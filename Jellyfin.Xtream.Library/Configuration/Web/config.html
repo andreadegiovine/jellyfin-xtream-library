@@ -547,6 +547,17 @@
                                         doubles this delay. Default: 1000ms (1 second).
                                     </div>
                                 </div>
+                                <div class="inputContainer">
+                                    <label class="inputLabel inputLabelUnfocused" for="txtTimeoutSeconds">Request Timeout (seconds)</label>
+                                    <input is="emby-input" type="number" id="txtTimeoutSeconds" name="TimeoutSeconds"
+                                           min="10" max="3600" step="10" />
+                                    <div class="fieldDescription">
+                                        How long to wait for a single API response (10-3600s). Providers with hundreds of
+                                        thousands of entries can need several minutes for one catalog call. Raise this if you see
+                                        timeouts in the log while fetching channels, movies or series. Applies per attempt, so a
+                                        retried request can take a multiple of this in total. Default: 300s (5 minutes).
+                                    </div>
+                                </div>
 
                                 <h4 style="margin-top: 20px; opacity: 0.8;">Incremental Sync</h4>
                                 <div class="checkboxContainer checkboxContainer-withDescription">

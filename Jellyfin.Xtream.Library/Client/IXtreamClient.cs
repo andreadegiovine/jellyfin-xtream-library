@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -39,6 +40,12 @@ public interface IXtreamClient
     /// Gets or sets the initial retry delay in milliseconds after a 429 response.
     /// </summary>
     int RetryDelayMs { get; set; }
+
+    /// <summary>
+    /// Gets or sets the per-request timeout for API calls. Applies per attempt, so a retried
+    /// request can spend a multiple of this in total.
+    /// </summary>
+    TimeSpan Timeout { get; set; }
 
     /// <summary>
     /// Updates the User-Agent header based on plugin configuration.

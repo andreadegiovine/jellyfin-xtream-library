@@ -80,6 +80,7 @@ const XtreamLibraryConfig = {
             RequestDelayMs: 50,
             MaxRetries: 3,
             RetryDelayMs: 1000,
+            TimeoutSeconds: 300,
         };
     },
 
@@ -143,6 +144,7 @@ const XtreamLibraryConfig = {
         document.getElementById('txtRequestDelayMs').value = p.RequestDelayMs || 50;
         document.getElementById('txtMaxRetries').value = p.MaxRetries || 3;
         document.getElementById('txtRetryDelayMs').value = p.RetryDelayMs || 1000;
+        document.getElementById('txtTimeoutSeconds').value = p.TimeoutSeconds || 300;
 
         document.getElementById('chkDownloadArtworkForUnmatched').checked = p.DownloadArtworkForUnmatched !== false;
         document.getElementById('chkEnableIncrementalSync').checked = p.EnableIncrementalSync !== false;
@@ -229,6 +231,7 @@ const XtreamLibraryConfig = {
         p.RequestDelayMs = parseInt(document.getElementById('txtRequestDelayMs').value) || 50;
         p.MaxRetries = parseInt(document.getElementById('txtMaxRetries').value) || 3;
         p.RetryDelayMs = parseInt(document.getElementById('txtRetryDelayMs').value) || 1000;
+        p.TimeoutSeconds = parseInt(document.getElementById('txtTimeoutSeconds').value) || 300;
 
         p.DownloadArtworkForUnmatched = document.getElementById('chkDownloadArtworkForUnmatched').checked;
         p.EnableIncrementalSync = document.getElementById('chkEnableIncrementalSync').checked;

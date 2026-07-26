@@ -344,4 +344,71 @@ public class LiveTvServiceTests
 
         m3u.Should().Contain("group-title=\"Sports &amp; News\"");
     }
+
+    // Live TV never applied the per-provider client tuning at all, so every Live TV call ran
+    // on the client defaults regardless of what the provider was configured with. That is the
+    // path the timeout has to cover, because that is where the catalog fetch happens.
+
+    [Fact]
+    public void ResolveClientTimeout_SingleProvider_UsesThatProvidersTimeout()
+    {
+        var config = new PluginConfiguration();
+        config.Providers.Add(new ProviderConfig
+        {
+            BaseUrl = "http://one.example.com",
+            Username = "user",
+            TimeoutSeconds = 600,
+        });
+
+        LiveTvService.ResolveClientTimeout(config).Should().Be(TimeSpan.FromSeconds(600));
+    }
+
+    [Fact]
+    public void ResolveClientTimeout_MultipleProviders_UsesTheLargest()
+    {
+        // One client serves every provider in a single operation, so timing out at the
+        // smallest value would cut off the slowest provider mid-fetch.
+        var config = new PluginConfiguration();
+        config.Providers.Add(new ProviderConfig
+        {
+            BaseUrl = "http://fast.example.com",
+            Username = "user",
+            TimeoutSeconds = 120,
+        });
+        config.Providers.Add(new ProviderConfig
+        {
+            BaseUrl = "http://slow.example.com",
+            Username = "user",
+            TimeoutSeconds = 900,
+        });
+
+        LiveTvService.ResolveClientTimeout(config).Should().Be(TimeSpan.FromSeconds(900));
+    }
+
+    [Fact]
+    public void ResolveClientTimeout_DisabledProviderIgnored()
+    {
+        var config = new PluginConfiguration();
+        config.Providers.Add(new ProviderConfig
+        {
+            BaseUrl = "http://enabled.example.com",
+            Username = "user",
+            TimeoutSeconds = 120,
+        });
+        config.Providers.Add(new ProviderConfig
+        {
+            BaseUrl = "http://disabled.example.com",
+            Username = "user",
+            IsEnabled = false,
+            TimeoutSeconds = 900,
+        });
+
+        LiveTvService.ResolveClientTimeout(config).Should().Be(TimeSpan.FromSeconds(120));
+    }
+
+    [Fact]
+    public void ResolveClientTimeout_NoUsableProviders_FallsBackToDefault()
+    {
+        LiveTvService.ResolveClientTimeout(new PluginConfiguration()).Should().Be(TimeSpan.FromMinutes(5));
+    }
 }

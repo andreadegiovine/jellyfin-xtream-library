@@ -174,6 +174,7 @@ public class LiveTvService : IDisposable
     public async Task<string> GetXmltvEpgAsync(CancellationToken cancellationToken)
     {
         var config = Plugin.Instance.Configuration;
+        ApplyClientTimeout(config);
 
         await _epgLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -317,6 +318,7 @@ public class LiveTvService : IDisposable
     internal async Task<Dictionary<int, string>> GetCategoryNameMapAsync(CancellationToken cancellationToken)
     {
         var config = Plugin.Instance.Configuration;
+        ApplyClientTimeout(config);
         var liveTvProviders = ResolveLiveTvProviders(config).ToList();
         if (liveTvProviders.Count != 1)
         {
@@ -346,6 +348,7 @@ public class LiveTvService : IDisposable
     internal async Task<List<LiveStreamInfo>> GetFilteredChannelsAsync(CancellationToken cancellationToken)
     {
         var config = Plugin.Instance.Configuration;
+        ApplyClientTimeout(config);
         var liveTvProviders = ResolveLiveTvProviders(config).ToList();
         var allChannels = new List<LiveStreamInfo>();
 
@@ -562,6 +565,34 @@ public class LiveTvService : IDisposable
         }
 
         return (config.BaseUrl, config.Username, config.Password);
+    }
+
+    /// <summary>
+    /// Resolves the per-request timeout to apply to the Xtream client for Live TV work.
+    /// A single client serves every configured provider within one operation, so the largest
+    /// configured value wins: a smaller one would cut off the slowest provider mid-fetch.
+    /// </summary>
+    /// <param name="config">The plugin configuration.</param>
+    /// <returns>The timeout to apply, five minutes when no provider is usable.</returns>
+    internal static TimeSpan ResolveClientTimeout(PluginConfiguration config)
+    {
+        var seconds = ResolveLiveTvProviders(config)
+            .Select(p => p.Provider.TimeoutSeconds)
+            .DefaultIfEmpty(300)
+            .Max();
+
+        return TimeSpan.FromSeconds(seconds);
+    }
+
+    /// <summary>
+    /// Applies the configured timeout to the shared client. Live TV previously ran every call
+    /// on the client defaults, so a provider timeout set in the UI had no effect on the channel
+    /// fetch, which is exactly where large catalogs time out.
+    /// </summary>
+    /// <param name="config">The plugin configuration.</param>
+    private void ApplyClientTimeout(PluginConfiguration config)
+    {
+        _client.Timeout = ResolveClientTimeout(config);
     }
 
     internal static IEnumerable<(int Index, ProviderConfig Provider)> ResolveLiveTvProviders(PluginConfiguration config)

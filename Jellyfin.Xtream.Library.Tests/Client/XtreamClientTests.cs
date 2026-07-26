@@ -184,9 +184,158 @@ public class XtreamClientTests : IDisposable
 
     #endregion
 
+    #region Timeout Tests
+
+    [Fact]
+    public void Timeout_DefaultsToFiveMinutes()
+    {
+        _client.Timeout.Should().Be(TimeSpan.FromMinutes(5));
+    }
+
+    [Fact]
+    public async Task GetVodCategoryAsync_ResponseSlowerThanTimeout_ThrowsTimeoutException()
+    {
+        var handler = new DelayingHttpMessageHandler(_ => TimeSpan.FromSeconds(30));
+        using var httpClient = new HttpClient(handler);
+        var client = new XtreamClient(httpClient, _mockLogger.Object)
+        {
+            Timeout = TimeSpan.FromMilliseconds(50),
+            MaxRetries = 0,
+        };
+        client.UpdateUserAgent(null);
+        var connectionInfo = new ConnectionInfo("http://test.example.com", "user", "secret");
+
+        var act = () => client.GetVodCategoryAsync(connectionInfo, CancellationToken.None);
+
+        // A bare TaskCanceledException is what users see today and it reads as "cancelled",
+        // not "too slow". The timeout must surface as a timeout.
+        await act.Should().ThrowAsync<TimeoutException>();
+        handler.Attempts.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task GetVodCategoryAsync_TimesOutThenSucceeds_RetriesAndReturnsContent()
+    {
+        // First two attempts exceed the timeout, the third answers immediately.
+        var handler = new DelayingHttpMessageHandler(
+            attempt => attempt <= 2 ? TimeSpan.FromSeconds(30) : TimeSpan.Zero);
+        using var httpClient = new HttpClient(handler);
+        var client = new XtreamClient(httpClient, _mockLogger.Object)
+        {
+            Timeout = TimeSpan.FromMilliseconds(50),
+            MaxRetries = 3,
+            RetryDelayMs = 1,
+        };
+        client.UpdateUserAgent(null);
+        var connectionInfo = new ConnectionInfo("http://test.example.com", "user", "secret");
+
+        var result = await client.GetVodCategoryAsync(connectionInfo, CancellationToken.None);
+
+        result.Should().BeEmpty();
+        handler.Attempts.Should().Be(3);
+    }
+
+    [Fact]
+    public async Task GetVodCategoryAsync_CallerCancels_DoesNotRetry()
+    {
+        using var cts = new CancellationTokenSource();
+        var handler = new DelayingHttpMessageHandler(_ => TimeSpan.FromSeconds(30), onRequest: cts.Cancel);
+        using var httpClient = new HttpClient(handler);
+        var client = new XtreamClient(httpClient, _mockLogger.Object)
+        {
+            Timeout = TimeSpan.FromSeconds(30),
+            MaxRetries = 3,
+            RetryDelayMs = 1,
+        };
+        client.UpdateUserAgent(null);
+        var connectionInfo = new ConnectionInfo("http://test.example.com", "user", "secret");
+
+        var act = () => client.GetVodCategoryAsync(connectionInfo, cts.Token);
+
+        // Caller-driven cancellation must propagate, not be retried as if it were a timeout.
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        handler.Attempts.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task GetVodCategoryAsync_CancellationFromElsewhere_IsNotRelabelledAsTimeout()
+    {
+        // Only our own timeout token firing counts as a timeout. A cancellation from any other
+        // source (transport, handler, an HttpClient ceiling we failed to lift) must not be
+        // retried and then reported as "the provider was too slow", which sends people looking
+        // in the wrong place.
+        var handler = new ThrowingHttpMessageHandler(() => new TaskCanceledException("transport went away"));
+        using var httpClient = new HttpClient(handler);
+        var client = new XtreamClient(httpClient, _mockLogger.Object)
+        {
+            Timeout = TimeSpan.FromMinutes(5),
+            MaxRetries = 3,
+            RetryDelayMs = 1,
+        };
+        client.UpdateUserAgent(null);
+        var connectionInfo = new ConnectionInfo("http://test.example.com", "user", "secret");
+
+        var act = () => client.GetVodCategoryAsync(connectionInfo, CancellationToken.None);
+
+        await act.Should().ThrowAsync<TaskCanceledException>();
+        handler.Attempts.Should().Be(1);
+    }
+
+    [Fact]
+    public void RetryDelayMs_ClampedToAnUpperBound()
+    {
+        // Unbounded, a large configured delay plus exponential doubling turns an ordinary
+        // timeout into a multi-day wait and eventually overflows the int passed to Task.Delay.
+        var provider = new ProviderConfig { RetryDelayMs = int.MaxValue };
+
+        provider.Validate();
+
+        provider.RetryDelayMs.Should().Be(60000);
+    }
+
+    #endregion
+
     private sealed class CapturingHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
             => Task.FromResult(respond(request));
+    }
+
+    private sealed class ThrowingHttpMessageHandler(Func<Exception> makeException) : HttpMessageHandler
+    {
+        private int _attempts;
+
+        public int Attempts => _attempts;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _attempts);
+            throw makeException();
+        }
+    }
+
+    private sealed class DelayingHttpMessageHandler(Func<int, TimeSpan> delayForAttempt, Action? onRequest = null)
+        : HttpMessageHandler
+    {
+        private int _attempts;
+
+        public int Attempts => _attempts;
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var attempt = Interlocked.Increment(ref _attempts);
+            onRequest?.Invoke();
+
+            var delay = delayForAttempt(attempt);
+            if (delay > TimeSpan.Zero)
+            {
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+
+            return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent("[]", System.Text.Encoding.UTF8, "application/json"),
+            };
+        }
     }
 }
