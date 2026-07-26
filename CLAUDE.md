@@ -52,6 +52,11 @@ Edit `Jellyfin.Xtream.Library/Jellyfin.Xtream.Library.csproj`:
 <FileVersion>X.Y.Z.0</FileVersion>
 ```
 
+This edit must land in the commit that gets tagged. The **tag is the source of truth** for the
+shipped version: CI derives `AssemblyVersion`/`FileVersion` from the tag name, and a separate step
+fails the release when this csproj disagrees. Nothing used to check, which is why v1.42.0.0 and
+v1.42.1.0 both shipped DLLs reporting `1.41.0.0` (issue #69).
+
 ### 2. Commit & Tag
 ```bash
 git add .
@@ -60,20 +65,40 @@ git tag -a vX.Y.Z.0 -m "Release vX.Y.Z.0: Description"
 git push origin main --tags
 ```
 
-### 3. Build Release Package
+### 3. Build & Release (automatic)
+Pushing the tag triggers `.github/workflows/build-release.yml`, which:
+- derives the version from the tag and stamps it into the build,
+- fails if csproj disagrees with the tag,
+- verifies the built DLL actually carries that version,
+- creates the GitHub release if it does not exist and uploads
+  `jellyfin-xtream-library_X.Y.Z.0.zip` (numeric version, no `v` — that is what the manifest
+  `sourceUrl` points at).
+
+Get the checksum for the manifest entry:
 ```bash
-dotnet publish Jellyfin.Xtream.Library -c Release -o /tmp/claude/xtream-library-release
-cd /tmp/claude/xtream-library-release
-zip -j /tmp/claude/jellyfin-xtream-library_X.Y.Z.0.zip Jellyfin.Xtream.Library.dll
-openssl md5 /tmp/claude/jellyfin-xtream-library_X.Y.Z.0.zip | awk '{print $NF}'  # Get checksum (portable: macOS + Linux)
+gh release download vX.Y.Z.0 -D /tmp/claude/rel -p 'jellyfin-xtream-library_*.zip'
+openssl md5 /tmp/claude/rel/jellyfin-xtream-library_X.Y.Z.0.zip | awk '{print $NF}'  # portable: macOS + Linux
 ```
 
-### 4. Create GitHub Release
+To re-stamp an already-published tag, run the workflow manually with the `existing_tag` input.
+It replaces the asset of the same name, so remember to update the checksum in the manifest.
+
+<details>
+<summary>Manual fallback (only if CI is unavailable)</summary>
+
 ```bash
-gh release create vX.Y.Z.0 /tmp/claude/jellyfin-xtream-library_X.Y.Z.0.zip \
-  --title "vX.Y.Z.0: Title" \
-  --notes "Changelog here"
+VER=X.Y.Z.0
+dotnet publish Jellyfin.Xtream.Library -c Release \
+  -p:Version=$VER -p:AssemblyVersion=$VER -p:FileVersion=$VER \
+  -o /tmp/claude/xtream-library-release
+cd /tmp/claude/xtream-library-release
+zip -j /tmp/claude/jellyfin-xtream-library_$VER.zip Jellyfin.Xtream.Library.dll
+openssl md5 /tmp/claude/jellyfin-xtream-library_$VER.zip | awk '{print $NF}'
+gh release create v$VER /tmp/claude/jellyfin-xtream-library_$VER.zip \
+  --title "v$VER: Title" --notes "Changelog here"
 ```
+Pass the version properties explicitly; a bare `dotnet publish` stamps whatever csproj happens to say.
+</details>
 
 ### 5. Publish to Beta Channel
 Edit `../jellyfin-plugin-repo/manifest-dev.json` (sibling directory):
