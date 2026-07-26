@@ -291,7 +291,9 @@ public class ProviderConfig
 
         RequestDelayMs = Math.Max(RequestDelayMs, 0);
         MaxRetries = Math.Clamp(MaxRetries, 0, 10);
-        RetryDelayMs = Math.Max(RetryDelayMs, 0);
+        // Upper bound matters: the retry delay doubles on each attempt, so an unbounded value
+        // turns an ordinary timeout into a multi-day wait and eventually overflows Task.Delay.
+        RetryDelayMs = Math.Clamp(RetryDelayMs, 0, 60000);
         TimeoutSeconds = Math.Clamp(TimeoutSeconds, 10, 3600);
 
         OrphanSafetyThreshold = Math.Clamp(OrphanSafetyThreshold, 0.0, 1.0);

@@ -46,6 +46,12 @@ namespace Jellyfin.Xtream.Library.Client;
 /// <param name="logger">Instance of the <see cref="ILogger"/> interface.</param>
 public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXtreamClient
 {
+    /// <summary>
+    /// Ceiling for the doubled retry delay. Without it, a large configured delay overflows the
+    /// int handed to Task.Delay after a few retries.
+    /// </summary>
+    private const int MaxRetryDelayMs = 60000;
+
     private static readonly ConcurrentDictionary<Type, PropertyInfo[]> PropertyCache = new();
 
     private readonly JsonSerializerSettings _serializerSettings = new()
@@ -295,11 +301,15 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
                 logger.LogWarning("HTTP {StatusCode} for URL: {Url}. Retry {Retry}/{MaxRetries} after {Delay}ms", (int?)ex.StatusCode, uri, retryCount + 1, MaxRetries, currentDelay);
                 await Task.Delay(currentDelay, cancellationToken).ConfigureAwait(false);
                 retryCount++;
-                currentDelay *= 2; // Exponential backoff
+                currentDelay = Math.Min(currentDelay * 2, MaxRetryDelayMs); // Exponential backoff, capped
             }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested
+                && !cancellationToken.IsCancellationRequested)
             {
-                // Our own timeout fired rather than the caller cancelling. Previously this
+                // Our own timeout token fired, rather than the caller cancelling or a
+                // cancellation arriving from the transport. Checking the timeout token matters:
+                // without it any OperationCanceledException got retried and then relabelled as
+                // a provider timeout, pointing diagnosis at the wrong thing. Previously this
                 // escaped as a bare TaskCanceledException and was never retried, so a single
                 // slow catalog response failed the whole channel fetch.
                 if (retryCount >= MaxRetries)
@@ -327,7 +337,7 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
                     currentDelay);
                 await Task.Delay(currentDelay, cancellationToken).ConfigureAwait(false);
                 retryCount++;
-                currentDelay *= 2; // Exponential backoff
+                currentDelay = Math.Min(currentDelay * 2, MaxRetryDelayMs); // Exponential backoff, capped
             }
         }
     }

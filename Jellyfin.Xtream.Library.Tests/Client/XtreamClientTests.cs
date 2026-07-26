@@ -257,12 +257,61 @@ public class XtreamClientTests : IDisposable
         handler.Attempts.Should().Be(1);
     }
 
+    [Fact]
+    public async Task GetVodCategoryAsync_CancellationFromElsewhere_IsNotRelabelledAsTimeout()
+    {
+        // Only our own timeout token firing counts as a timeout. A cancellation from any other
+        // source (transport, handler, an HttpClient ceiling we failed to lift) must not be
+        // retried and then reported as "the provider was too slow", which sends people looking
+        // in the wrong place.
+        var handler = new ThrowingHttpMessageHandler(() => new TaskCanceledException("transport went away"));
+        using var httpClient = new HttpClient(handler);
+        var client = new XtreamClient(httpClient, _mockLogger.Object)
+        {
+            Timeout = TimeSpan.FromMinutes(5),
+            MaxRetries = 3,
+            RetryDelayMs = 1,
+        };
+        client.UpdateUserAgent(null);
+        var connectionInfo = new ConnectionInfo("http://test.example.com", "user", "secret");
+
+        var act = () => client.GetVodCategoryAsync(connectionInfo, CancellationToken.None);
+
+        await act.Should().ThrowAsync<TaskCanceledException>();
+        handler.Attempts.Should().Be(1);
+    }
+
+    [Fact]
+    public void RetryDelayMs_ClampedToAnUpperBound()
+    {
+        // Unbounded, a large configured delay plus exponential doubling turns an ordinary
+        // timeout into a multi-day wait and eventually overflows the int passed to Task.Delay.
+        var provider = new ProviderConfig { RetryDelayMs = int.MaxValue };
+
+        provider.Validate();
+
+        provider.RetryDelayMs.Should().Be(60000);
+    }
+
     #endregion
 
     private sealed class CapturingHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
             => Task.FromResult(respond(request));
+    }
+
+    private sealed class ThrowingHttpMessageHandler(Func<Exception> makeException) : HttpMessageHandler
+    {
+        private int _attempts;
+
+        public int Attempts => _attempts;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _attempts);
+            throw makeException();
+        }
     }
 
     private sealed class DelayingHttpMessageHandler(Func<int, TimeSpan> delayForAttempt, Action? onRequest = null)
