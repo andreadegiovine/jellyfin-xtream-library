@@ -31,6 +31,35 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.version }}
 
+      - name: Determine assembly version
+        id: asmver
+        run: |
+          TAG="${{ steps.tag.outputs.version }}"
+          VER="${TAG#v}"
+          if ! echo "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag '$TAG' is not of the form vX.Y.Z.W, cannot derive an assembly version"
+            exit 1
+          fi
+          echo "version=${VER}" >> $GITHUB_OUTPUT
+          echo "Assembly version: ${VER}"
+
+      # The tag is the source of truth for the shipped version, but csproj is what a
+      # local `dotnet build` stamps. Fail loudly when they disagree instead of silently
+      # shipping a DLL that misreports itself (v1.42.0.0 and v1.42.1.0 both shipped
+      # reporting 1.41.0.0 because nothing checked). Skipped when rebuilding an existing
+      # tag, since older commits legitimately predate this check.
+      - name: Verify csproj version matches tag
+        if: github.event.inputs.existing_tag == ''
+        run: |
+          VER="${{ steps.asmver.outputs.version }}"
+          CSPROJ="Jellyfin.Xtream.Library/Jellyfin.Xtream.Library.csproj"
+          CSPROJ_VER=$(sed -n 's:.*<AssemblyVersion>\(.*\)</AssemblyVersion>.*:\1:p' "$CSPROJ" | head -1)
+          if [ "$CSPROJ_VER" != "$VER" ]; then
+            echo "::error::AssemblyVersion in $CSPROJ is '$CSPROJ_VER' but the tag says '$VER'. Bump the csproj and re-tag."
+            exit 1
+          fi
+          echo "csproj matches tag: $VER"
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -39,21 +68,53 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore
 
+      # Version properties must be passed here: publish runs with --no-build, so
+      # stamping at publish time alone would be a no-op.
       - name: Build
-        run: dotnet build -c Release --no-restore
+        run: |
+          VERSION=${{ steps.asmver.outputs.version }}
+          dotnet build -c Release --no-restore \
+            -p:Version="${VERSION}" \
+            -p:AssemblyVersion="${VERSION}" \
+            -p:FileVersion="${VERSION}"
 
       - name: Publish
         run: |
-          VERSION=${{ steps.tag.outputs.version }}
+          VERSION=${{ steps.asmver.outputs.version }}
           mkdir -p output
           dotnet publish Jellyfin.Xtream.Library/Jellyfin.Xtream.Library.csproj \
             -c Release \
             --no-build \
+            -p:Version="${VERSION}" \
+            -p:AssemblyVersion="${VERSION}" \
+            -p:FileVersion="${VERSION}" \
             -o output/plugin
 
+      # Smoke check: FileVersion is stored as a UTF-8 string in the assembly metadata,
+      # so a stamped DLL literally contains the version. Catches a silently un-stamped
+      # build before it is uploaded as a release asset.
+      - name: Verify stamped DLL version
+        env:
+          EXPECTED: ${{ steps.asmver.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+
+          expected = os.environ["EXPECTED"]
+          data = pathlib.Path("output/plugin/Jellyfin.Xtream.Library.dll").read_bytes()
+          found = sorted({m.decode() for m in re.findall(rb"\d+\.\d+\.\d+\.\d+", data)})
+          print("Version strings in DLL:", " ".join(found))
+          if expected not in found:
+              sys.exit(f"::error::Built DLL does not carry version {expected}")
+          print(f"DLL carries {expected}")
+          PY
+
+      # Asset name uses the numeric version (no leading "v"), because that is what the
+      # sourceUrl in manifest.json / manifest-dev.json points at. Naming it after the
+      # tag would 404 for every user installing from the plugin catalog.
       - name: Package
         run: |
-          VERSION=${{ steps.tag.outputs.version }}
+          VERSION=${{ steps.asmver.outputs.version }}
           # Only publish plugin DLL, not framework deps (Jellyfin ships those)
           cd output/plugin
           zip -j "../jellyfin-xtream-library_${VERSION}.zip" Jellyfin.Xtream.Library.dll
@@ -65,30 +126,45 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION=${{ steps.tag.outputs.version }}
-          ZIP="output/jellyfin-xtream-library_${VERSION}.zip"
-          
-          # Find the release ID
+          TAG=${{ steps.tag.outputs.version }}
+          VERSION=${{ steps.asmver.outputs.version }}
+          export ASSET="jellyfin-xtream-library_${VERSION}.zip"
+          ZIP="output/${ASSET}"
+
+          # Find the release ID (releases are keyed by tag, assets by numeric version)
           RELEASE_ID=$(curl -s \
             -H "Authorization: token ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))")
-          
+
           if [ -z "$RELEASE_ID" ]; then
-            echo "Release $VERSION not found. Creating..."
+            echo "Release $TAG not found. Creating..."
             RELEASE_JSON=$(curl -s -X POST \
               -H "Authorization: token ${GITHUB_TOKEN}" \
               -H "Content-Type: application/json" \
-              -d "{\"tag_name\":\"${VERSION}\",\"name\":\"${VERSION}\",\"draft\":false,\"prerelease\":false}" \
+              -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"draft\":false,\"prerelease\":false}" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases")
             RELEASE_ID=$(echo "$RELEASE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))")
           fi
-          
+
           echo "Release ID: $RELEASE_ID"
-          
+
+          # Replace an existing asset of the same name, so re-running for an existing tag
+          # actually swaps the binary instead of silently failing on a name clash.
+          EXISTING_ASSET_ID=$(curl -s \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets" \
+            | python3 -c "import sys,json,os; a=json.load(sys.stdin); n=os.environ['ASSET']; print(next((x['id'] for x in a if x['name']==n), ''))")
+          if [ -n "$EXISTING_ASSET_ID" ]; then
+            echo "Deleting existing asset $EXISTING_ASSET_ID ($ASSET)"
+            curl -s -X DELETE \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${EXISTING_ASSET_ID}"
+          fi
+
           # Upload asset
           curl -s -X POST \
             -H "Authorization: token ${GITHUB_TOKEN}" \
             -H "Content-Type: application/zip" \
             --data-binary @"${ZIP}" \
-            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=jellyfin-xtream-library_${VERSION}.zip"
+            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${ASSET}"
