@@ -16,15 +16,31 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
+      # The dispatch input is attacker-controlled text as far as this shell is concerned, so
+      # it arrives through env rather than ${{ }} interpolation, and its shape is validated
+      # before it can reach GITHUB_OUTPUT or actions/checkout's ref.
       - name: Determine tag
         id: tag
+        env:
+          EXISTING_TAG: ${{ github.event.inputs.existing_tag }}
         run: |
-          if [ -n "${{ github.event.inputs.existing_tag }}" ]; then
-            echo "version=${{ github.event.inputs.existing_tag }}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [ -n "$EXISTING_TAG" ]; then
+            TAG="$EXISTING_TAG"
           else
-            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            TAG="$GITHUB_REF_NAME"
           fi
+          # bash regex, not grep: grep matches per line, so a value carrying a newline would
+          # pass and then write a second line into GITHUB_OUTPUT, poisoning this step's output.
+          if [[ ! $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not of the form vX.Y.Z.W"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,14 +49,16 @@ jobs:
 
       - name: Determine assembly version
         id: asmver
+        env:
+          TAG: ${{ steps.tag.outputs.version }}
         run: |
-          TAG="${{ steps.tag.outputs.version }}"
+          set -euo pipefail
           VER="${TAG#v}"
-          if ! echo "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if [[ ! $VER =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Tag '$TAG' is not of the form vX.Y.Z.W, cannot derive an assembly version"
             exit 1
           fi
-          echo "version=${VER}" >> $GITHUB_OUTPUT
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
           echo "Assembly version: ${VER}"
 
       # The tag is the source of truth for the shipped version, but csproj is what a
@@ -50,8 +68,10 @@ jobs:
       # tag, since older commits legitimately predate this check.
       - name: Verify csproj version matches tag
         if: github.event.inputs.existing_tag == ''
+        env:
+          VER: ${{ steps.asmver.outputs.version }}
         run: |
-          VER="${{ steps.asmver.outputs.version }}"
+          set -euo pipefail
           CSPROJ="Jellyfin.Xtream.Library/Jellyfin.Xtream.Library.csproj"
           CSPROJ_VER=$(sed -n 's:.*<AssemblyVersion>\(.*\)</AssemblyVersion>.*:\1:p' "$CSPROJ" | head -1)
           if [ "$CSPROJ_VER" != "$VER" ]; then
@@ -71,16 +91,20 @@ jobs:
       # Version properties must be passed here: publish runs with --no-build, so
       # stamping at publish time alone would be a no-op.
       - name: Build
+        env:
+          VERSION: ${{ steps.asmver.outputs.version }}
         run: |
-          VERSION=${{ steps.asmver.outputs.version }}
+          set -euo pipefail
           dotnet build -c Release --no-restore \
             -p:Version="${VERSION}" \
             -p:AssemblyVersion="${VERSION}" \
             -p:FileVersion="${VERSION}"
 
       - name: Publish
+        env:
+          VERSION: ${{ steps.asmver.outputs.version }}
         run: |
-          VERSION=${{ steps.asmver.outputs.version }}
+          set -euo pipefail
           mkdir -p output
           dotnet publish Jellyfin.Xtream.Library/Jellyfin.Xtream.Library.csproj \
             -c Release \
@@ -113,8 +137,10 @@ jobs:
       # sourceUrl in manifest.json / manifest-dev.json points at. Naming it after the
       # tag would 404 for every user installing from the plugin catalog.
       - name: Package
+        env:
+          VERSION: ${{ steps.asmver.outputs.version }}
         run: |
-          VERSION=${{ steps.asmver.outputs.version }}
+          set -euo pipefail
           # Only publish plugin DLL, not framework deps (Jellyfin ships those)
           cd output/plugin
           zip -j "../jellyfin-xtream-library_${VERSION}.zip" Jellyfin.Xtream.Library.dll
@@ -122,49 +148,81 @@ jobs:
           echo "Package size:"
           ls -lh output/*.zip
 
+      # Every API call is status-checked. GitHub rejects a duplicate asset name, so replacing
+      # means delete-then-upload, and a silently failed upload would leave a release with no
+      # plugin ZIP while the job reported success. Users installing from the catalog would get
+      # a 404 and nobody would know.
       - name: Upload Release Asset
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.version }}
+          VERSION: ${{ steps.asmver.outputs.version }}
         run: |
-          TAG=${{ steps.tag.outputs.version }}
-          VERSION=${{ steps.asmver.outputs.version }}
+          set -euo pipefail
           export ASSET="jellyfin-xtream-library_${VERSION}.zip"
           ZIP="output/${ASSET}"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
 
-          # Find the release ID (releases are keyed by tag, assets by numeric version)
-          RELEASE_ID=$(curl -s \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+          [ -f "$ZIP" ] || { echo "::error::Package $ZIP is missing"; exit 1; }
+
+          # api <method> <url> [curl args...] -> body on stdout, non-2xx fails the step
+          api() {
+            local method="$1" url="$2"; shift 2
+            local out status
+            out=$(mktemp)
+            status=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "$@" "$url")
+            if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+              echo "::error::$method $url returned HTTP $status"
+              cat "$out" >&2
+              rm -f "$out"
+              return 1
+            fi
+            cat "$out"
+            rm -f "$out"
+          }
+
+          # Releases are keyed by tag, assets by numeric version. A 404 here is expected the
+          # first time, so that one call tolerates a non-2xx.
+          RELEASE_ID=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${API}/releases/tags/${TAG}" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))")
 
           if [ -z "$RELEASE_ID" ]; then
             echo "Release $TAG not found. Creating..."
-            RELEASE_JSON=$(curl -s -X POST \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
+            RELEASE_ID=$(api POST "${API}/releases" \
               -H "Content-Type: application/json" \
               -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"draft\":false,\"prerelease\":false}" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases")
-            RELEASE_ID=$(echo "$RELEASE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))")
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))")
           fi
 
+          [ -n "$RELEASE_ID" ] || { echo "::error::Could not resolve a release id for $TAG"; exit 1; }
           echo "Release ID: $RELEASE_ID"
 
-          # Replace an existing asset of the same name, so re-running for an existing tag
-          # actually swaps the binary instead of silently failing on a name clash.
-          EXISTING_ASSET_ID=$(curl -s \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets" \
+          EXISTING_ASSET_ID=$(api GET "${API}/releases/${RELEASE_ID}/assets" \
             | python3 -c "import sys,json,os; a=json.load(sys.stdin); n=os.environ['ASSET']; print(next((x['id'] for x in a if x['name']==n), ''))")
           if [ -n "$EXISTING_ASSET_ID" ]; then
             echo "Deleting existing asset $EXISTING_ASSET_ID ($ASSET)"
-            curl -s -X DELETE \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${EXISTING_ASSET_ID}"
+            api DELETE "${API}/releases/assets/${EXISTING_ASSET_ID}" > /dev/null
           fi
 
-          # Upload asset
-          curl -s -X POST \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
+          echo "Uploading $ASSET"
+          api POST "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${ASSET}" \
             -H "Content-Type: application/zip" \
-            --data-binary @"${ZIP}" \
-            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${ASSET}"
+            --data-binary @"${ZIP}" > /dev/null
+
+          # Confirm it is actually attached, so a release can never be published assetless.
+          api GET "${API}/releases/${RELEASE_ID}/assets" \
+            | python3 -c "
+          import sys, json, os
+          assets = json.load(sys.stdin)
+          name = os.environ['ASSET']
+          match = next((a for a in assets if a['name'] == name), None)
+          if match is None:
+              sys.exit(f'::error::{name} is not attached to the release after upload')
+          if match.get('state') != 'uploaded':
+              sys.exit(f\"::error::{name} is in state {match.get('state')}, not 'uploaded'\")
+          print(f\"{name} attached, {match['size']} bytes\")
+          "
