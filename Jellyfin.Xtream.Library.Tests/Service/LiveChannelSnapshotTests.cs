@@ -218,11 +218,11 @@ public class LiveChannelSnapshotTests
 
         restored.Should().NotBeNull();
         restored!.Channels.Should().HaveCount(2);
-        restored.Channels[101].Name.Should().Be("BBC One");
-        restored.Channels[101].EpgChannelId.Should().Be("bbc1.uk");
-        restored.Channels[101].StreamIcon.Should().Be("https://example/bbc.png");
-        restored.Channels[101].Num.Should().Be(1);
-        restored.Channels[101].Checksum.Should().Be(original.Channels[101].Checksum);
+        restored.Channels[LiveChannelSnapshot.ChannelKey(0, 101)].Name.Should().Be("BBC One");
+        restored.Channels[LiveChannelSnapshot.ChannelKey(0, 101)].EpgChannelId.Should().Be("bbc1.uk");
+        restored.Channels[LiveChannelSnapshot.ChannelKey(0, 101)].StreamIcon.Should().Be("https://example/bbc.png");
+        restored.Channels[LiveChannelSnapshot.ChannelKey(0, 101)].Num.Should().Be(1);
+        restored.Channels[LiveChannelSnapshot.ChannelKey(0, 101)].Checksum.Should().Be(original.Channels[LiveChannelSnapshot.ChannelKey(0, 101)].Checksum);
     }
 
     [Fact]
@@ -249,8 +249,8 @@ public class LiveChannelSnapshotTests
         var snapshot = LiveChannelSnapshot.FromChannels(channels);
 
         snapshot.Channels.Should().HaveCount(1);
-        snapshot.Channels[1].Name.Should().Be("BBC One HD");
-        snapshot.Channels[1].Num.Should().Be(1101);
+        snapshot.Channels[LiveChannelSnapshot.ChannelKey(0, 1)].Name.Should().Be("BBC One HD");
+        snapshot.Channels[LiveChannelSnapshot.ChannelKey(0, 1)].Num.Should().Be(1101);
     }
 
     // Rebuilding the M3U from the persisted snapshot is what removes the cold-cache stall:
@@ -281,7 +281,8 @@ public class LiveChannelSnapshotTests
     [Fact]
     public void FromChannels_PersistsTheFieldsM3UGenerationNeeds()
     {
-        var entry = LiveChannelSnapshot.FromChannels(new[] { MakeRichChannel(7) }).Channels[7];
+        // MakeRichChannel sits on provider 3, so the key carries that index.
+        var entry = LiveChannelSnapshot.FromChannels(new[] { MakeRichChannel(7) }).Channels[LiveChannelSnapshot.ChannelKey(3, 7)];
 
         entry.CategoryId.Should().Be(42);
         entry.TvArchive.Should().BeTrue();
@@ -331,6 +332,113 @@ public class LiveChannelSnapshotTests
         channel.TvArchiveDuration.Should().Be(5);
         channel.ProviderIndex.Should().Be(3);
         channel.Tags.Should().BeEquivalentTo(new[] { "sport" });
+    }
+
+    [Fact]
+    public void FromChannels_SameStreamIdAcrossProviders_KeepsBoth()
+    {
+        // GetFilteredChannelsAsync de-dupes by StreamId *within* a provider and deliberately
+        // allows the same id across providers (LiveTvService.cs:563). Keying the snapshot on
+        // StreamId alone silently drops one of them, so a cold-cache M3U would be missing
+        // channels a live fetch returns.
+        var channels = new List<LiveStreamInfo>
+        {
+            new() { StreamId = 100, Name = "Provider A Channel", Num = 1, ProviderIndex = 0 },
+            new() { StreamId = 100, Name = "Provider B Channel", Num = 2, ProviderIndex = 1 },
+        };
+
+        var snapshot = LiveChannelSnapshot.FromChannels(channels);
+
+        snapshot.Channels.Should().HaveCount(2);
+        var restored = snapshot.ToChannels();
+        restored.Should().NotBeNull();
+        restored!.Should().HaveCount(2);
+        restored.Select(c => c.Name).Should().BeEquivalentTo(new[] { "Provider A Channel", "Provider B Channel" });
+    }
+
+    [Fact]
+    public void ComputeDelta_SameStreamIdAcrossProviders_CountsBoth()
+    {
+        var channels = new List<LiveStreamInfo>
+        {
+            new() { StreamId = 100, Name = "Provider A Channel", Num = 1, ProviderIndex = 0 },
+            new() { StreamId = 100, Name = "Provider B Channel", Num = 2, ProviderIndex = 1 },
+        };
+
+        var delta = LiveChannelSnapshot.ComputeDelta(previous: null, current: channels);
+
+        delta.AddedCount.Should().Be(2);
+        delta.TotalChannels.Should().Be(2);
+    }
+
+    // ProviderIndex is positional. If the user reorders or replaces providers, a stored index
+    // resolves against a different provider and stream URLs get built with the wrong
+    // credentials. The snapshot therefore records who each index was.
+
+    [Fact]
+    public void MatchesProviders_UnchangedProviders_True()
+    {
+        var snapshot = LiveChannelSnapshot.FromChannels(
+            new[] { MakeRichChannel(7) },
+            providerFingerprints: new Dictionary<int, string> { [3] = "fp-provider-a" });
+
+        snapshot.MatchesProviders(new Dictionary<int, string> { [3] = "fp-provider-a" })
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void MatchesProviders_ReferencedProviderReplaced_False()
+    {
+        var snapshot = LiveChannelSnapshot.FromChannels(
+            new[] { MakeRichChannel(7) },
+            providerFingerprints: new Dictionary<int, string> { [3] = "fp-provider-a" });
+
+        snapshot.MatchesProviders(new Dictionary<int, string> { [3] = "fp-provider-b" })
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void MatchesProviders_ReferencedProviderGone_False()
+    {
+        var snapshot = LiveChannelSnapshot.FromChannels(
+            new[] { MakeRichChannel(7) },
+            providerFingerprints: new Dictionary<int, string> { [3] = "fp-provider-a" });
+
+        snapshot.MatchesProviders(new Dictionary<int, string> { [0] = "fp-provider-a" })
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void MatchesProviders_UnreferencedProviderChanged_True()
+    {
+        // Only the providers the stored channels actually point at matter.
+        var snapshot = LiveChannelSnapshot.FromChannels(
+            new[] { MakeRichChannel(7) },
+            providerFingerprints: new Dictionary<int, string> { [3] = "fp-a", [9] = "fp-unused" });
+
+        snapshot.MatchesProviders(new Dictionary<int, string> { [3] = "fp-a", [9] = "fp-changed" })
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void MatchesProviders_NoFingerprintsStored_False()
+    {
+        // Cannot prove the indices still mean what they did, so refuse rather than guess.
+        var snapshot = LiveChannelSnapshot.FromChannels(new[] { MakeRichChannel(7) });
+
+        snapshot.MatchesProviders(new Dictionary<int, string> { [3] = "fp-a" }).Should().BeFalse();
+    }
+
+    [Fact]
+    public void FromChannels_PersistsIsAdult_SoTheFilterCanBeReappliedOnRender()
+    {
+        var channel = MakeRichChannel(7);
+        channel.IsAdult = true;
+
+        var snapshot = LiveChannelSnapshot.FromChannels(new[] { channel });
+
+        snapshot.Channels[LiveChannelSnapshot.ChannelKey(3, 7)].IsAdult.Should().BeTrue();
+        snapshot.ToChannels()!.Single().IsAdult.Should().BeTrue();
     }
 
     [Fact]

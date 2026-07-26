@@ -21,6 +21,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -126,7 +127,6 @@ public class LiveTvService : IDisposable
             {
                 _cachedM3U = fromSnapshot;
                 _m3uCacheTime = DateTime.UtcNow;
-                StartBackgroundChannelRefresh();
                 return fromSnapshot;
             }
 
@@ -173,7 +173,6 @@ public class LiveTvService : IDisposable
             {
                 _cachedCatchupM3U = fromSnapshot;
                 _catchupCacheTime = DateTime.UtcNow;
-                StartBackgroundChannelRefresh();
                 return fromSnapshot;
             }
 
@@ -259,13 +258,129 @@ public class LiveTvService : IDisposable
             return null;
         }
 
-        var age = DateTime.UtcNow - snapshot!.CreatedAt;
+        // ProviderIndex is positional, so a reordered or replaced provider list would make the
+        // stored indices resolve to the wrong credentials. Refuse and fetch fresh instead.
+        if (!snapshot!.MatchesProviders(BuildProviderFingerprints(config)))
+        {
+            _logger.LogInformation(
+                "Stored Live TV snapshot references providers that have changed; fetching from the provider instead");
+            return null;
+        }
+
+        channels = ApplyRenderTimeFilters(channels, config);
+        if (channels.Count == 0)
+        {
+            return null;
+        }
+
+        var refreshDue = ShouldRefreshSnapshot(snapshot.CreatedAt, DateTime.UtcNow, config.M3UCacheMinutes);
+        var age = DateTime.UtcNow - snapshot.CreatedAt;
         _logger.LogInformation(
-            "Serving M3U from the stored channel snapshot ({Count} channels, {AgeMinutes:F0} minutes old) and refreshing in the background",
+            "Serving M3U from the stored channel snapshot ({Count} channels, {AgeMinutes:F0} minutes old, refresh due: {RefreshDue})",
             channels.Count,
-            age.TotalMinutes);
+            age.TotalMinutes,
+            refreshDue);
+
+        // Only when the snapshot has actually aged out. Refreshing on every cold poll would
+        // loop forever, because a successful refresh invalidates the cache that made the poll
+        // cold in the first place.
+        if (refreshDue)
+        {
+            StartBackgroundChannelRefresh();
+        }
 
         return GenerateM3U(channels, config, catchupOnly, GetServerBaseUrl(), snapshot.Categories);
+    }
+
+    /// <summary>
+    /// Builds an index to identity fingerprint map for the enabled Live TV providers. The
+    /// fingerprint is a hash so the snapshot file carries no base URL or username: it is only
+    /// used to detect that a stored provider index still means the same provider.
+    /// </summary>
+    /// <param name="config">The plugin configuration.</param>
+    /// <returns>The provider index to fingerprint map.</returns>
+    internal static Dictionary<int, string> BuildProviderFingerprints(PluginConfiguration config)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+
+        var map = new Dictionary<int, string>();
+        foreach (var (index, provider) in ResolveLiveTvProviders(config))
+        {
+            var material = string.Create(CultureInfo.InvariantCulture, $"{provider.BaseUrl}|{provider.Username}");
+            var hash = SHA256.HashData(Encoding.UTF8.GetBytes(material));
+            map[index] = Convert.ToHexString(hash)[..16].ToLowerInvariant();
+        }
+
+        return map;
+    }
+
+    /// <summary>
+    /// Re-applies the filters that the fetch path applies, so a snapshot taken before a filter
+    /// was switched on does not keep serving what the filter now excludes. Matters most for the
+    /// adult filter, where the staleness window is not acceptable.
+    /// </summary>
+    /// <param name="channels">The channels restored from a snapshot.</param>
+    /// <param name="config">The plugin configuration.</param>
+    /// <returns>The filtered channel list.</returns>
+    internal static List<LiveStreamInfo> ApplyRenderTimeFilters(List<LiveStreamInfo> channels, PluginConfiguration config)
+    {
+        ArgumentNullException.ThrowIfNull(channels);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var result = channels;
+
+        if (!config.IncludeAdultChannels)
+        {
+            result = result.Where(c => !c.IsAdult).ToList();
+        }
+
+        // IncludeAll deliberately ignores per-channel exclusions, matching the fetch path.
+        if (config.LiveChannelMode == LiveChannelSelectionMode.Custom)
+        {
+            result = FilterExcludedChannels(result, config.ExcludedLiveStreamIds);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Decides whether a completed fetch may write its snapshot. The fetch happens outside the
+    /// snapshot lock and more than one caller can be fetching (the background refresh and the
+    /// scheduled sync), so a slow fetch finishing last must not move the stored data backwards.
+    /// </summary>
+    /// <param name="fetchStartedAtUtc">When this caller started fetching.</param>
+    /// <param name="existingCreatedAtUtc">The stored snapshot's timestamp, null when there is none.</param>
+    /// <returns>True when this caller's data is not older than what is already stored.</returns>
+    internal static bool ShouldWriteSnapshot(DateTime fetchStartedAtUtc, DateTime? existingCreatedAtUtc)
+        => existingCreatedAtUtc is null || existingCreatedAtUtc <= fetchStartedAtUtc;
+
+    /// <summary>
+    /// Decides whether a snapshot is due for a refresh. A successful refresh calls
+    /// <see cref="InvalidateCache"/>, so the next tuner poll finds a cold cache again. Without
+    /// this check the cold path would start a refresh on every poll and re-download the whole
+    /// catalogue continuously, which is worse than the stall it was meant to fix.
+    /// </summary>
+    /// <param name="createdAtUtc">When the snapshot was written (default when unknown).</param>
+    /// <param name="nowUtc">The current time.</param>
+    /// <param name="cacheMinutes">The configured cache window in minutes.</param>
+    /// <returns>True when a background refresh should be started.</returns>
+    internal static bool ShouldRefreshSnapshot(DateTime createdAtUtc, DateTime nowUtc, int cacheMinutes)
+    {
+        if (createdAtUtc == default)
+        {
+            // No usable timestamp: refresh rather than pin the plugin to stale data forever.
+            return true;
+        }
+
+        var age = nowUtc - createdAtUtc;
+        if (age < TimeSpan.Zero)
+        {
+            // Stamped in the future (clock skew). Treat as fresh; reading it as infinitely
+            // stale would reintroduce the refresh-per-poll loop.
+            return false;
+        }
+
+        return age >= TimeSpan.FromMinutes(Math.Max(cacheMinutes, 1));
     }
 
     /// <summary>
@@ -333,7 +448,10 @@ public class LiveTvService : IDisposable
         try
         {
             await SaveChannelSnapshotAsync(
-                LiveChannelSnapshot.FromChannels(channels, categoryNames),
+                LiveChannelSnapshot.FromChannels(
+                    channels,
+                    categoryNames,
+                    BuildProviderFingerprints(Plugin.Instance.Configuration)),
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -370,6 +488,7 @@ public class LiveTvService : IDisposable
     /// <returns>The delta between the previous and current channel set.</returns>
     public async Task<LiveChannelDelta> RefreshChannelsAsync(CancellationToken cancellationToken)
     {
+        var fetchStartedAt = DateTime.UtcNow;
         var channels = await GetFilteredChannelsAsync(cancellationToken).ConfigureAwait(false);
 
         // Persisted alongside the channels so group titles survive a restart without a second
@@ -381,8 +500,22 @@ public class LiveTvService : IDisposable
         {
             var previous = await LoadChannelSnapshotAsync(cancellationToken).ConfigureAwait(false);
             var delta = LiveChannelSnapshot.ComputeDelta(previous, channels);
-            var next = LiveChannelSnapshot.FromChannels(channels, categoryNames);
-            await SaveChannelSnapshotAsync(next, cancellationToken).ConfigureAwait(false);
+
+            if (ShouldWriteSnapshot(fetchStartedAt, previous?.CreatedAt))
+            {
+                var next = LiveChannelSnapshot.FromChannels(
+                    channels,
+                    categoryNames,
+                    BuildProviderFingerprints(Plugin.Instance.Configuration));
+                await SaveChannelSnapshotAsync(next, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                // A fresher snapshot landed while this fetch was running. Keep it and report the
+                // delta we computed rather than moving the stored data backwards.
+                _logger.LogInformation(
+                    "A newer Live TV snapshot was written while this refresh was fetching; keeping the newer one");
+            }
 
             _logger.LogInformation(
                 "Live TV refresh: {Total} channels ({Added} added, {Updated} updated, {Removed} removed, {Unchanged} unchanged)",

@@ -353,6 +353,151 @@ public class LiveTvServiceTests
         _service.TryBeginChannelRefresh().Should().BeTrue();
     }
 
+    // A successful refresh calls InvalidateCache, so the next tuner poll finds a cold cache
+    // again. Starting a refresh on every cold poll therefore loops forever and re-downloads
+    // the whole catalogue at poll frequency. Only refresh when the snapshot is actually due.
+
+    // Fetch-time filters are baked into the snapshot, so turning a filter ON after a snapshot
+    // was taken would keep serving the filtered-out channels until the next refresh completes.
+    // For adult content that is not an acceptable staleness window, so the filters are
+    // re-applied when rendering from a snapshot.
+
+    [Fact]
+    public void ApplyRenderTimeFilters_AdultChannelsDroppedWhenNotIncluded()
+    {
+        var config = MakeM3UConfig();
+        config.IncludeAdultChannels = false;
+        var channels = new List<LiveStreamInfo>
+        {
+            new() { StreamId = 1, Name = "BBC One", Num = 1 },
+            new() { StreamId = 2, Name = "Adult Channel", Num = 2, IsAdult = true },
+        };
+
+        var result = LiveTvService.ApplyRenderTimeFilters(channels, config);
+
+        result.Select(c => c.StreamId).Should().BeEquivalentTo(new[] { 1 });
+    }
+
+    [Fact]
+    public void ApplyRenderTimeFilters_AdultChannelsKeptWhenIncluded()
+    {
+        var config = MakeM3UConfig();
+        config.IncludeAdultChannels = true;
+        var channels = new List<LiveStreamInfo>
+        {
+            new() { StreamId = 1, Name = "BBC One", Num = 1 },
+            new() { StreamId = 2, Name = "Adult Channel", Num = 2, IsAdult = true },
+        };
+
+        var result = LiveTvService.ApplyRenderTimeFilters(channels, config);
+
+        result.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public void ApplyRenderTimeFilters_ExclusionsReappliedInCustomMode()
+    {
+        var config = MakeM3UConfig();
+        config.LiveChannelMode = LiveChannelSelectionMode.Custom;
+        config.ExcludedLiveStreamIds = new[] { 2 };
+        var channels = new List<LiveStreamInfo>
+        {
+            new() { StreamId = 1, Name = "BBC One", Num = 1 },
+            new() { StreamId = 2, Name = "Newly Excluded", Num = 2 },
+        };
+
+        var result = LiveTvService.ApplyRenderTimeFilters(channels, config);
+
+        result.Select(c => c.StreamId).Should().BeEquivalentTo(new[] { 1 });
+    }
+
+    [Fact]
+    public void ApplyRenderTimeFilters_ExclusionsIgnoredInIncludeAllMode()
+    {
+        // Matches the fetch path, where IncludeAll deliberately ignores per-channel exclusions.
+        var config = MakeM3UConfig();
+        config.LiveChannelMode = LiveChannelSelectionMode.IncludeAll;
+        config.ExcludedLiveStreamIds = new[] { 2 };
+        var channels = new List<LiveStreamInfo>
+        {
+            new() { StreamId = 1, Name = "BBC One", Num = 1 },
+            new() { StreamId = 2, Name = "Excluded But IncludeAll", Num = 2 },
+        };
+
+        var result = LiveTvService.ApplyRenderTimeFilters(channels, config);
+
+        result.Should().HaveCount(2);
+    }
+
+    // The stampede guard only covers the background refresh. The scheduled sync calls
+    // RefreshChannelsAsync directly, and both fetch outside the snapshot lock, so a slow fetch
+    // that finishes last would overwrite a newer snapshot with older data.
+
+    [Fact]
+    public void ShouldWriteSnapshot_NoExistingSnapshot_Writes()
+    {
+        var started = new DateTime(2026, 7, 26, 12, 0, 0, DateTimeKind.Utc);
+
+        LiveTvService.ShouldWriteSnapshot(started, existingCreatedAtUtc: null).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ShouldWriteSnapshot_ExistingIsOlderThanOurFetch_Writes()
+    {
+        var started = new DateTime(2026, 7, 26, 12, 0, 0, DateTimeKind.Utc);
+
+        LiveTvService.ShouldWriteSnapshot(started, started.AddMinutes(-5)).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ShouldWriteSnapshot_NewerSnapshotLandedWhileWeFetched_DoesNotOverwrite()
+    {
+        // Our fetch started at 12:00 and something wrote a fresher snapshot at 12:02 while we
+        // were still downloading. Writing ours now would move the data backwards.
+        var started = new DateTime(2026, 7, 26, 12, 0, 0, DateTimeKind.Utc);
+
+        LiveTvService.ShouldWriteSnapshot(started, started.AddMinutes(2)).Should().BeFalse();
+    }
+
+    [Fact]
+    public void ShouldRefreshSnapshot_JustRefreshed_DoesNotRefreshAgain()
+    {
+        var now = new DateTime(2026, 7, 26, 12, 0, 0, DateTimeKind.Utc);
+
+        LiveTvService.ShouldRefreshSnapshot(now.AddMinutes(-1), now, cacheMinutes: 15)
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void ShouldRefreshSnapshot_OlderThanCacheWindow_Refreshes()
+    {
+        var now = new DateTime(2026, 7, 26, 12, 0, 0, DateTimeKind.Utc);
+
+        LiveTvService.ShouldRefreshSnapshot(now.AddMinutes(-16), now, cacheMinutes: 15)
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void ShouldRefreshSnapshot_NoTimestamp_Refreshes()
+    {
+        // A snapshot written before CreatedAt was populated, or a corrupt one, must not pin
+        // the plugin to stale data forever.
+        var now = new DateTime(2026, 7, 26, 12, 0, 0, DateTimeKind.Utc);
+
+        LiveTvService.ShouldRefreshSnapshot(default, now, cacheMinutes: 15).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ShouldRefreshSnapshot_ClockWentBackwards_DoesNotRefreshEveryPoll()
+    {
+        // A snapshot stamped in the future (clock skew, timezone bug) must not read as
+        // infinitely stale, which would reintroduce the refresh-per-poll loop.
+        var now = new DateTime(2026, 7, 26, 12, 0, 0, DateTimeKind.Utc);
+
+        LiveTvService.ShouldRefreshSnapshot(now.AddHours(1), now, cacheMinutes: 15)
+            .Should().BeFalse();
+    }
+
     [Fact]
     public void GenerateM3U_ChannelWithUnknownCategoryId_OmitsGroupTitle()
     {
