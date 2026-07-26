@@ -267,6 +267,13 @@ public class ProviderConfig
     public int RetryDelayMs { get; set; } = 1000;
 
     /// <summary>
+    /// Gets or sets the per-request timeout in seconds for calls to this provider.
+    /// Providers with hundreds of thousands of entries can take minutes to answer a single
+    /// catalog call, which the previous fixed 100 second HttpClient default could not cover.
+    /// </summary>
+    public int TimeoutSeconds { get; set; } = 300;
+
+    /// <summary>
     /// Validates and clamps all configuration values to safe ranges.
     /// </summary>
     public void Validate()
@@ -285,6 +292,7 @@ public class ProviderConfig
         RequestDelayMs = Math.Max(RequestDelayMs, 0);
         MaxRetries = Math.Clamp(MaxRetries, 0, 10);
         RetryDelayMs = Math.Max(RetryDelayMs, 0);
+        TimeoutSeconds = Math.Clamp(TimeoutSeconds, 10, 3600);
 
         OrphanSafetyThreshold = Math.Clamp(OrphanSafetyThreshold, 0.0, 1.0);
 

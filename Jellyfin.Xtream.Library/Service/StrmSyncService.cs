@@ -815,6 +815,7 @@ public partial class StrmSyncService
         _client.RequestDelayMs = provider.RequestDelayMs;
         _client.MaxRetries = provider.MaxRetries;
         _client.RetryDelayMs = provider.RetryDelayMs;
+        _client.Timeout = TimeSpan.FromSeconds(provider.TimeoutSeconds);
 
         // Compute provider key for snapshot directory isolation: "{index}-{urlHash8}"
         var urlHashBytes = MD5.HashData(Encoding.UTF8.GetBytes(provider.BaseUrl));

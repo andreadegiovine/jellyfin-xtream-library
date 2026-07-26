@@ -19,6 +19,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -53,7 +54,16 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
     };
 
     private readonly object _userAgentLock = new();
+    private readonly object _timeoutLock = new();
     private volatile bool _userAgentConfigured;
+    private volatile bool _httpTimeoutDisabled;
+
+    /// <summary>
+    /// Gets or sets the per-request timeout for API calls. A single call against a provider
+    /// with a very large catalog can take minutes, so this is configurable per provider via
+    /// <c>ProviderConfig.TimeoutSeconds</c>.
+    /// </summary>
+    public TimeSpan Timeout { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
     /// Gets or sets the delay in milliseconds between API requests.
@@ -114,6 +124,44 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
         // Set User-Agent before any requests are in flight
         var config = Plugin.Instance?.Configuration;
         UpdateUserAgent(config?.UserAgent);
+    }
+
+    /// <summary>
+    /// Hands timeout control to <see cref="Timeout"/> by removing the HttpClient's own ceiling.
+    /// Without this the IHttpClientFactory default of 100 seconds silently wins over any larger
+    /// configured value. Must run before the first request: HttpClient.Timeout throws once a
+    /// request has been sent, which is why this is separate from the User-Agent setup (that one
+    /// can be re-run at any time via UpdateUserAgent).
+    /// </summary>
+    private void EnsureHttpTimeoutDisabled()
+    {
+        if (_httpTimeoutDisabled)
+        {
+            return;
+        }
+
+        lock (_timeoutLock)
+        {
+            if (_httpTimeoutDisabled)
+            {
+                return;
+            }
+
+            try
+            {
+                client.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
+            }
+            catch (InvalidOperationException)
+            {
+                // A request already went out on this client, so its ceiling is fixed for the
+                // client's lifetime. Our own timeout still applies, it just cannot exceed it.
+                logger.LogDebug(
+                    "Could not lift the HttpClient timeout; effective ceiling stays {Ceiling}",
+                    client.Timeout);
+            }
+
+            _httpTimeoutDisabled = true;
+        }
     }
 
     private static string EncodeCredentials(ConnectionInfo connectionInfo)
@@ -208,17 +256,24 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
     private async Task<string> GetStringWithRetryAsync(Uri uri, CancellationToken cancellationToken)
     {
         EnsureUserAgent();
+        EnsureHttpTimeoutDisabled();
         int retryCount = 0;
         int currentDelay = RetryDelayMs;
 
         while (true)
         {
+            // Bounds this attempt without touching HttpClient.Timeout, which is immutable
+            // once a request has been sent and would therefore not be reconfigurable per
+            // provider on the long-lived client.
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(Timeout);
+
             try
             {
-                using var response = await client.GetAsync(uri, cancellationToken).ConfigureAwait(false);
+                using var response = await client.GetAsync(uri, timeoutCts.Token).ConfigureAwait(false);
                 response.EnsureSuccessStatusCode();
 
-                var content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var content = await response.Content.ReadAsStringAsync(timeoutCts.Token).ConfigureAwait(false);
 
                 // Apply request delay to prevent rate limiting
                 if (RequestDelayMs > 0)
@@ -238,6 +293,38 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
                 }
 
                 logger.LogWarning("HTTP {StatusCode} for URL: {Url}. Retry {Retry}/{MaxRetries} after {Delay}ms", (int?)ex.StatusCode, uri, retryCount + 1, MaxRetries, currentDelay);
+                await Task.Delay(currentDelay, cancellationToken).ConfigureAwait(false);
+                retryCount++;
+                currentDelay *= 2; // Exponential backoff
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Our own timeout fired rather than the caller cancelling. Previously this
+                // escaped as a bare TaskCanceledException and was never retried, so a single
+                // slow catalog response failed the whole channel fetch.
+                if (retryCount >= MaxRetries)
+                {
+                    logger.LogError(
+                        "Timed out after {Timeout} and {Retries} retries for URL: {Url}",
+                        Timeout,
+                        retryCount,
+                        uri);
+
+                    // Message deliberately carries no query string: Xtream URLs embed the
+                    // provider username and password.
+                    throw new TimeoutException(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Xtream request to {uri.Host} timed out after {Timeout.TotalSeconds:F0}s ({retryCount} retries). Raise the provider timeout if the catalog is very large."));
+                }
+
+                logger.LogWarning(
+                    "Timed out after {Timeout} for URL: {Url}. Retry {Retry}/{MaxRetries} after {Delay}ms",
+                    Timeout,
+                    uri,
+                    retryCount + 1,
+                    MaxRetries,
+                    currentDelay);
                 await Task.Delay(currentDelay, cancellationToken).ConfigureAwait(false);
                 retryCount++;
                 currentDelay *= 2; // Exponential backoff

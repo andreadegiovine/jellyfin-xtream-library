@@ -62,6 +62,25 @@ public class PluginConfigurationTests
     }
 
     [Fact]
+    public void ProviderConfig_TimeoutSeconds_DefaultsTo300()
+    {
+        new ProviderConfig().TimeoutSeconds.Should().Be(300);
+    }
+
+    [Fact]
+    public void ProviderConfig_Validate_ClampsTimeoutSeconds_ToValidRange()
+    {
+        // Providers with very large catalogs need a generous ceiling, so the upper bound
+        // is an hour rather than something tidy.
+        var tooLow = new ProviderConfig { TimeoutSeconds = 2 };
+        var tooHigh = new ProviderConfig { TimeoutSeconds = 99999 };
+        tooLow.Validate();
+        tooHigh.Validate();
+        tooLow.TimeoutSeconds.Should().Be(10);
+        tooHigh.TimeoutSeconds.Should().Be(3600);
+    }
+
+    [Fact]
     public void ProviderConfig_Validate_ClampsCategoryBatchSize_ToValidRange()
     {
         var provider = new ProviderConfig { CategoryBatchSize = 150 };
