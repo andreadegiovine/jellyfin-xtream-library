@@ -30,9 +30,15 @@ namespace Jellyfin.Xtream.Library.Service.Models;
 public class LiveChannelSnapshot
 {
     /// <summary>
+    /// Format version of a snapshot that carries everything M3U rendering needs.
+    /// Version 1 tracked only change-detection fields.
+    /// </summary>
+    public const int RenderableVersion = 2;
+
+    /// <summary>
     /// Gets or sets the snapshot format version.
     /// </summary>
-    public int Version { get; set; } = 1;
+    public int Version { get; set; } = RenderableVersion;
 
     /// <summary>
     /// Gets or sets when this snapshot was created.
@@ -40,16 +46,37 @@ public class LiveChannelSnapshot
     public DateTime CreatedAt { get; set; }
 
     /// <summary>
-    /// Gets or sets the channels indexed by StreamId.
+    /// Gets or sets the channels indexed by <see cref="ChannelKey(int, int)"/>. Keyed on provider *and*
+    /// stream id: <c>GetFilteredChannelsAsync</c> de-dupes by stream id within a provider but
+    /// deliberately allows the same id across providers, so a stream-id-only key silently drops
+    /// one of them.
     /// </summary>
-    public Dictionary<int, LiveChannelSnapshotEntry> Channels { get; set; } = new();
+    public Dictionary<string, LiveChannelSnapshotEntry> Channels { get; set; } = new();
+
+    /// <summary>
+    /// Gets or sets the category id to category name map, so group titles survive a restart
+    /// without re-fetching the category list.
+    /// </summary>
+    public Dictionary<int, string> Categories { get; set; } = new();
+
+    /// <summary>
+    /// Gets or sets the provider index to identity fingerprint map. <c>ProviderIndex</c> is
+    /// positional, so without this a reordered or replaced provider list would resolve a stored
+    /// index against a different provider and build stream URLs with the wrong credentials.
+    /// </summary>
+    public Dictionary<int, string> Providers { get; set; } = new();
 
     /// <summary>
     /// Builds a snapshot from the current channel list.
     /// </summary>
     /// <param name="channels">The current channels from the provider.</param>
+    /// <param name="categoryNames">Optional category id to name map to persist alongside the channels.</param>
+    /// <param name="providerFingerprints">Optional provider index to identity fingerprint map.</param>
     /// <returns>A new snapshot stamped with the current time.</returns>
-    public static LiveChannelSnapshot FromChannels(IEnumerable<LiveStreamInfo> channels)
+    public static LiveChannelSnapshot FromChannels(
+        IEnumerable<LiveStreamInfo> channels,
+        IReadOnlyDictionary<int, string>? categoryNames = null,
+        IReadOnlyDictionary<int, string>? providerFingerprints = null)
     {
         ArgumentNullException.ThrowIfNull(channels);
 
@@ -60,11 +87,84 @@ public class LiveChannelSnapshot
 
         foreach (var channel in channels)
         {
-            // Last write wins on StreamId collision - matches LiveTvService.GetFilteredChannelsAsync de-dup.
-            snapshot.Channels[channel.StreamId] = LiveChannelSnapshotEntry.From(channel);
+            // Last write wins within a provider, matching GetFilteredChannelsAsync's per-provider
+            // de-dup. Across providers the ids stay distinct because the key includes the index.
+            snapshot.Channels[ChannelKey(channel)] = LiveChannelSnapshotEntry.From(channel);
+        }
+
+        if (categoryNames != null)
+        {
+            foreach (var (id, name) in categoryNames)
+            {
+                snapshot.Categories[id] = name;
+            }
+        }
+
+        if (providerFingerprints != null)
+        {
+            foreach (var (index, fingerprint) in providerFingerprints)
+            {
+                snapshot.Providers[index] = fingerprint;
+            }
         }
 
         return snapshot;
+    }
+
+    /// <summary>
+    /// Checks that every provider index the stored channels point at still identifies the same
+    /// provider. Returns false when a referenced index is missing, changed, or was never
+    /// recorded, in which case the snapshot must not be rendered from.
+    /// </summary>
+    /// <param name="currentFingerprints">The current provider index to fingerprint map.</param>
+    /// <returns>True when the snapshot's provider indices are still valid.</returns>
+    public bool MatchesProviders(IReadOnlyDictionary<int, string> currentFingerprints)
+    {
+        ArgumentNullException.ThrowIfNull(currentFingerprints);
+
+        foreach (var index in Channels.Values.Select(c => c.ProviderIndex).Distinct())
+        {
+            if (!Providers.TryGetValue(index, out var stored)
+                || !currentFingerprints.TryGetValue(index, out var current)
+                || !string.Equals(stored, current, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Rebuilds the channel list from this snapshot so output can be produced without calling
+    /// the provider. Returns null for a pre-<see cref="RenderableVersion"/> snapshot: those files
+    /// predate the fields rendering needs, and defaulting them would invent data (a defaulted
+    /// ProviderIndex builds stream URLs with the wrong provider's credentials).
+    /// </summary>
+    /// <returns>The channels, or null when this snapshot cannot be rendered from.</returns>
+    public List<LiveStreamInfo>? ToChannels()
+    {
+        if (Version < RenderableVersion)
+        {
+            return null;
+        }
+
+        return Channels.Values
+            .Select(entry => new LiveStreamInfo
+            {
+                StreamId = entry.StreamId,
+                Name = entry.Name,
+                EpgChannelId = entry.EpgChannelId,
+                StreamIcon = entry.StreamIcon,
+                Num = entry.Num,
+                Tags = entry.Tags,
+                CategoryId = entry.CategoryId,
+                TvArchive = entry.TvArchive,
+                TvArchiveDuration = entry.TvArchiveDuration,
+                ProviderIndex = entry.ProviderIndex,
+                IsAdult = entry.IsAdult,
+            })
+            .ToList();
     }
 
     /// <summary>
@@ -78,20 +178,20 @@ public class LiveChannelSnapshot
         ArgumentNullException.ThrowIfNull(current);
 
         var delta = new LiveChannelDelta();
-        var previousChannels = previous?.Channels ?? new Dictionary<int, LiveChannelSnapshotEntry>();
-        var seen = new HashSet<int>();
+        var previousChannels = previous?.Channels ?? new Dictionary<string, LiveChannelSnapshotEntry>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var channel in current)
         {
-            if (!seen.Add(channel.StreamId))
+            if (!seen.Add(ChannelKey(channel)))
             {
-                // Duplicate StreamId in the input list - already counted.
+                // Same provider and stream id seen twice in the input list - already counted.
                 continue;
             }
 
             var newChecksum = LiveChannelSnapshotEntry.ComputeChecksum(channel);
 
-            if (!previousChannels.TryGetValue(channel.StreamId, out var existing))
+            if (!previousChannels.TryGetValue(ChannelKey(channel), out var existing))
             {
                 delta.AddedStreamIds.Add(channel.StreamId);
             }
@@ -105,16 +205,37 @@ public class LiveChannelSnapshot
             }
         }
 
-        foreach (var streamId in previousChannels.Keys)
+        foreach (var (key, entry) in previousChannels)
         {
-            if (!seen.Contains(streamId))
+            if (!seen.Contains(key))
             {
-                delta.RemovedStreamIds.Add(streamId);
+                delta.RemovedStreamIds.Add(entry.StreamId);
             }
         }
 
         return delta;
     }
+
+    /// <summary>
+    /// Builds the snapshot key for a channel. Provider index is part of the key because the same
+    /// stream id can legitimately come from two different providers.
+    /// </summary>
+    /// <param name="channel">The channel.</param>
+    /// <returns>The snapshot key.</returns>
+    public static string ChannelKey(LiveStreamInfo channel)
+    {
+        ArgumentNullException.ThrowIfNull(channel);
+        return ChannelKey(channel.ProviderIndex, channel.StreamId);
+    }
+
+    /// <summary>
+    /// Builds the snapshot key from a provider index and stream id.
+    /// </summary>
+    /// <param name="providerIndex">The provider index.</param>
+    /// <param name="streamId">The stream id.</param>
+    /// <returns>The snapshot key.</returns>
+    public static string ChannelKey(int providerIndex, int streamId)
+        => string.Create(CultureInfo.InvariantCulture, $"{providerIndex}:{streamId}");
 }
 
 /// <summary>
@@ -158,6 +279,38 @@ public class LiveChannelSnapshotEntry
     /// </summary>
     public string Checksum { get; set; } = string.Empty;
 
+    // The fields below exist so output can be rebuilt from the snapshot without calling the
+    // provider. They are deliberately outside ComputeChecksum: feeding them into it would make
+    // the first refresh after upgrading report every channel as updated.
+
+    /// <summary>
+    /// Gets or sets the provider category id, used for the M3U group title.
+    /// </summary>
+    public int? CategoryId { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the channel supports catch-up.
+    /// </summary>
+    public bool TvArchive { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of catch-up days the channel offers.
+    /// </summary>
+    public int TvArchiveDuration { get; set; }
+
+    /// <summary>
+    /// Gets or sets the index of the provider this channel came from. Required to build stream
+    /// URLs with the right credentials on multi-provider setups.
+    /// </summary>
+    public int ProviderIndex { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the provider flags this channel as adult.
+    /// Persisted so the adult filter can be re-applied when rendering from a snapshot, instead
+    /// of relying on whatever the filter happened to be when the snapshot was taken.
+    /// </summary>
+    public bool IsAdult { get; set; }
+
     /// <summary>
     /// Builds a snapshot entry from a live stream.
     /// </summary>
@@ -176,6 +329,11 @@ public class LiveChannelSnapshotEntry
             Num = channel.Num,
             Tags = channel.Tags,
             Checksum = ComputeChecksum(channel),
+            CategoryId = channel.CategoryId,
+            TvArchive = channel.TvArchive,
+            TvArchiveDuration = channel.TvArchiveDuration,
+            ProviderIndex = channel.ProviderIndex,
+            IsAdult = channel.IsAdult,
         };
     }
 
