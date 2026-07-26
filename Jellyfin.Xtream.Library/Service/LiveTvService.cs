@@ -54,6 +54,7 @@ public class LiveTvService : IDisposable
     private DateTime _m3uCacheTime = DateTime.MinValue;
     private DateTime _catchupCacheTime = DateTime.MinValue;
     private DateTime _epgCacheTime = DateTime.MinValue;
+    private int _refreshInFlight;
     private bool _disposed;
 
     /// <summary>
@@ -116,6 +117,19 @@ public class LiveTvService : IDisposable
                 return _cachedM3U;
             }
 
+            // Jellyfin gives its own fetch of this endpoint 100 seconds, a ceiling the plugin
+            // cannot raise. A full upstream catalog fetch can exceed that on a large provider,
+            // so answer from the stored snapshot and bring it up to date behind the request.
+            var fromSnapshot = await TryRenderM3UFromSnapshotAsync(config, catchupOnly: false, cancellationToken)
+                .ConfigureAwait(false);
+            if (fromSnapshot != null)
+            {
+                _cachedM3U = fromSnapshot;
+                _m3uCacheTime = DateTime.UtcNow;
+                StartBackgroundChannelRefresh();
+                return fromSnapshot;
+            }
+
             _logger.LogInformation("Generating M3U playlist");
             var channels = await GetFilteredChannelsAsync(cancellationToken).ConfigureAwait(false);
             var categoryNames = await GetCategoryNameMapAsync(cancellationToken).ConfigureAwait(false);
@@ -123,6 +137,9 @@ public class LiveTvService : IDisposable
 
             _cachedM3U = m3u;
             _m3uCacheTime = DateTime.UtcNow;
+
+            // Seed the snapshot so the next cold start does not repeat this fetch.
+            await PersistSnapshotAsync(channels, categoryNames, cancellationToken).ConfigureAwait(false);
 
             return m3u;
         }
@@ -150,6 +167,16 @@ public class LiveTvService : IDisposable
                 return _cachedCatchupM3U;
             }
 
+            var fromSnapshot = await TryRenderM3UFromSnapshotAsync(config, catchupOnly: true, cancellationToken)
+                .ConfigureAwait(false);
+            if (fromSnapshot != null)
+            {
+                _cachedCatchupM3U = fromSnapshot;
+                _catchupCacheTime = DateTime.UtcNow;
+                StartBackgroundChannelRefresh();
+                return fromSnapshot;
+            }
+
             _logger.LogInformation("Generating Catchup M3U playlist");
             var channels = await GetFilteredChannelsAsync(cancellationToken).ConfigureAwait(false);
             var categoryNames = await GetCategoryNameMapAsync(cancellationToken).ConfigureAwait(false);
@@ -157,6 +184,8 @@ public class LiveTvService : IDisposable
 
             _cachedCatchupM3U = m3u;
             _catchupCacheTime = DateTime.UtcNow;
+
+            await PersistSnapshotAsync(channels, categoryNames, cancellationToken).ConfigureAwait(false);
 
             return m3u;
         }
@@ -200,6 +229,125 @@ public class LiveTvService : IDisposable
     }
 
     /// <summary>
+    /// Renders the M3U from the stored channel snapshot, or returns null when there is nothing
+    /// usable to render from (no snapshot yet, an empty one, or a pre-v2 file that predates the
+    /// fields rendering needs). Callers fall back to fetching from the provider.
+    /// </summary>
+    /// <param name="config">The plugin configuration.</param>
+    /// <param name="catchupOnly">Whether to emit only catch-up capable channels.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The rendered playlist, or null when the snapshot cannot serve this request.</returns>
+    private async Task<string?> TryRenderM3UFromSnapshotAsync(
+        PluginConfiguration config,
+        bool catchupOnly,
+        CancellationToken cancellationToken)
+    {
+        LiveChannelSnapshot? snapshot;
+        try
+        {
+            snapshot = await LoadChannelSnapshotAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not read the Live TV channel snapshot; falling back to a provider fetch");
+            return null;
+        }
+
+        var channels = snapshot?.ToChannels();
+        if (channels == null || channels.Count == 0)
+        {
+            return null;
+        }
+
+        var age = DateTime.UtcNow - snapshot!.CreatedAt;
+        _logger.LogInformation(
+            "Serving M3U from the stored channel snapshot ({Count} channels, {AgeMinutes:F0} minutes old) and refreshing in the background",
+            channels.Count,
+            age.TotalMinutes);
+
+        return GenerateM3U(channels, config, catchupOnly, GetServerBaseUrl(), snapshot.Categories);
+    }
+
+    /// <summary>
+    /// Claims the right to run a channel refresh. Returns false when one is already running, so
+    /// every request arriving during a slow refresh does not kick off another one.
+    /// </summary>
+    /// <returns>True when the caller now owns the refresh and must call <see cref="EndChannelRefresh"/>.</returns>
+    internal bool TryBeginChannelRefresh()
+        => Interlocked.CompareExchange(ref _refreshInFlight, 1, 0) == 0;
+
+    /// <summary>
+    /// Releases the claim taken by <see cref="TryBeginChannelRefresh"/>. Must run even when the
+    /// refresh failed, otherwise no refresh is ever attempted again.
+    /// </summary>
+    internal void EndChannelRefresh()
+        => Interlocked.Exchange(ref _refreshInFlight, 0);
+
+    /// <summary>
+    /// Refreshes the channel set behind the current request. Used when output was served from a
+    /// stale snapshot: the caller gets an answer immediately and the fresh data lands in the
+    /// snapshot for the next request.
+    /// </summary>
+    private void StartBackgroundChannelRefresh()
+    {
+        if (!TryBeginChannelRefresh())
+        {
+            _logger.LogDebug("Live TV channel refresh already running; not starting another");
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RefreshChannelsAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Nothing awaits this task, so an escaping exception would be unobserved.
+                // Serving the previous snapshot is the correct fallback here.
+                _logger.LogError(ex, "Background Live TV channel refresh failed; continuing to serve the stored snapshot");
+            }
+            finally
+            {
+                EndChannelRefresh();
+            }
+        });
+    }
+
+    /// <summary>
+    /// Persists the channel set without computing a delta or invalidating the cache. Used after a
+    /// cold generation so the next restart has something to render from: the snapshot was
+    /// previously only ever written by a library sync, which a Live-TV-only user never runs.
+    /// </summary>
+    /// <param name="channels">The channels just fetched.</param>
+    /// <param name="categoryNames">The category names just fetched.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A task that completes when the snapshot has been written.</returns>
+    private async Task PersistSnapshotAsync(
+        List<LiveStreamInfo> channels,
+        IReadOnlyDictionary<int, string> categoryNames,
+        CancellationToken cancellationToken)
+    {
+        await _snapshotLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await SaveChannelSnapshotAsync(
+                LiveChannelSnapshot.FromChannels(channels, categoryNames),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Best effort: failing to cache must not fail the request that just succeeded.
+            _logger.LogWarning(ex, "Could not persist the Live TV channel snapshot");
+        }
+        finally
+        {
+            _snapshotLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Invalidates the M3U and EPG caches.
     /// </summary>
     public void InvalidateCache()
@@ -224,12 +372,16 @@ public class LiveTvService : IDisposable
     {
         var channels = await GetFilteredChannelsAsync(cancellationToken).ConfigureAwait(false);
 
+        // Persisted alongside the channels so group titles survive a restart without a second
+        // round trip to the provider.
+        var categoryNames = await GetCategoryNameMapAsync(cancellationToken).ConfigureAwait(false);
+
         await _snapshotLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var previous = await LoadChannelSnapshotAsync(cancellationToken).ConfigureAwait(false);
             var delta = LiveChannelSnapshot.ComputeDelta(previous, channels);
-            var next = LiveChannelSnapshot.FromChannels(channels);
+            var next = LiveChannelSnapshot.FromChannels(channels, categoryNames);
             await SaveChannelSnapshotAsync(next, cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation(

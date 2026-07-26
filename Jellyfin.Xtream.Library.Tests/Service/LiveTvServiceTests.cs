@@ -22,6 +22,7 @@ using Jellyfin.Xtream.Library;
 using Jellyfin.Xtream.Library.Client;
 using Jellyfin.Xtream.Library.Client.Models;
 using Jellyfin.Xtream.Library.Service;
+using Jellyfin.Xtream.Library.Service.Models;
 using MediaBrowser.Controller;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -301,6 +302,55 @@ public class LiveTvServiceTests
         var m3u = LiveTvService.GenerateM3U(channels, MakeM3UConfig(), catchupOnly: false, "http://127.0.0.1:8096", categoryNames);
 
         m3u.Should().Contain("group-title=\"Sports\"");
+    }
+
+    // Cold-cache handling renders the M3U from the persisted snapshot instead of doing a full
+    // upstream fetch inside the request, because Jellyfin only allows its own M3U fetch 100
+    // seconds. That only holds up if a snapshot round trip reproduces the same output.
+
+    [Fact]
+    public void GenerateM3U_FromSnapshotRestoredChannels_ByteForByteIdentical()
+    {
+        var config = MakeM3UConfig();
+        config.EnableCatchup = true;
+        config.CatchupDays = 7;
+        var channels = new List<LiveStreamInfo>
+        {
+            new()
+            {
+                StreamId = 1, Name = "BBC One", Num = 1, EpgChannelId = "bbc.one",
+                StreamIcon = "http://logos.example.com/bbc.png", CategoryId = 10,
+            },
+            new()
+            {
+                StreamId = 2, Name = "Sky Sports", Num = 2, CategoryId = 20,
+                TvArchive = true, TvArchiveDuration = 5,
+            },
+        };
+        var categoryNames = new Dictionary<int, string> { [10] = "General", [20] = "Sports" };
+        const string BaseUrl = "http://127.0.0.1:8096";
+
+        var fromLiveFetch = LiveTvService.GenerateM3U(channels, config, catchupOnly: false, BaseUrl, categoryNames);
+
+        var snapshot = LiveChannelSnapshot.FromChannels(channels, categoryNames);
+        var restored = snapshot.ToChannels();
+        restored.Should().NotBeNull();
+        var fromSnapshot = LiveTvService.GenerateM3U(restored!, config, catchupOnly: false, BaseUrl, snapshot.Categories);
+
+        fromSnapshot.Should().Be(fromLiveFetch);
+    }
+
+    [Fact]
+    public void TryBeginChannelRefresh_SecondCallerBlocked_UntilTheFirstEnds()
+    {
+        // Without this guard every request arriving during a slow refresh would kick off
+        // another one, which is the stampede the old lock-the-whole-request design avoided.
+        _service.TryBeginChannelRefresh().Should().BeTrue();
+        _service.TryBeginChannelRefresh().Should().BeFalse();
+
+        _service.EndChannelRefresh();
+
+        _service.TryBeginChannelRefresh().Should().BeTrue();
     }
 
     [Fact]

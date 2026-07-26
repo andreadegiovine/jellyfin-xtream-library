@@ -252,4 +252,96 @@ public class LiveChannelSnapshotTests
         snapshot.Channels[1].Name.Should().Be("BBC One HD");
         snapshot.Channels[1].Num.Should().Be(1101);
     }
+
+    // Rebuilding the M3U from the persisted snapshot is what removes the cold-cache stall:
+    // Jellyfin gives its own M3U fetch 100 seconds, which a full upstream catalog fetch can
+    // blow through on a large provider. Rendering needs the fields M3U generation reads, and
+    // v1 snapshots do not carry them.
+
+    private static LiveStreamInfo MakeRichChannel(int streamId) => new()
+    {
+        StreamId = streamId,
+        Name = "Sky Sports",
+        EpgChannelId = "sky.sports",
+        StreamIcon = "http://logos.example.com/sky.png",
+        Num = 101,
+        CategoryId = 42,
+        TvArchive = true,
+        TvArchiveDuration = 5,
+        ProviderIndex = 3,
+        Tags = new[] { "sport" },
+    };
+
+    [Fact]
+    public void FromChannels_StampsFormatVersion2()
+    {
+        LiveChannelSnapshot.FromChannels(new[] { MakeChannel(1, "BBC One") }).Version.Should().Be(2);
+    }
+
+    [Fact]
+    public void FromChannels_PersistsTheFieldsM3UGenerationNeeds()
+    {
+        var entry = LiveChannelSnapshot.FromChannels(new[] { MakeRichChannel(7) }).Channels[7];
+
+        entry.CategoryId.Should().Be(42);
+        entry.TvArchive.Should().BeTrue();
+        entry.TvArchiveDuration.Should().Be(5);
+        entry.ProviderIndex.Should().Be(3);
+    }
+
+    [Fact]
+    public void FromChannels_StoresCategoryNamesForGroupTitles()
+    {
+        var categoryNames = new Dictionary<int, string> { [42] = "Sports" };
+
+        var snapshot = LiveChannelSnapshot.FromChannels(new[] { MakeRichChannel(7) }, categoryNames);
+
+        snapshot.Categories.Should().ContainKey(42).WhoseValue.Should().Be("Sports");
+    }
+
+    [Fact]
+    public void ComputeChecksum_UnaffectedByTheNewlyPersistedFields()
+    {
+        // The checksum drives the add/update/remove delta. If persisting extra fields fed into
+        // it, the first refresh after upgrading would report every channel as updated.
+        var bare = MakeChannel(7, "Sky Sports", epg: "sky.sports", icon: "http://logos.example.com/sky.png", num: 101);
+        var rich = MakeRichChannel(7);
+        rich.Tags = null;
+
+        LiveChannelSnapshotEntry.ComputeChecksum(rich)
+            .Should().Be(LiveChannelSnapshotEntry.ComputeChecksum(bare));
+    }
+
+    [Fact]
+    public void ToChannels_RoundTripsEverythingRenderingReads()
+    {
+        var snapshot = LiveChannelSnapshot.FromChannels(new[] { MakeRichChannel(7) });
+
+        var restored = snapshot.ToChannels();
+
+        restored.Should().NotBeNull();
+        var channel = restored!.Single();
+        channel.StreamId.Should().Be(7);
+        channel.Name.Should().Be("Sky Sports");
+        channel.EpgChannelId.Should().Be("sky.sports");
+        channel.StreamIcon.Should().Be("http://logos.example.com/sky.png");
+        channel.Num.Should().Be(101);
+        channel.CategoryId.Should().Be(42);
+        channel.TvArchive.Should().BeTrue();
+        channel.TvArchiveDuration.Should().Be(5);
+        channel.ProviderIndex.Should().Be(3);
+        channel.Tags.Should().BeEquivalentTo(new[] { "sport" });
+    }
+
+    [Fact]
+    public void ToChannels_Version1Snapshot_RefusesToRender()
+    {
+        // A v1 file predates CategoryId/TvArchive/ProviderIndex. Rendering from it would invent
+        // data, and on a multi-provider setup a defaulted ProviderIndex means stream URLs built
+        // with the wrong provider's credentials. Refuse instead of guessing.
+        var snapshot = LiveChannelSnapshot.FromChannels(new[] { MakeRichChannel(7) });
+        snapshot.Version = 1;
+
+        snapshot.ToChannels().Should().BeNull();
+    }
 }
