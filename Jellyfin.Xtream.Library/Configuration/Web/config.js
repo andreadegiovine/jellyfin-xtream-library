@@ -498,6 +498,7 @@ const XtreamLibraryConfig = {
     // Update visibility based on folder mode
     updateFolderModeVisibility: function (type) {
         var modeSelect = document.getElementById(type === 'vod' ? 'selMovieFolderMode' : 'selSeriesFolderMode');
+        var categoriesModeSection = document.getElementById(type === 'vod' ? 'movieCategoriesModeContainer' : 'seriesCategoriesModeContainer');
         var singleSection = document.getElementById(type === 'vod' ? 'vodSingleFolderSection' : 'seriesSingleFolderSection');
         var multiSection = document.getElementById(type === 'vod' ? 'vodMultiFolderSection' : 'seriesMultiFolderSection');
 
@@ -505,10 +506,12 @@ const XtreamLibraryConfig = {
 
         if (mode === 'Multiple') {
             singleSection.style.display = 'none';
+            categoriesModeSection.style.display = 'none';
             multiSection.style.display = 'block';
             this.renderFolderList(type);
         } else {
             singleSection.style.display = 'block';
+            categoriesModeSection.style.display = 'block';
             multiSection.style.display = 'none';
         }
     },
