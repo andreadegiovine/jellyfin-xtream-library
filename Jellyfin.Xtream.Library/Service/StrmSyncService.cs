@@ -1249,7 +1249,8 @@ public partial class StrmSyncService
         if (selectedIds.Length > 0)
         {
             var selectedIdSet = selectedIds.ToHashSet();
-            var filteredCategories = categories.Where(c => selectedIdSet.Contains(c.CategoryId)).ToList();
+            bool exclude = string.Equals(provider.MovieCategoriesMode, "Exclude", StringComparison.OrdinalIgnoreCase);
+            var filteredCategories = categories.Where(c => exclude ? !selectedIdSet.Contains(c.CategoryId) : selectedIdSet.Contains(c.CategoryId)).ToList();
             var skippedCount = categories.Count - filteredCategories.Count;
             if (skippedCount > 0)
             {
@@ -1995,7 +1996,8 @@ public partial class StrmSyncService
         if (selectedIds.Length > 0)
         {
             var selectedIdSet = selectedIds.ToHashSet();
-            var filteredCategories = categories.Where(c => selectedIdSet.Contains(c.CategoryId)).ToList();
+            bool exclude = string.Equals(provider.SeriesCategoriesMode, "Exclude", StringComparison.OrdinalIgnoreCase);
+            var filteredCategories = categories.Where(c => exclude ? !selectedIdSet.Contains(c.CategoryId) : selectedIdSet.Contains(c.CategoryId)).ToList();
             var skippedCount = categories.Count - filteredCategories.Count;
             if (skippedCount > 0)
             {
