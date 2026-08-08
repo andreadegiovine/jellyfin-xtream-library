@@ -500,19 +500,16 @@ const XtreamLibraryConfig = {
         var modeSelect = document.getElementById(type === 'vod' ? 'selMovieFolderMode' : 'selSeriesFolderMode');
         var singleSection = document.getElementById(type === 'vod' ? 'vodSingleFolderSection' : 'seriesSingleFolderSection');
         var multiSection = document.getElementById(type === 'vod' ? 'vodMultiFolderSection' : 'seriesMultiFolderSection');
-        var descElem = document.getElementById(type === 'vod' ? 'vodCategoryDescription' : 'seriesCategoryDescription');
 
         var mode = modeSelect.value;
 
         if (mode === 'Multiple') {
             singleSection.style.display = 'none';
             multiSection.style.display = 'block';
-            descElem.textContent = 'Create folders and assign categories to each. Categories can be in multiple folders.';
             this.renderFolderList(type);
         } else {
             singleSection.style.display = 'block';
             multiSection.style.display = 'none';
-            descElem.textContent = 'Select specific categories to sync. Leave all unchecked to sync all categories.';
         }
     },
 
