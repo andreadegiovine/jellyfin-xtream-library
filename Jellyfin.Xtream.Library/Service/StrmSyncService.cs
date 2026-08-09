@@ -501,7 +501,19 @@ public partial class StrmSyncService
         CancellationToken cancellationToken)
     {
         var connectionInfo = new ConnectionInfo(provider.BaseUrl, provider.Username, provider.Password);
-        var categoryIds = provider.SelectedSeriesCategoryIds;
+        var allSeriesCategories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
+        var selectedIds = provider.SelectedSeriesCategoryIds;
+        var categoryIds = allSeriesCategories.Select(c => c.CategoryId).ToArray();
+        
+        if (selectedIds != null && selectedIds.Length > 0)
+        {
+            var selectedIdSet = selectedIds.ToHashSet();
+            bool exclude = string.Equals(provider.SeriesCategoriesMode, "Exclude", StringComparison.OrdinalIgnoreCase);
+            categoryIds = allSeriesCategories
+                .Where(c => exclude ? !selectedIdSet.Contains(c.CategoryId) : selectedIdSet.Contains(c.CategoryId))
+                .Select(c => c.CategoryId)
+                .ToArray();
+        }
 
         // If no categories selected, we can't search efficiently
         if (categoryIds == null || categoryIds.Length == 0)
