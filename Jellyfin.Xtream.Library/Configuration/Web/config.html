@@ -405,6 +405,15 @@
                                     Remove STRM files for content that no longer exists on the provider.
                                 </div>
                             </div>
+                            <div id="orphanSafetyThresholdSettings" class="inputContainer" style="display: none;">
+                                <label class="inputLabel inputLabelUnfocused" for="txtOrphanSafetyThreshold">Orphan Safety Threshold (%)</label>
+                                <input is="emby-input" type="number" id="txtOrphanSafetyThreshold" name="OrphanSafetyThreshold"
+                                       min="0" max="100" step="5" />
+                                <div class="fieldDescription">
+                                    Skip orphan cleanup if more than this percentage of existing content would be
+                                    deleted, as a protection against provider glitches (0-100%). Default: 20%.
+                                </div>
+                            </div>
                             <div class="checkboxContainer checkboxContainer-withDescription">
                                 <label class="emby-checkbox-label">
                                     <input is="emby-checkbox" type="checkbox" id="chkEnableMetadataLookup" name="EnableMetadataLookup" />

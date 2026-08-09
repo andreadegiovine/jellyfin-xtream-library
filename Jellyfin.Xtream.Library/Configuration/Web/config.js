@@ -75,7 +75,7 @@ const XtreamLibraryConfig = {
             FullSyncIntervalDays: 7,
             FullSyncChangeThreshold: 0.5,
             CleanupOrphans: true,
-            OrphanSafetyThreshold: 0.5,
+            OrphanSafetyThreshold: 0.2,
             SmartSkipExisting: true,
             SyncParallelism: 10,
             CategoryBatchSize: 25,
@@ -117,6 +117,8 @@ const XtreamLibraryConfig = {
         document.getElementById('chkSyncMovies').checked = p.SyncMovies !== false;
         document.getElementById('chkSyncSeries').checked = p.SyncSeries !== false;
         document.getElementById('chkCleanupOrphans').checked = p.CleanupOrphans !== false;
+        document.getElementById('txtOrphanSafetyThreshold').value = Math.round((p.OrphanSafetyThreshold || 0.20) * 100);
+        self.updateOrphanSafetyThresholdVisibility();
 
         self.selectedVodCategoryIds = p.SelectedVodCategoryIds || [];
         self.selectedSeriesCategoryIds = p.SelectedSeriesCategoryIds || [];
@@ -193,6 +195,7 @@ const XtreamLibraryConfig = {
         p.SyncMovies = document.getElementById('chkSyncMovies').checked;
         p.SyncSeries = document.getElementById('chkSyncSeries').checked;
         p.CleanupOrphans = document.getElementById('chkCleanupOrphans').checked;
+        p.OrphanSafetyThreshold = (parseInt(document.getElementById('txtOrphanSafetyThreshold').value) || 20) / 100;
 
         p.MovieCategoriesMode = document.getElementById('selMovieCategoriesMode').value;
         p.SeriesCategoriesMode = document.getElementById('selSeriesCategoriesMode').value;
@@ -1669,6 +1672,11 @@ const XtreamLibraryConfig = {
         document.getElementById('dispatcharrSettings').style.display = enabled ? 'block' : 'none';
     },
 
+    updateOrphanSafetyThresholdVisibility: function () {
+        const enabled = document.getElementById('chkCleanupOrphans').checked;
+        document.getElementById('orphanSafetyThresholdSettings').style.display = enabled ? 'block' : 'none';
+    },
+
     testDispatcharr: function () {
         const statusSpan = document.getElementById('dispatcharrStatus');
         statusSpan.innerHTML = '<span style="color: orange;">Testing...</span>';
@@ -2328,6 +2336,13 @@ function initXtreamLibraryConfig() {
     if (chkEnableDispatcharrMode) {
         chkEnableDispatcharrMode.addEventListener('change', function () {
             XtreamLibraryConfig.updateDispatcharrVisibility();
+        });
+    }
+
+    var chkCleanupOrphans = document.getElementById('chkCleanupOrphans');
+    if (chkCleanupOrphans) {
+        chkCleanupOrphans.addEventListener('change', function () {
+            XtreamLibraryConfig.updateOrphanSafetyThresholdVisibility();
         });
     }
 
