@@ -198,6 +198,30 @@ public class StrmSyncServiceTests
     }
 
     [Theory]
+    [InlineData("Movie V1", "Movie")]
+    [InlineData("Movie [V2]", "Movie")]
+    [InlineData("Movie v3", "Movie")]
+    [InlineData("Movie V1 HEVC 4K", "Movie")]
+    [InlineData("AV1", "Unknown")] // AV1 is a codec, stripped by CodecTagPattern before VersionTagPattern runs
+    public void SanitizeFileName_VersionTags_RemovesThem(string input, string expected)
+    {
+        var result = StrmSyncService.SanitizeFileName(input);
+
+        result.Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData("Movie V1", "V1")]
+    [InlineData("Movie [V2] HEVC", "V2 HEVC")]
+    [InlineData("AV1", "AV1")] // codec match wins; VersionTagPattern \bV does not match inside "AV1"
+    public void ExtractVersionLabel_VersionTags_ReturnsThem(string input, string expected)
+    {
+        var result = StrmSyncService.ExtractVersionLabel(input);
+
+        result.Should().Be(expected);
+    }
+
+    [Theory]
     [InlineData("Movie BluRay", "Movie")]
     [InlineData("Movie Blu-Ray", "Movie")]
     [InlineData("Movie WEBRip", "Movie")]
