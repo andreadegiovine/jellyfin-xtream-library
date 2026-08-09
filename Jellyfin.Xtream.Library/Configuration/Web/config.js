@@ -132,7 +132,7 @@ const XtreamLibraryConfig = {
 
         document.getElementById('selMovieFolderMode').value = p.MovieFolderMode || 'Single';
         document.getElementById('selSeriesFolderMode').value = p.SeriesFolderMode || 'Single';
-        
+
         document.getElementById('selMovieCategoriesMode').value = p.MovieCategoriesMode || 'Include';
         document.getElementById('selSeriesCategoriesMode').value = p.SeriesCategoriesMode || 'Include';
 
