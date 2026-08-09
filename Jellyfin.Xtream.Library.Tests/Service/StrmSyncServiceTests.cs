@@ -202,7 +202,7 @@ public class StrmSyncServiceTests
     [InlineData("Movie [V2]", "Movie")]
     [InlineData("Movie v3", "Movie")]
     [InlineData("Movie V1 HEVC 4K", "Movie")]
-    [InlineData("AV1", "Unknown")] // AV1 is a codec, stripped by CodecTagPattern before VersionTagPattern runs
+    [InlineData("AV1", "Unknown")]
     public void SanitizeFileName_VersionTags_RemovesThem(string input, string expected)
     {
         var result = StrmSyncService.SanitizeFileName(input);
@@ -213,7 +213,7 @@ public class StrmSyncServiceTests
     [Theory]
     [InlineData("Movie V1", "V1")]
     [InlineData("Movie [V2] HEVC", "HEVC V2")]
-    [InlineData("AV1", "AV1")] // codec match wins; VersionTagPattern \bV does not match inside "AV1"
+    [InlineData("AV1", "AV1")]
     public void ExtractVersionLabel_VersionTags_ReturnsThem(string input, string expected)
     {
         var result = StrmSyncService.ExtractVersionLabel(input);
