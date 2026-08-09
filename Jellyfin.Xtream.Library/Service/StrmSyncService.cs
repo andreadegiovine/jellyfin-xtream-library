@@ -504,7 +504,6 @@ public partial class StrmSyncService
         var allSeriesCategories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
         var selectedIds = provider.SelectedSeriesCategoryIds;
         var categoryIds = allSeriesCategories.Select(c => c.CategoryId).ToArray();
-
         if (selectedIds != null && selectedIds.Length > 0)
         {
             var selectedIdSet = selectedIds.ToHashSet();
