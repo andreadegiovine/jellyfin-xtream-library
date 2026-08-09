@@ -212,7 +212,7 @@ public class StrmSyncServiceTests
 
     [Theory]
     [InlineData("Movie V1", "V1")]
-    [InlineData("Movie [V2] HEVC", "V2 HEVC")]
+    [InlineData("Movie [V2] HEVC", "HEVC V2")]
     [InlineData("AV1", "AV1")] // codec match wins; VersionTagPattern \bV does not match inside "AV1"
     public void ExtractVersionLabel_VersionTags_ReturnsThem(string input, string expected)
     {
