@@ -212,7 +212,7 @@ const XtreamLibraryConfig = {
         } else {
             this.updateFolderDefinitionsFromUI('vod');
             p.MovieCategoriesMode = 'Include';
-            p.SelectedVodCategoryIds = this.getAllCategoryIdsFromFolders('vod');
+            p.SelectedVodCategoryIds = this.getSelectedCategoryIds('vod');
             p.MovieFolderMappings = this.buildFolderMappings(this.vodFolderDefinitions);
         }
 
@@ -222,7 +222,7 @@ const XtreamLibraryConfig = {
         } else {
             this.updateFolderDefinitionsFromUI('series');
             p.SeriesCategoriesMode = 'Include';
-            p.SelectedSeriesCategoryIds = this.getAllCategoryIdsFromFolders('series');
+            p.SelectedSeriesCategoryIds = this.getSelectedCategoryIds('series');
             p.SeriesFolderMappings = this.buildFolderMappings(this.seriesFolderDefinitions);
         }
 
