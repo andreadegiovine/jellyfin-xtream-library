@@ -117,7 +117,7 @@ const XtreamLibraryConfig = {
         document.getElementById('chkSyncMovies').checked = p.SyncMovies !== false;
         document.getElementById('chkSyncSeries').checked = p.SyncSeries !== false;
         document.getElementById('chkCleanupOrphans').checked = p.CleanupOrphans !== false;
-        document.getElementById('txtOrphanSafetyThreshold').value = Math.round((p.OrphanSafetyThreshold || 0.20) * 100);
+        document.getElementById('txtOrphanSafetyThreshold').value = Math.round((p.OrphanSafetyThreshold != null ? p.OrphanSafetyThreshold : 0.20) * 100);
         self.updateOrphanSafetyThresholdVisibility();
 
         self.selectedVodCategoryIds = p.SelectedVodCategoryIds || [];
@@ -195,7 +195,8 @@ const XtreamLibraryConfig = {
         p.SyncMovies = document.getElementById('chkSyncMovies').checked;
         p.SyncSeries = document.getElementById('chkSyncSeries').checked;
         p.CleanupOrphans = document.getElementById('chkCleanupOrphans').checked;
-        p.OrphanSafetyThreshold = (parseInt(document.getElementById('txtOrphanSafetyThreshold').value) || 20) / 100;
+        var orphanSafetyThresholdValue = parseInt(document.getElementById('txtOrphanSafetyThreshold').value);
+        p.OrphanSafetyThreshold = (isNaN(orphanSafetyThresholdValue) ? 20 : orphanSafetyThresholdValue) / 100;
 
         p.MovieCategoriesMode = document.getElementById('selMovieCategoriesMode').value;
         p.SeriesCategoriesMode = document.getElementById('selSeriesCategoriesMode').value;
