@@ -3039,9 +3039,11 @@ public partial class StrmSyncService
         cleanName = SourceTagPattern().Replace(cleanName, string.Empty);
 
         // Remove trailing version tags like "V1", "V2", "V3", etc. A name that is nothing but a
-        // version token is a real title (the 2021 film "V2"), so it is kept as-is.
+        // version token is a real title (the 2021 film "V2"), so it is kept as-is. The leftover is
+        // probed with the empty brackets already taken out, otherwise "[V2]" reads as the
+        // non-empty "[]" here, survives the guard, and is then wiped to "Unknown" two lines down.
         string withoutVersionTag = VersionTagPattern().Replace(cleanName, string.Empty);
-        if (!string.IsNullOrWhiteSpace(withoutVersionTag))
+        if (!string.IsNullOrWhiteSpace(EmptyBracketsPattern().Replace(withoutVersionTag, string.Empty)))
         {
             cleanName = withoutVersionTag;
         }
@@ -3112,10 +3114,11 @@ public partial class StrmSyncService
 
         cleanName = SourceTagPattern().Replace(cleanName, string.Empty);
 
-        // Same guard as SanitizeFileName: a name that is nothing but a version token is a real
-        // title, not a version marker. Without this the name and the label disagree and the file
-        // ends up as "V2 - V2.strm".
-        if (!string.IsNullOrWhiteSpace(VersionTagPattern().Replace(cleanName, string.Empty)))
+        // Same guard as SanitizeFileName, including the empty-bracket normalisation. Both have to
+        // reach the same verdict: if one strips the token and the other does not, the name and the
+        // label disagree and the file ends up as "V2 - V2.strm".
+        if (!string.IsNullOrWhiteSpace(
+            EmptyBracketsPattern().Replace(VersionTagPattern().Replace(cleanName, string.Empty), string.Empty)))
         {
             foreach (Match match in VersionTagPattern().Matches(cleanName))
             {

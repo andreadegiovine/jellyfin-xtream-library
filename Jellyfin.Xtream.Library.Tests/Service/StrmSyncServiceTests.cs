@@ -217,6 +217,12 @@ public class StrmSyncServiceTests
     [InlineData("V2: Escape from Hell", "V2 - Escape from Hell")]
     [InlineData("V1: Hitler's Vengeance Weapon", "V1 - Hitler's Vengeance Weapon")]
     [InlineData("V2 (2021)", "V2")]
+    [InlineData("V2 [4K]", "V2")]
+    [InlineData("V2 (4K)", "V2")]
+    // Bracketed and nothing else: the leftover after stripping is "[]", which is not whitespace,
+    // so the guard has to normalise empty brackets away before it decides.
+    [InlineData("[V2]", "[V2]")]
+    [InlineData("(V2)", "(V2)")]
     public void SanitizeFileName_VersionTagIsTheTitle_KeepsIt(string input, string expected)
     {
         var result = StrmSyncService.SanitizeFileName(input);
@@ -256,6 +262,8 @@ public class StrmSyncServiceTests
     [Theory]
     [InlineData("V2")]
     [InlineData("V2: Escape from Hell")]
+    [InlineData("[V2]")]
+    [InlineData("(V2)")]
     public void ExtractVersionLabel_VersionTagIsTheTitle_ReturnsNull(string input)
     {
         var result = StrmSyncService.ExtractVersionLabel(input);
