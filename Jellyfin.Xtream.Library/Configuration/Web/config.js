@@ -210,9 +210,15 @@ const XtreamLibraryConfig = {
             p.SelectedVodCategoryIds = this.getSelectedCategoryIds('vod');
             p.MovieFolderMappings = '';
         } else {
+            // Multiple folder mode. SelectedVodCategoryIds is the only thing the sync consults to
+            // decide *whether* a category is synced (StrmSyncService.SyncMoviesAsync); the folder
+            // mappings only decide *where* the files land. It therefore has to carry the union of
+            // the categories assigned to folders - reading the flat checkbox list here yields an
+            // empty array (that list is hidden, and often never rendered, in this mode), and an
+            // empty array means "sync every category on the provider".
             this.updateFolderDefinitionsFromUI('vod');
             p.MovieCategoriesMode = 'Include';
-            p.SelectedVodCategoryIds = this.getSelectedCategoryIds('vod');
+            p.SelectedVodCategoryIds = this.getAllCategoryIdsFromFolders('vod');
             p.MovieFolderMappings = this.buildFolderMappings(this.vodFolderDefinitions);
         }
 
@@ -220,9 +226,11 @@ const XtreamLibraryConfig = {
             p.SelectedSeriesCategoryIds = this.getSelectedCategoryIds('series');
             p.SeriesFolderMappings = '';
         } else {
+            // Same as movies above: the union of the folder-assigned categories, not the hidden
+            // flat checkbox list.
             this.updateFolderDefinitionsFromUI('series');
             p.SeriesCategoriesMode = 'Include';
-            p.SelectedSeriesCategoryIds = this.getSelectedCategoryIds('series');
+            p.SelectedSeriesCategoryIds = this.getAllCategoryIdsFromFolders('series');
             p.SeriesFolderMappings = this.buildFolderMappings(this.seriesFolderDefinitions);
         }
 
