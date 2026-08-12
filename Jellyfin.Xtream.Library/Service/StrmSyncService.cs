@@ -708,6 +708,18 @@ public partial class StrmSyncService
                 globalResult.ChannelsSkipped,
                 globalResult.ChannelsDeleted);
 
+            if (globalResult.OrphanCleanupSkipped)
+            {
+                // Restated at the end of the run so it sits next to the completion line rather
+                // than thousands of per-item entries earlier in the log.
+                _logger.LogWarning(
+                    "Sync finished with orphan cleanup blocked: {Total} orphaned STRM files ({Movies} movies, {Episodes} episodes) were left on disk because the deletion ratio exceeded the {Threshold:P0} safety threshold. Raise Orphan Safety Threshold in the plugin settings if the provider change was intentional.",
+                    globalResult.OrphansSkipped,
+                    globalResult.MovieOrphansSkipped,
+                    globalResult.EpisodeOrphansSkipped,
+                    globalResult.OrphanSafetyThresholdApplied);
+            }
+
             // Flush metadata cache to disk
             if (config.EnableMetadataLookup)
             {
@@ -1059,6 +1071,13 @@ public partial class StrmSyncService
 
             if (skipMovieCleanup)
             {
+                // Record the counts as well as logging them. Before this the numbers existed only
+                // as locals at the moment of the decision, so a run that refused to delete half
+                // the library reported Success/0 deleted/0 errors - identical to a clean run, and
+                // the only trace was one log line that scrolls away (GitHub #77).
+                result.MovieOrphansSkipped += orphanedMovies;
+                result.MovieOrphansExamined += existingMovieCount;
+
                 _logger.LogWarning(
                     "Skipping movie orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
                     orphanedMovies,
@@ -1069,12 +1088,22 @@ public partial class StrmSyncService
 
             if (skipEpisodeCleanup)
             {
+                result.EpisodeOrphansSkipped += orphanedEpisodes;
+                result.EpisodeOrphansExamined += existingEpisodeCount;
+
                 _logger.LogWarning(
                     "Skipping episode orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
                     orphanedEpisodes,
                     existingEpisodeCount,
                     episodeDeletionRatio,
                     safetyThreshold);
+            }
+
+            if (skipMovieCleanup || skipEpisodeCleanup)
+            {
+                // One provider, one cleanup pass, so this is the only threshold this result can
+                // carry. Merging several providers is where a choice has to be made.
+                result.OrphanSafetyThresholdApplied = safetyThreshold;
             }
 
             // Filter orphans based on safety checks
@@ -1167,6 +1196,9 @@ public partial class StrmSyncService
     /// <param name="providerResult">The result from a single provider.</param>
     private static void MergeResult(SyncResult globalResult, SyncResult providerResult)
     {
+        // Read before the counts below make it true for this provider's own contribution.
+        bool anEarlierProviderAlreadyBlocked = globalResult.OrphanCleanupSkipped;
+
         globalResult.MoviesCreated += providerResult.MoviesCreated;
         globalResult.MoviesUpdated += providerResult.MoviesUpdated;
         globalResult.MoviesSkipped += providerResult.MoviesSkipped;
@@ -1185,6 +1217,20 @@ public partial class StrmSyncService
         globalResult.EpisodesDeleted += providerResult.EpisodesDeleted;
         globalResult.EpisodeNameCollisions += providerResult.EpisodeNameCollisions;
         globalResult.FilesDeleted += providerResult.FilesDeleted;
+        globalResult.MovieOrphansSkipped += providerResult.MovieOrphansSkipped;
+        globalResult.MovieOrphansExamined += providerResult.MovieOrphansExamined;
+        globalResult.EpisodeOrphansSkipped += providerResult.EpisodeOrphansSkipped;
+        globalResult.EpisodeOrphansExamined += providerResult.EpisodeOrphansExamined;
+        if (providerResult.OrphanCleanupSkipped)
+        {
+            // The most conservative threshold in play is the one worth showing. Gated on the
+            // counts rather than on a non-zero threshold, because a provider set to 0% blocks
+            // every cleanup and still has to report the limit that did it.
+            globalResult.OrphanSafetyThresholdApplied = anEarlierProviderAlreadyBlocked
+                ? Math.Min(globalResult.OrphanSafetyThresholdApplied, providerResult.OrphanSafetyThresholdApplied)
+                : providerResult.OrphanSafetyThresholdApplied;
+        }
+
         globalResult.SeriesUnmatched += providerResult.SeriesUnmatched;
         globalResult.Errors += providerResult.Errors;
         globalResult.WasIncrementalSync = globalResult.WasIncrementalSync || providerResult.WasIncrementalSync;
@@ -4207,6 +4253,55 @@ public class SyncResult
     /// Gets or sets the number of files deleted (orphans) - legacy, use specific counts.
     /// </summary>
     public int FilesDeleted { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of orphaned movie STRM files that were found but deliberately left
+    /// on disk because deleting them would have exceeded the provider's orphan safety threshold.
+    /// Non-zero means the library still holds that many files the sync believes are dead, and it
+    /// will keep holding them until the threshold is raised or the provider recovers.
+    /// </summary>
+    public int MovieOrphansSkipped { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of existing movie STRM files that <see cref="MovieOrphansSkipped"/>
+    /// was measured against - the denominator of the ratio that tripped the safety threshold.
+    /// The denominator is carried instead of the ratio so the figure stays meaningful after
+    /// several providers are merged into one result.
+    /// </summary>
+    public int MovieOrphansExamined { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of orphaned episode STRM files that were found but deliberately
+    /// left on disk. See <see cref="MovieOrphansSkipped"/>; movies and episodes are gated
+    /// separately, so one can be cleaned while the other is blocked.
+    /// </summary>
+    public int EpisodeOrphansSkipped { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of existing episode STRM files that
+    /// <see cref="EpisodeOrphansSkipped"/> was measured against.
+    /// </summary>
+    public int EpisodeOrphansExamined { get; set; }
+
+    /// <summary>
+    /// Gets or sets the orphan safety threshold, as a fraction of the library, that blocked the
+    /// cleanup. Zero when nothing was blocked. When several providers blocked at different
+    /// thresholds this holds the lowest of them, so the limit shown to the user is the most
+    /// conservative one in play.
+    /// </summary>
+    public double OrphanSafetyThresholdApplied { get; set; }
+
+    /// <summary>
+    /// Gets the total number of orphaned STRM files that were found but not deleted.
+    /// </summary>
+    public int OrphansSkipped => MovieOrphansSkipped + EpisodeOrphansSkipped;
+
+    /// <summary>
+    /// Gets a value indicating whether orphan cleanup was blocked by the safety threshold. The
+    /// sync itself did not fail, so <see cref="Success"/> stays true; this is the separate signal
+    /// that the run deliberately did not finish part of its job.
+    /// </summary>
+    public bool OrphanCleanupSkipped => OrphansSkipped > 0;
 
     /// <summary>
     /// Gets or sets the number of errors encountered. Thread-safe for concurrent movie+series sync.
