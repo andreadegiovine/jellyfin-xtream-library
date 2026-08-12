@@ -501,24 +501,30 @@ public partial class StrmSyncService
         CancellationToken cancellationToken)
     {
         var connectionInfo = new ConnectionInfo(provider.BaseUrl, provider.Username, provider.Password);
-        var allSeriesCategories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
         var selectedIds = provider.SelectedSeriesCategoryIds;
-        var categoryIds = allSeriesCategories.Select(c => c.CategoryId).ToArray();
 
-        if (selectedIds != null && selectedIds.Length > 0)
-        {
-            var selectedIdSet = selectedIds.ToHashSet();
-            bool exclude = string.Equals(provider.SeriesCategoriesMode, "Exclude", StringComparison.OrdinalIgnoreCase);
-            categoryIds = allSeriesCategories
-                .Where(c => exclude ? !selectedIdSet.Contains(c.CategoryId) : selectedIdSet.Contains(c.CategoryId))
-                .Select(c => c.CategoryId)
-                .ToArray();
-        }
-
-        // If no categories selected, we can't search efficiently
-        if (categoryIds == null || categoryIds.Length == 0)
+        // This is the fallback path after a lookup has already failed, and it costs one
+        // GetSeriesByCategoryAsync call per category it walks. Only a selection that actually
+        // narrows the catalogue makes that worth doing: with nothing configured every category is
+        // in scope, and scanning all of them would hammer a provider that is already misbehaving.
+        // Bailing out here also keeps the GetSeriesCategoryAsync call below off the common path.
+        if (!CategorySelectionFilter.NarrowsSelection(selectedIds))
         {
             _logger.LogDebug("No series categories configured, cannot search for series by name");
+            return null;
+        }
+
+        var allSeriesCategories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
+        var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
+        bool exclude = CategorySelectionFilter.IsExcludeMode(provider.SeriesCategoriesMode);
+        var categoryIds = allSeriesCategories
+            .Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude))
+            .Select(c => c.CategoryId)
+            .ToArray();
+
+        if (categoryIds.Length == 0)
+        {
+            _logger.LogDebug("Series category selection resolves to nothing, cannot search for series by name");
             return null;
         }
 
@@ -1260,9 +1266,9 @@ public partial class StrmSyncService
         var selectedIds = provider.SelectedVodCategoryIds;
         if (selectedIds.Length > 0)
         {
-            var selectedIdSet = selectedIds.ToHashSet();
-            bool exclude = string.Equals(provider.MovieCategoriesMode, "Exclude", StringComparison.OrdinalIgnoreCase);
-            var filteredCategories = categories.Where(c => exclude ? !selectedIdSet.Contains(c.CategoryId) : selectedIdSet.Contains(c.CategoryId)).ToList();
+            var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
+            bool exclude = CategorySelectionFilter.IsExcludeMode(provider.MovieCategoriesMode);
+            var filteredCategories = categories.Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude)).ToList();
             var skippedCount = categories.Count - filteredCategories.Count;
             if (skippedCount > 0)
             {
@@ -2007,9 +2013,9 @@ public partial class StrmSyncService
         var selectedIds = provider.SelectedSeriesCategoryIds;
         if (selectedIds.Length > 0)
         {
-            var selectedIdSet = selectedIds.ToHashSet();
-            bool exclude = string.Equals(provider.SeriesCategoriesMode, "Exclude", StringComparison.OrdinalIgnoreCase);
-            var filteredCategories = categories.Where(c => exclude ? !selectedIdSet.Contains(c.CategoryId) : selectedIdSet.Contains(c.CategoryId)).ToList();
+            var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
+            bool exclude = CategorySelectionFilter.IsExcludeMode(provider.SeriesCategoriesMode);
+            var filteredCategories = categories.Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude)).ToList();
             var skippedCount = categories.Count - filteredCategories.Count;
             if (skippedCount > 0)
             {
