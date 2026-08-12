@@ -3032,8 +3032,13 @@ public partial class StrmSyncService
         // Remove source tags like "BluRay", "WEBRip", "HDTV", etc.
         cleanName = SourceTagPattern().Replace(cleanName, string.Empty);
 
-        // Remove generic version tags like "V1", "V2", "V3", etc.
-        cleanName = VersionTagPattern().Replace(cleanName, string.Empty);
+        // Remove trailing version tags like "V1", "V2", "V3", etc. A name that is nothing but a
+        // version token is a real title (the 2021 film "V2"), so it is kept as-is.
+        string withoutVersionTag = VersionTagPattern().Replace(cleanName, string.Empty);
+        if (!string.IsNullOrWhiteSpace(withoutVersionTag))
+        {
+            cleanName = withoutVersionTag;
+        }
 
         // Remove empty brackets left after tag stripping (e.g., "Movie [4K]" → "Movie []" → "Movie")
         cleanName = EmptyBracketsPattern().Replace(cleanName, string.Empty);
@@ -3077,24 +3082,39 @@ public partial class StrmSyncService
 
         var labels = new List<string>();
 
+        // Each tag is stripped after it is collected, mirroring the order SanitizeFileName uses.
+        // VersionTagPattern is anchored to the end of the name, so it cannot see the "V1" in
+        // "Movie V1 HEVC 4K" until "HEVC" and "4K" have been removed.
         foreach (Match match in CodecTagPattern().Matches(cleanName))
         {
             labels.Add(match.Value);
         }
+
+        cleanName = CodecTagPattern().Replace(cleanName, string.Empty);
 
         foreach (Match match in QualityTagPattern().Matches(cleanName))
         {
             labels.Add(match.Value);
         }
 
+        cleanName = QualityTagPattern().Replace(cleanName, string.Empty);
+
         foreach (Match match in SourceTagPattern().Matches(cleanName))
         {
             labels.Add(match.Value);
         }
 
-        foreach (Match match in VersionTagPattern().Matches(cleanName))
+        cleanName = SourceTagPattern().Replace(cleanName, string.Empty);
+
+        // Same guard as SanitizeFileName: a name that is nothing but a version token is a real
+        // title, not a version marker. Without this the name and the label disagree and the file
+        // ends up as "V2 - V2.strm".
+        if (!string.IsNullOrWhiteSpace(VersionTagPattern().Replace(cleanName, string.Empty)))
         {
-            labels.Add(match.Value);
+            foreach (Match match in VersionTagPattern().Matches(cleanName))
+            {
+                labels.Add(match.Value);
+            }
         }
 
         return labels.Count > 0 ? string.Join(" ", labels) : null;
@@ -3592,8 +3612,13 @@ public partial class StrmSyncService
     [GeneratedRegex(@"\b(?:Blu-?Ray|BRRip|BDRip|WEB-?(?:Rip|DL)?|HDTV|DVDRip|DVD|REMUX|CAM|TS|HC|PROPER|REPACK)\b", RegexOptions.IgnoreCase)]
     private static partial Regex SourceTagPattern();
 
-    // Matches generic numbered version tags like "V1", "V2", "V3", to mark duplicate/alternate streams.
-    [GeneratedRegex(@"\bV[0-9]+\b", RegexOptions.IgnoreCase)]
+    // Matches generic numbered version tags like "V1", "V2", "V3", used to mark duplicate/alternate
+    // streams. Anchored to the end of the name (optionally inside a closing bracket) so that real
+    // titles beginning with a V-plus-digit token - "V2", "V1: Hitler's Vengeance Weapon" - survive.
+    // Only the token itself is consumed, exactly like the codec/quality/source patterns, so the
+    // surrounding " - []" is cleaned up by EmptyBracketsPattern and a "[V1]" variant ends up with
+    // the same folder name as the "[4K]" variant of the same title.
+    [GeneratedRegex(@"\bV[0-9]+\b(?=\s*[\]\)]?\s*$)", RegexOptions.IgnoreCase)]
     private static partial Regex VersionTagPattern();
 
     // Fixes malformed quotes like "'\'" "\''" "'\''" "Bob'\''s" to just "'"

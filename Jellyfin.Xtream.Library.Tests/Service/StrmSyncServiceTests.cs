@@ -210,15 +210,57 @@ public class StrmSyncServiceTests
         result.Should().Be(expected);
     }
 
+    // The version pattern is anchored to the end of the name, so a title that legitimately
+    // starts with a V-plus-digit token keeps its name instead of being reduced to "Unknown".
+    [Theory]
+    [InlineData("V2", "V2")]
+    [InlineData("V2: Escape from Hell", "V2 - Escape from Hell")]
+    [InlineData("V1: Hitler's Vengeance Weapon", "V1 - Hitler's Vengeance Weapon")]
+    [InlineData("V2 (2021)", "V2")]
+    public void SanitizeFileName_VersionTagIsTheTitle_KeepsIt(string input, string expected)
+    {
+        var result = StrmSyncService.SanitizeFileName(input);
+
+        result.Should().Be(expected);
+    }
+
+    // The point of stripping the tag: every variant of the same title has to collapse to one
+    // folder name so Jellyfin shows a single movie with a version dropdown (issue #74).
+    [Theory]
+    [InlineData("Final Destination Bloodlines (2025) - [V1]")]
+    [InlineData("Final Destination Bloodlines (2025) - [V2]")]
+    [InlineData("Final Destination Bloodlines (2025) - [4K]")]
+    [InlineData("Final Destination Bloodlines (2025) - [FHD]")]
+    public void SanitizeFileName_VersionAndQualityVariants_ShareOneFolderName(string input)
+    {
+        var result = StrmSyncService.SanitizeFileName(input);
+
+        result.Should().Be("Final Destination Bloodlines (2025)");
+    }
+
     [Theory]
     [InlineData("Movie V1", "V1")]
     [InlineData("Movie [V2] HEVC", "HEVC V2")]
     [InlineData("AV1", "AV1")]
+    [InlineData("Movie V1 HEVC 4K", "HEVC 4K V1")]
+    [InlineData("Final Destination Bloodlines (2025) - [V2]", "V2")]
     public void ExtractVersionLabel_VersionTags_ReturnsThem(string input, string expected)
     {
         var result = StrmSyncService.ExtractVersionLabel(input);
 
         result.Should().Be(expected);
+    }
+
+    // A name that is nothing but a version token is a real title, so it must not also be
+    // reported as a version label - otherwise the file lands as "V2 - V2.strm".
+    [Theory]
+    [InlineData("V2")]
+    [InlineData("V2: Escape from Hell")]
+    public void ExtractVersionLabel_VersionTagIsTheTitle_ReturnsNull(string input)
+    {
+        var result = StrmSyncService.ExtractVersionLabel(input);
+
+        result.Should().BeNull();
     }
 
     [Theory]
