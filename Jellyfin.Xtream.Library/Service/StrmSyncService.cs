@@ -501,12 +501,30 @@ public partial class StrmSyncService
         CancellationToken cancellationToken)
     {
         var connectionInfo = new ConnectionInfo(provider.BaseUrl, provider.Username, provider.Password);
-        var categoryIds = provider.SelectedSeriesCategoryIds;
+        var selectedIds = provider.SelectedSeriesCategoryIds;
 
-        // If no categories selected, we can't search efficiently
-        if (categoryIds == null || categoryIds.Length == 0)
+        // This is the fallback path after a lookup has already failed, and it costs one
+        // GetSeriesByCategoryAsync call per category it walks. Only a selection that actually
+        // narrows the catalogue makes that worth doing: with nothing configured every category is
+        // in scope, and scanning all of them would hammer a provider that is already misbehaving.
+        // Bailing out here also keeps the GetSeriesCategoryAsync call below off the common path.
+        if (!CategorySelectionFilter.NarrowsSelection(selectedIds))
         {
             _logger.LogDebug("No series categories configured, cannot search for series by name");
+            return null;
+        }
+
+        var allSeriesCategories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
+        var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
+        bool exclude = CategorySelectionFilter.IsExcludeMode(provider.SeriesCategoriesMode);
+        var categoryIds = allSeriesCategories
+            .Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude))
+            .Select(c => c.CategoryId)
+            .ToArray();
+
+        if (categoryIds.Length == 0)
+        {
+            _logger.LogDebug("Series category selection resolves to nothing, cannot search for series by name");
             return null;
         }
 
@@ -1248,8 +1266,9 @@ public partial class StrmSyncService
         var selectedIds = provider.SelectedVodCategoryIds;
         if (selectedIds.Length > 0)
         {
-            var selectedIdSet = selectedIds.ToHashSet();
-            var filteredCategories = categories.Where(c => selectedIdSet.Contains(c.CategoryId)).ToList();
+            var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
+            bool exclude = CategorySelectionFilter.IsExcludeMode(provider.MovieCategoriesMode);
+            var filteredCategories = categories.Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude)).ToList();
             var skippedCount = categories.Count - filteredCategories.Count;
             if (skippedCount > 0)
             {
@@ -1994,8 +2013,9 @@ public partial class StrmSyncService
         var selectedIds = provider.SelectedSeriesCategoryIds;
         if (selectedIds.Length > 0)
         {
-            var selectedIdSet = selectedIds.ToHashSet();
-            var filteredCategories = categories.Where(c => selectedIdSet.Contains(c.CategoryId)).ToList();
+            var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
+            bool exclude = CategorySelectionFilter.IsExcludeMode(provider.SeriesCategoriesMode);
+            var filteredCategories = categories.Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude)).ToList();
             var skippedCount = categories.Count - filteredCategories.Count;
             if (skippedCount > 0)
             {
@@ -3018,6 +3038,16 @@ public partial class StrmSyncService
         // Remove source tags like "BluRay", "WEBRip", "HDTV", etc.
         cleanName = SourceTagPattern().Replace(cleanName, string.Empty);
 
+        // Remove trailing version tags like "V1", "V2", "V3", etc. A name that is nothing but a
+        // version token is a real title (the 2021 film "V2"), so it is kept as-is. The leftover is
+        // probed with the empty brackets already taken out, otherwise "[V2]" reads as the
+        // non-empty "[]" here, survives the guard, and is then wiped to "Unknown" two lines down.
+        string withoutVersionTag = VersionTagPattern().Replace(cleanName, string.Empty);
+        if (!string.IsNullOrWhiteSpace(EmptyBracketsPattern().Replace(withoutVersionTag, string.Empty)))
+        {
+            cleanName = withoutVersionTag;
+        }
+
         // Remove empty brackets left after tag stripping (e.g., "Movie [4K]" → "Movie []" → "Movie")
         cleanName = EmptyBracketsPattern().Replace(cleanName, string.Empty);
 
@@ -3060,19 +3090,40 @@ public partial class StrmSyncService
 
         var labels = new List<string>();
 
+        // Each tag is stripped after it is collected, mirroring the order SanitizeFileName uses.
+        // VersionTagPattern is anchored to the end of the name, so it cannot see the "V1" in
+        // "Movie V1 HEVC 4K" until "HEVC" and "4K" have been removed.
         foreach (Match match in CodecTagPattern().Matches(cleanName))
         {
             labels.Add(match.Value);
         }
+
+        cleanName = CodecTagPattern().Replace(cleanName, string.Empty);
 
         foreach (Match match in QualityTagPattern().Matches(cleanName))
         {
             labels.Add(match.Value);
         }
 
+        cleanName = QualityTagPattern().Replace(cleanName, string.Empty);
+
         foreach (Match match in SourceTagPattern().Matches(cleanName))
         {
             labels.Add(match.Value);
+        }
+
+        cleanName = SourceTagPattern().Replace(cleanName, string.Empty);
+
+        // Same guard as SanitizeFileName, including the empty-bracket normalisation. Both have to
+        // reach the same verdict: if one strips the token and the other does not, the name and the
+        // label disagree and the file ends up as "V2 - V2.strm".
+        if (!string.IsNullOrWhiteSpace(
+            EmptyBracketsPattern().Replace(VersionTagPattern().Replace(cleanName, string.Empty), string.Empty)))
+        {
+            foreach (Match match in VersionTagPattern().Matches(cleanName))
+            {
+                labels.Add(match.Value);
+            }
         }
 
         return labels.Count > 0 ? string.Join(" ", labels) : null;
@@ -3569,6 +3620,15 @@ public partial class StrmSyncService
     // Matches source tags like "BluRay", "BRRip", "WEBRip", "WEB-DL", "HDTV", "DVDRip", "REMUX", etc.
     [GeneratedRegex(@"\b(?:Blu-?Ray|BRRip|BDRip|WEB-?(?:Rip|DL)?|HDTV|DVDRip|DVD|REMUX|CAM|TS|HC|PROPER|REPACK)\b", RegexOptions.IgnoreCase)]
     private static partial Regex SourceTagPattern();
+
+    // Matches generic numbered version tags like "V1", "V2", "V3", used to mark duplicate/alternate
+    // streams. Anchored to the end of the name (optionally inside a closing bracket) so that real
+    // titles beginning with a V-plus-digit token - "V2", "V1: Hitler's Vengeance Weapon" - survive.
+    // Only the token itself is consumed, exactly like the codec/quality/source patterns, so the
+    // surrounding " - []" is cleaned up by EmptyBracketsPattern and a "[V1]" variant ends up with
+    // the same folder name as the "[4K]" variant of the same title.
+    [GeneratedRegex(@"\bV[0-9]+\b(?=\s*[\]\)]?\s*$)", RegexOptions.IgnoreCase)]
+    private static partial Regex VersionTagPattern();
 
     // Fixes malformed quotes like "'\'" "\''" "'\''" "Bob'\''s" to just "'"
     [GeneratedRegex(@"'\\''|'\\'|\\''|''+")]

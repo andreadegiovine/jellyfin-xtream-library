@@ -57,6 +57,8 @@ const XtreamLibraryConfig = {
             ExcludedSeriesIds: [],
             MovieFolderMode: 'Single',
             SeriesFolderMode: 'Single',
+            MovieCategoriesMode: 'Include',
+            SeriesCategoriesMode: 'Include',
             MovieFolderMappings: '',
             SeriesFolderMappings: '',
             TmdbFolderIdOverrides: '',
@@ -73,7 +75,7 @@ const XtreamLibraryConfig = {
             FullSyncIntervalDays: 7,
             FullSyncChangeThreshold: 0.5,
             CleanupOrphans: true,
-            OrphanSafetyThreshold: 0.5,
+            OrphanSafetyThreshold: 0.2,
             SmartSkipExisting: true,
             SyncParallelism: 10,
             CategoryBatchSize: 25,
@@ -115,6 +117,8 @@ const XtreamLibraryConfig = {
         document.getElementById('chkSyncMovies').checked = p.SyncMovies !== false;
         document.getElementById('chkSyncSeries').checked = p.SyncSeries !== false;
         document.getElementById('chkCleanupOrphans').checked = p.CleanupOrphans !== false;
+        document.getElementById('txtOrphanSafetyThreshold').value = Math.round((p.OrphanSafetyThreshold != null ? p.OrphanSafetyThreshold : 0.20) * 100);
+        self.updateOrphanSafetyThresholdVisibility();
 
         self.selectedVodCategoryIds = p.SelectedVodCategoryIds || [];
         self.selectedSeriesCategoryIds = p.SelectedSeriesCategoryIds || [];
@@ -128,6 +132,9 @@ const XtreamLibraryConfig = {
 
         document.getElementById('selMovieFolderMode').value = p.MovieFolderMode || 'Single';
         document.getElementById('selSeriesFolderMode').value = p.SeriesFolderMode || 'Single';
+
+        document.getElementById('selMovieCategoriesMode').value = p.MovieCategoriesMode || 'Include';
+        document.getElementById('selSeriesCategoriesMode').value = p.SeriesCategoriesMode || 'Include';
 
         self.vodFolderDefinitions = self.parseFolderMappings(p.MovieFolderMappings);
         self.seriesFolderDefinitions = self.parseFolderMappings(p.SeriesFolderMappings);
@@ -188,6 +195,11 @@ const XtreamLibraryConfig = {
         p.SyncMovies = document.getElementById('chkSyncMovies').checked;
         p.SyncSeries = document.getElementById('chkSyncSeries').checked;
         p.CleanupOrphans = document.getElementById('chkCleanupOrphans').checked;
+        var orphanSafetyThresholdValue = parseInt(document.getElementById('txtOrphanSafetyThreshold').value);
+        p.OrphanSafetyThreshold = (isNaN(orphanSafetyThresholdValue) ? 20 : orphanSafetyThresholdValue) / 100;
+
+        p.MovieCategoriesMode = document.getElementById('selMovieCategoriesMode').value;
+        p.SeriesCategoriesMode = document.getElementById('selSeriesCategoriesMode').value;
 
         var movieMode = document.getElementById('selMovieFolderMode').value;
         var seriesMode = document.getElementById('selSeriesFolderMode').value;
@@ -198,7 +210,14 @@ const XtreamLibraryConfig = {
             p.SelectedVodCategoryIds = this.getSelectedCategoryIds('vod');
             p.MovieFolderMappings = '';
         } else {
+            // Multiple folder mode. SelectedVodCategoryIds is the only thing the sync consults to
+            // decide *whether* a category is synced (StrmSyncService.SyncMoviesAsync); the folder
+            // mappings only decide *where* the files land. It therefore has to carry the union of
+            // the categories assigned to folders - reading the flat checkbox list here yields an
+            // empty array (that list is hidden, and often never rendered, in this mode), and an
+            // empty array means "sync every category on the provider".
             this.updateFolderDefinitionsFromUI('vod');
+            p.MovieCategoriesMode = 'Include';
             p.SelectedVodCategoryIds = this.getAllCategoryIdsFromFolders('vod');
             p.MovieFolderMappings = this.buildFolderMappings(this.vodFolderDefinitions);
         }
@@ -207,7 +226,10 @@ const XtreamLibraryConfig = {
             p.SelectedSeriesCategoryIds = this.getSelectedCategoryIds('series');
             p.SeriesFolderMappings = '';
         } else {
+            // Same as movies above: the union of the folder-assigned categories, not the hidden
+            // flat checkbox list.
             this.updateFolderDefinitionsFromUI('series');
+            p.SeriesCategoriesMode = 'Include';
             p.SelectedSeriesCategoryIds = this.getAllCategoryIdsFromFolders('series');
             p.SeriesFolderMappings = this.buildFolderMappings(this.seriesFolderDefinitions);
         }
@@ -490,21 +512,21 @@ const XtreamLibraryConfig = {
     // Update visibility based on folder mode
     updateFolderModeVisibility: function (type) {
         var modeSelect = document.getElementById(type === 'vod' ? 'selMovieFolderMode' : 'selSeriesFolderMode');
+        var categoriesModeSection = document.getElementById(type === 'vod' ? 'movieCategoriesModeContainer' : 'seriesCategoriesModeContainer');
         var singleSection = document.getElementById(type === 'vod' ? 'vodSingleFolderSection' : 'seriesSingleFolderSection');
         var multiSection = document.getElementById(type === 'vod' ? 'vodMultiFolderSection' : 'seriesMultiFolderSection');
-        var descElem = document.getElementById(type === 'vod' ? 'vodCategoryDescription' : 'seriesCategoryDescription');
 
         var mode = modeSelect.value;
 
         if (mode === 'Multiple') {
             singleSection.style.display = 'none';
+            categoriesModeSection.style.display = 'none';
             multiSection.style.display = 'block';
-            descElem.textContent = 'Create folders and assign categories to each. Categories can be in multiple folders.';
             this.renderFolderList(type);
         } else {
             singleSection.style.display = 'block';
+            categoriesModeSection.style.display = 'block';
             multiSection.style.display = 'none';
-            descElem.textContent = 'Select specific categories to sync. Leave all unchecked to sync all categories.';
         }
     },
 
@@ -1659,6 +1681,11 @@ const XtreamLibraryConfig = {
         document.getElementById('dispatcharrSettings').style.display = enabled ? 'block' : 'none';
     },
 
+    updateOrphanSafetyThresholdVisibility: function () {
+        const enabled = document.getElementById('chkCleanupOrphans').checked;
+        document.getElementById('orphanSafetyThresholdSettings').style.display = enabled ? 'block' : 'none';
+    },
+
     testDispatcharr: function () {
         const statusSpan = document.getElementById('dispatcharrStatus');
         statusSpan.innerHTML = '<span style="color: orange;">Testing...</span>';
@@ -2318,6 +2345,13 @@ function initXtreamLibraryConfig() {
     if (chkEnableDispatcharrMode) {
         chkEnableDispatcharrMode.addEventListener('change', function () {
             XtreamLibraryConfig.updateDispatcharrVisibility();
+        });
+    }
+
+    var chkCleanupOrphans = document.getElementById('chkCleanupOrphans');
+    if (chkCleanupOrphans) {
+        chkCleanupOrphans.addEventListener('change', function () {
+            XtreamLibraryConfig.updateOrphanSafetyThresholdVisibility();
         });
     }
 
