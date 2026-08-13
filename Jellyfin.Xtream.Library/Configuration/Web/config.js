@@ -365,11 +365,26 @@ const XtreamLibraryConfig = {
     },
 
     saveConfig: function () {
-        Dashboard.showLoadingMsg();
         const self = this;
 
         // Flush current UI state into providers array before saving
         self.updateActiveProviderFromUI();
+
+        // Refuse a Multiple folder mode config that assigns no categories to any folder. Nothing
+        // would sync, and before GitHub #78 it did the opposite and ingested the provider's whole
+        // catalogue into the library root. Either way the user did not ask for it, so say so here
+        // rather than letting them find out from a sync result.
+        var emptyFolderContent = self.findEmptyFolderModeContent();
+        if (emptyFolderContent) {
+            Dashboard.alert(
+                emptyFolderContent + ' is set to Multiple folder mode but no category is assigned ' +
+                'to any folder, so nothing would sync.\n\n' +
+                'Assign categories to your folders, or switch to Single folder mode.\n\n' +
+                'Nothing has been saved.');
+            return;
+        }
+
+        Dashboard.showLoadingMsg();
 
         ApiClient.getPluginConfiguration(this.pluginUniqueId).then(function (config) {
             // Write providers array
@@ -464,6 +479,30 @@ const XtreamLibraryConfig = {
         return lines.join('\n');
     },
 
+    // Returns a "<Provider> / <Content>" label for the first provider whose Multiple folder mode
+    // configuration assigns no categories at all, or null when every provider is fine. Reads the
+    // mappings rather than Selected*CategoryIds because the mappings are what the sync now filters
+    // on (GitHub #78). Every provider is checked, not just the active one: switching providers
+    // flushes the outgoing one into this.providers, so a broken config can be sitting there
+    // unsaved while a different provider is on screen.
+    // Call only after updateActiveProviderFromUI, so this sees what would actually be persisted.
+    findEmptyFolderModeContent: function () {
+        for (var i = 0; i < this.providers.length; i++) {
+            var p = this.providers[i];
+            if (!p) {
+                continue;
+            }
+            var label = p.Name || ('Provider ' + (i + 1));
+            if (p.MovieFolderMode === 'Multiple' && !p.MovieFolderMappings) {
+                return label + ' / Movies';
+            }
+            if (p.SeriesFolderMode === 'Multiple' && !p.SeriesFolderMappings) {
+                return label + ' / Series';
+            }
+        }
+        return null;
+    },
+
     // Get all category IDs from folder definitions
     getAllCategoryIdsFromFolders: function (type) {
         var definitions = type === 'vod' ? this.vodFolderDefinitions : this.seriesFolderDefinitions;
@@ -488,6 +527,16 @@ const XtreamLibraryConfig = {
             return;
         }
         var folderItems = container.querySelectorAll('.folder-item');
+
+        // renderFolderList short-circuits to a "Load categories first" placeholder when the
+        // category fetch has not resolved (or failed), so an empty node list here means the folder
+        // UI was never drawn - not that the user removed every folder. Clearing the definitions in
+        // that case silently destroys a saved folder configuration and drops the provider into
+        // "no categories assigned", which is the state that used to sync the whole catalogue into
+        // the library root (GitHub #78).
+        if (folderItems.length === 0 && definitions.length > 0) {
+            return;
+        }
 
         definitions.length = 0; // Clear array
 
@@ -527,6 +576,15 @@ const XtreamLibraryConfig = {
             singleSection.style.display = 'block';
             categoriesModeSection.style.display = 'block';
             multiSection.style.display = 'none';
+
+            // Multiple folder mode never renders this list, so arriving here from it leaves an
+            // empty container. Saving an empty container writes "no categories selected", which
+            // means sync everything - the same failure as GitHub #78, hit while the user is
+            // narrowing their config. Mirror what the Multiple branch above does.
+            this.renderCategoryList(
+                type,
+                type === 'vod' ? this.vodCategories : this.seriesCategories,
+                type === 'vod' ? this.selectedVodCategoryIds : this.selectedSeriesCategoryIds);
         }
     },
 

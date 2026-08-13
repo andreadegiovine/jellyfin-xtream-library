@@ -137,4 +137,95 @@ public class CategorySelectionFilterTests
     {
         CategorySelectionFilter.NarrowsSelection(selectedIds).Should().Be(expected);
     }
+
+    // --- CategorySelection: the same primitives, plus what an empty selection means (GitHub #78).
+
+    private static int[] Apply(CategorySelection selection)
+        => ProviderCategories.Where(selection.ShouldSync).ToArray();
+
+    [Fact]
+    public void FromFolderMappings_Empty_SyncsNothing()
+    {
+        var selection = CategorySelection.FromFolderMappings([]);
+
+        selection.SyncsNothing.Should().BeTrue();
+        selection.NarrowsSelection.Should().BeFalse("there is nothing to narrow down to");
+        Apply(selection).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void FromFolderMappings_WithIds_SyncsOnlyThose()
+    {
+        var selection = CategorySelection.FromFolderMappings([20, 40]);
+
+        selection.SyncsNothing.Should().BeFalse();
+        selection.NarrowsSelection.Should().BeTrue();
+        Apply(selection).Should().Equal(20, 40);
+    }
+
+    [Theory]
+    [InlineData("Include")]
+    [InlineData("Exclude")]
+    [InlineData(null)]
+    public void FromCategoryList_Empty_SyncsEverything(string? mode)
+    {
+        var selection = CategorySelection.FromCategoryList([], mode);
+
+        selection.SyncsNothing.Should().BeFalse("an empty flat selection has always meant sync everything");
+        Apply(selection).Should().Equal(ProviderCategories);
+    }
+
+    [Fact]
+    public void FromCategoryList_ExcludeWithIds_StillInverts()
+    {
+        Apply(CategorySelection.FromCategoryList([20, 40], "Exclude")).Should().Equal(10, 30);
+    }
+
+    [Fact]
+    public void ResolveCategorySelection_SingleFolderMode_UsesTheCategoryList()
+    {
+        var selection = StrmSyncService.ResolveCategorySelection(
+            "Single", "Kids=20", [40], "Include");
+
+        Apply(selection).Should().Equal(new[] { 40 }, "Single folder mode ignores the mappings entirely");
+    }
+
+    [Fact]
+    public void ResolveCategorySelection_MultipleFolderMode_UsesTheFolderMappings()
+    {
+        var selection = StrmSyncService.ResolveCategorySelection(
+            "Multiple", "Kids=20", [40], "Include");
+
+        Apply(selection).Should().Equal(new[] { 20 }, "the mappings win over a stale selection array");
+    }
+
+    [Fact]
+    public void ResolveCategorySelection_MultipleFolderMode_EmptyMappings_SyncsNothing()
+    {
+        var selection = StrmSyncService.ResolveCategorySelection(
+            "Multiple", string.Empty, [], "Include");
+
+        selection.SyncsNothing.Should().BeTrue();
+        Apply(selection).Should().BeEmpty();
+    }
+
+    [Fact]
+    public void ResolveCategorySelection_MultipleFolderMode_IgnoresExcludeMode()
+    {
+        // Only reachable from a hand-edited config; the mapping is an inclusion list either way.
+        var selection = StrmSyncService.ResolveCategorySelection(
+            "Multiple", "Kids=20", [20], "Exclude");
+
+        Apply(selection).Should().Equal(20);
+    }
+
+    [Theory]
+    [InlineData("Multiple")]
+    [InlineData("multiple")]
+    [InlineData("MULTIPLE")]
+    public void ResolveCategorySelection_MultipleFolderMode_IsCaseInsensitiveOnTheModeString(string mode)
+    {
+        Apply(StrmSyncService.ResolveCategorySelection(mode, "Kids=20", [40], "Include"))
+            .Should().Equal(20);
+    }
 }

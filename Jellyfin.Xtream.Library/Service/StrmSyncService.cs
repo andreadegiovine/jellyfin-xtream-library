@@ -510,24 +510,28 @@ public partial class StrmSyncService
         CancellationToken cancellationToken)
     {
         var connectionInfo = new ConnectionInfo(provider.BaseUrl, provider.Username, provider.Password);
-        var selectedIds = provider.SelectedSeriesCategoryIds;
+        var selection = ResolveCategorySelection(
+            provider.SeriesFolderMode,
+            provider.SeriesFolderMappings,
+            provider.SelectedSeriesCategoryIds,
+            provider.SeriesCategoriesMode);
 
         // This is the fallback path after a lookup has already failed, and it costs one
         // GetSeriesByCategoryAsync call per category it walks. Only a selection that actually
         // narrows the catalogue makes that worth doing: with nothing configured every category is
         // in scope, and scanning all of them would hammer a provider that is already misbehaving.
+        // A selection that resolves to nothing has nowhere to search either, so it takes the same
+        // exit rather than fetching the category list first.
         // Bailing out here also keeps the GetSeriesCategoryAsync call below off the common path.
-        if (!CategorySelectionFilter.NarrowsSelection(selectedIds))
+        if (!selection.NarrowsSelection)
         {
             _logger.LogDebug("No series categories configured, cannot search for series by name");
             return null;
         }
 
         var allSeriesCategories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
-        var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
-        bool exclude = CategorySelectionFilter.IsExcludeMode(provider.SeriesCategoriesMode);
         var categoryIds = allSeriesCategories
-            .Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude))
+            .Where(c => selection.ShouldSync(c.CategoryId))
             .Select(c => c.CategoryId)
             .ToArray();
 
@@ -1054,10 +1058,37 @@ public partial class StrmSyncService
             double movieDeletionRatio = existingMovieCount > 0 ? (double)orphanedMovies / existingMovieCount : 0;
             double episodeDeletionRatio = existingEpisodeCount > 0 ? (double)orphanedEpisodes / existingEpisodeCount : 0;
 
-            bool skipMovieCleanup = existingMovieCount > 10 && movieDeletionRatio > safetyThreshold;
-            bool skipEpisodeCleanup = existingEpisodeCount > 10 && episodeDeletionRatio > safetyThreshold;
+            // Protection: a selection that resolves to nothing syncs no files, which would make
+            // the entire existing library an orphan. That is a misconfiguration to be corrected,
+            // not a deletion to be carried out - and it is reachable by upgrading into the #78 fix
+            // with a Multiple folder mode config that assigns no categories. The safety threshold
+            // above would normally catch it, but not for a provider set to 100%.
+            // The "> 0" conjuncts matter: with nothing on disk yet there is nothing to protect and
+            // the warning would be noise on every sync.
+            bool skipMovieForEmptySelection = orphanedMovies > 0 && ResolveCategorySelection(
+                provider.MovieFolderMode,
+                provider.MovieFolderMappings,
+                provider.SelectedVodCategoryIds,
+                provider.MovieCategoriesMode).SyncsNothing;
+            bool skipEpisodeForEmptySelection = orphanedEpisodes > 0 && ResolveCategorySelection(
+                provider.SeriesFolderMode,
+                provider.SeriesFolderMappings,
+                provider.SelectedSeriesCategoryIds,
+                provider.SeriesCategoriesMode).SyncsNothing;
 
-            if (skipMovieCleanup)
+            bool skipMovieForThreshold = existingMovieCount > 10 && movieDeletionRatio > safetyThreshold;
+            bool skipEpisodeForThreshold = existingEpisodeCount > 10 && episodeDeletionRatio > safetyThreshold;
+
+            bool skipMovieCleanup = skipMovieForEmptySelection || skipMovieForThreshold;
+            bool skipEpisodeCleanup = skipEpisodeForEmptySelection || skipEpisodeForThreshold;
+
+            if (skipMovieForEmptySelection)
+            {
+                _logger.LogWarning(
+                    "Skipping movie orphan cleanup: the movie category selection resolves to nothing, so all {OrphanCount} existing movie files would be deleted. Fix the folder configuration first.",
+                    orphanedMovies);
+            }
+            else if (skipMovieForThreshold)
             {
                 _logger.LogWarning(
                     "Skipping movie orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
@@ -1067,7 +1098,13 @@ public partial class StrmSyncService
                     safetyThreshold);
             }
 
-            if (skipEpisodeCleanup)
+            if (skipEpisodeForEmptySelection)
+            {
+                _logger.LogWarning(
+                    "Skipping episode orphan cleanup: the series category selection resolves to nothing, so all {OrphanCount} existing episode files would be deleted. Fix the folder configuration first.",
+                    orphanedEpisodes);
+            }
+            else if (skipEpisodeForThreshold)
             {
                 _logger.LogWarning(
                     "Skipping episode orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
@@ -1292,33 +1329,11 @@ public partial class StrmSyncService
         var categories = await _client.GetVodCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
         var processedStreamIds = new ConcurrentDictionary<int, bool>();
 
-        // Filter categories if user has selected specific ones
-        var selectedIds = provider.SelectedVodCategoryIds;
-        if (selectedIds.Length > 0)
-        {
-            var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
-            bool exclude = CategorySelectionFilter.IsExcludeMode(provider.MovieCategoriesMode);
-            var filteredCategories = categories.Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude)).ToList();
-            var skippedCount = categories.Count - filteredCategories.Count;
-            if (skippedCount > 0)
-            {
-                _logger.LogInformation("Filtering VOD categories: {Selected} selected, {Skipped} skipped", filteredCategories.Count, skippedCount);
-            }
-
-            // Warn about non-existent category IDs
-            var existingIds = categories.Select(c => c.CategoryId).ToHashSet();
-            var missingIds = selectedIds.Where(id => !existingIds.Contains(id)).ToList();
-            if (missingIds.Count > 0)
-            {
-                _logger.LogWarning("Selected VOD category IDs not found on provider: {MissingIds}", string.Join(", ", missingIds));
-            }
-
-            categories = filteredCategories;
-        }
-
-        // Parse folder mappings (category ID → folder names) - only in Multiple folder mode
+        // Parse folder mappings (category ID → folder names) - only in Multiple folder mode.
+        // This has to come before the category filter, because in Multiple folder mode the
+        // mappings are also what decides which categories are in scope at all.
         var folderMappings = new Dictionary<int, List<string>>();
-        if (string.Equals(provider.MovieFolderMode, "Multiple", StringComparison.OrdinalIgnoreCase))
+        if (IsMultipleFolderMode(provider.MovieFolderMode))
         {
             folderMappings = ParseFolderMappings(provider.MovieFolderMappings);
             if (folderMappings.Count > 0)
@@ -1327,8 +1342,70 @@ public partial class StrmSyncService
             }
         }
 
-        // Determine batch size - 0 means process all at once (legacy behavior)
-        var batchSize = provider.CategoryBatchSize > 0 ? provider.CategoryBatchSize : categories.Count;
+        // Filter categories down to the configured selection
+        var selection = ResolveCategorySelection(
+            provider.MovieFolderMode,
+            folderMappings,
+            provider.SelectedVodCategoryIds,
+            provider.MovieCategoriesMode);
+
+        if (selection.SyncsNothing)
+        {
+            _logger.LogWarning(
+                "No movies will be synced for provider '{Provider}': Multiple folder mode is on but no category is assigned to any folder. Assign categories to your movie folders, or switch to Single folder mode.",
+                provider.Name);
+        }
+
+        var filteredCategories = categories.Where(c => selection.ShouldSync(c.CategoryId)).ToList();
+        var skippedCount = categories.Count - filteredCategories.Count;
+        if (skippedCount > 0)
+        {
+            _logger.LogInformation("Filtering VOD categories: {Selected} selected, {Skipped} skipped", filteredCategories.Count, skippedCount);
+        }
+
+        // Warn about non-existent category IDs. The wording differs by mode: in Multiple folder
+        // mode there is no "selected categories" list on screen, there are folders with categories
+        // assigned to them.
+        var existingCategoryIds = categories.Select(c => c.CategoryId).ToHashSet();
+        var missingIds = selection.ConfiguredIds.Where(id => !existingCategoryIds.Contains(id)).ToList();
+        if (missingIds.Count > 0)
+        {
+            if (IsMultipleFolderMode(provider.MovieFolderMode))
+            {
+                _logger.LogWarning("Movie folder mappings reference VOD category IDs that no longer exist on the provider: {MissingIds}", string.Join(", ", missingIds));
+            }
+            else
+            {
+                _logger.LogWarning("Selected VOD category IDs not found on provider: {MissingIds}", string.Join(", ", missingIds));
+            }
+        }
+
+        // Configs written before v1.16.0.0 kept the folder mappings in a free-text box that was
+        // independent of the category checkboxes, so the two can genuinely disagree. Every save
+        // since then rewrites the selection from the folders, but a config that has not been saved
+        // since can still name categories no folder covers. Those stop syncing here, so say which.
+        if (IsMultipleFolderMode(provider.MovieFolderMode))
+        {
+            var unassignedIds = (provider.SelectedVodCategoryIds ?? [])
+                .Where(id => !selection.ConfiguredIds.Contains(id))
+                .ToList();
+            if (unassignedIds.Count > 0)
+            {
+                _logger.LogWarning(
+                    "Multiple folder mode: {Count} previously selected VOD category IDs are not assigned to any folder and will no longer be synced: {MissingIds}. Assign them to a folder to keep them.",
+                    unassignedIds.Count,
+                    string.Join(", ", unassignedIds));
+            }
+        }
+
+        categories = filteredCategories;
+
+        // Determine batch size - 0 means process all at once (legacy behavior).
+        // Math.Max keeps the division below defined when the selection resolves to no categories
+        // at all, which is now reachable from the config rather than only by accident: with
+        // CategoryBatchSize 0 the fallback would be 0 too, and (int)Math.Ceiling(0.0 / 0.0) is a
+        // NaN cast whose result the spec leaves undefined.
+        var batchSize = provider.CategoryBatchSize > 0 ? provider.CategoryBatchSize : Math.Max(1, categories.Count);
         var totalBatches = (int)Math.Ceiling((double)categories.Count / batchSize);
 
         _logger.LogInformation(
@@ -2076,33 +2153,11 @@ public partial class StrmSyncService
         var categories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
         var processedSeriesIds = new ConcurrentDictionary<int, bool>();
 
-        // Filter categories if user has selected specific ones
-        var selectedIds = provider.SelectedSeriesCategoryIds;
-        if (selectedIds.Length > 0)
-        {
-            var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
-            bool exclude = CategorySelectionFilter.IsExcludeMode(provider.SeriesCategoriesMode);
-            var filteredCategories = categories.Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude)).ToList();
-            var skippedCount = categories.Count - filteredCategories.Count;
-            if (skippedCount > 0)
-            {
-                _logger.LogInformation("Filtering Series categories: {Selected} selected, {Skipped} skipped", filteredCategories.Count, skippedCount);
-            }
-
-            // Warn about non-existent category IDs
-            var existingIds = categories.Select(c => c.CategoryId).ToHashSet();
-            var missingIds = selectedIds.Where(id => !existingIds.Contains(id)).ToList();
-            if (missingIds.Count > 0)
-            {
-                _logger.LogWarning("Selected Series category IDs not found on provider: {MissingIds}", string.Join(", ", missingIds));
-            }
-
-            categories = filteredCategories;
-        }
-
-        // Parse folder mappings (category ID → folder names) - only in Multiple folder mode
+        // Parse folder mappings (category ID → folder names) - only in Multiple folder mode.
+        // This has to come before the category filter, because in Multiple folder mode the
+        // mappings are also what decides which categories are in scope at all.
         var folderMappings = new Dictionary<int, List<string>>();
-        if (string.Equals(provider.SeriesFolderMode, "Multiple", StringComparison.OrdinalIgnoreCase))
+        if (IsMultipleFolderMode(provider.SeriesFolderMode))
         {
             folderMappings = ParseFolderMappings(provider.SeriesFolderMappings);
             if (folderMappings.Count > 0)
@@ -2111,8 +2166,70 @@ public partial class StrmSyncService
             }
         }
 
-        // Determine batch size - 0 means process all at once (legacy behavior)
-        var batchSize = provider.CategoryBatchSize > 0 ? provider.CategoryBatchSize : categories.Count;
+        // Filter categories down to the configured selection
+        var selection = ResolveCategorySelection(
+            provider.SeriesFolderMode,
+            folderMappings,
+            provider.SelectedSeriesCategoryIds,
+            provider.SeriesCategoriesMode);
+
+        if (selection.SyncsNothing)
+        {
+            _logger.LogWarning(
+                "No series will be synced for provider '{Provider}': Multiple folder mode is on but no category is assigned to any folder. Assign categories to your series folders, or switch to Single folder mode.",
+                provider.Name);
+        }
+
+        var filteredCategories = categories.Where(c => selection.ShouldSync(c.CategoryId)).ToList();
+        var skippedCount = categories.Count - filteredCategories.Count;
+        if (skippedCount > 0)
+        {
+            _logger.LogInformation("Filtering Series categories: {Selected} selected, {Skipped} skipped", filteredCategories.Count, skippedCount);
+        }
+
+        // Warn about non-existent category IDs. The wording differs by mode: in Multiple folder
+        // mode there is no "selected categories" list on screen, there are folders with categories
+        // assigned to them.
+        var existingCategoryIds = categories.Select(c => c.CategoryId).ToHashSet();
+        var missingIds = selection.ConfiguredIds.Where(id => !existingCategoryIds.Contains(id)).ToList();
+        if (missingIds.Count > 0)
+        {
+            if (IsMultipleFolderMode(provider.SeriesFolderMode))
+            {
+                _logger.LogWarning("Series folder mappings reference Series category IDs that no longer exist on the provider: {MissingIds}", string.Join(", ", missingIds));
+            }
+            else
+            {
+                _logger.LogWarning("Selected Series category IDs not found on provider: {MissingIds}", string.Join(", ", missingIds));
+            }
+        }
+
+        // Configs written before v1.16.0.0 kept the folder mappings in a free-text box that was
+        // independent of the category checkboxes, so the two can genuinely disagree. Every save
+        // since then rewrites the selection from the folders, but a config that has not been saved
+        // since can still name categories no folder covers. Those stop syncing here, so say which.
+        if (IsMultipleFolderMode(provider.SeriesFolderMode))
+        {
+            var unassignedIds = (provider.SelectedSeriesCategoryIds ?? [])
+                .Where(id => !selection.ConfiguredIds.Contains(id))
+                .ToList();
+            if (unassignedIds.Count > 0)
+            {
+                _logger.LogWarning(
+                    "Multiple folder mode: {Count} previously selected Series category IDs are not assigned to any folder and will no longer be synced: {MissingIds}. Assign them to a folder to keep them.",
+                    unassignedIds.Count,
+                    string.Join(", ", unassignedIds));
+            }
+        }
+
+        categories = filteredCategories;
+
+        // Determine batch size - 0 means process all at once (legacy behavior).
+        // Math.Max keeps the division below defined when the selection resolves to no categories
+        // at all, which is now reachable from the config rather than only by accident: with
+        // CategoryBatchSize 0 the fallback would be 0 too, and (int)Math.Ceiling(0.0 / 0.0) is a
+        // NaN cast whose result the spec leaves undefined.
+        var batchSize = provider.CategoryBatchSize > 0 ? provider.CategoryBatchSize : Math.Max(1, categories.Count);
         var totalBatches = (int)Math.Ceiling((double)categories.Count / batchSize);
 
         _logger.LogInformation(
@@ -3386,6 +3503,61 @@ public partial class StrmSyncService
 
         return null;
     }
+
+    /// <summary>
+    /// Returns true when the given folder mode string selects Multiple folder mode.
+    /// </summary>
+    /// <param name="folderMode">The configured folder mode, "Single" or "Multiple".</param>
+    /// <returns>True for Multiple, false for anything else.</returns>
+    internal static bool IsMultipleFolderMode(string? folderMode)
+        => string.Equals(folderMode, "Multiple", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Resolves which categories take part in a sync. In Multiple folder mode the folder mappings
+    /// are the filter; in Single folder mode the flat category selection is.
+    /// <para>
+    /// The two always agree for a config written by the config page, which stores the union of the
+    /// folder-assigned categories in the selection array. Reading the mappings directly removes the
+    /// frontend's obligation to keep them in step, and gives "no folder holds a category" a meaning
+    /// ("sync nothing") that an empty selection array cannot carry (GitHub #78).
+    /// </para>
+    /// </summary>
+    /// <param name="folderMode">The provider's folder mode for this content type.</param>
+    /// <param name="parsedFolderMappings">The already-parsed folder mappings, empty in Single mode.</param>
+    /// <param name="selectedIds">The provider's flat category selection.</param>
+    /// <param name="categoriesMode">The provider's Include/Exclude mode.</param>
+    /// <returns>The resolved selection.</returns>
+    internal static CategorySelection ResolveCategorySelection(
+        string? folderMode,
+        Dictionary<int, List<string>> parsedFolderMappings,
+        int[]? selectedIds,
+        string? categoriesMode)
+    {
+        ArgumentNullException.ThrowIfNull(parsedFolderMappings);
+
+        return IsMultipleFolderMode(folderMode)
+            ? CategorySelection.FromFolderMappings(parsedFolderMappings.Keys)
+            : CategorySelection.FromCategoryList(selectedIds, categoriesMode);
+    }
+
+    /// <summary>
+    /// Resolves the category selection for a caller that does not already hold the parsed mappings.
+    /// </summary>
+    /// <param name="folderMode">The provider's folder mode for this content type.</param>
+    /// <param name="folderMappings">The raw folder mapping string.</param>
+    /// <param name="selectedIds">The provider's flat category selection.</param>
+    /// <param name="categoriesMode">The provider's Include/Exclude mode.</param>
+    /// <returns>The resolved selection.</returns>
+    internal static CategorySelection ResolveCategorySelection(
+        string? folderMode,
+        string? folderMappings,
+        int[]? selectedIds,
+        string? categoriesMode)
+        => ResolveCategorySelection(
+            folderMode,
+            IsMultipleFolderMode(folderMode) ? ParseFolderMappings(folderMappings) : new Dictionary<int, List<string>>(),
+            selectedIds,
+            categoriesMode);
 
     /// <summary>
     /// Parses folder mapping configuration into a reverse lookup (category ID → folder names).
