@@ -262,6 +262,53 @@ public class FolderModeCategoryFilterTests : IDisposable
         _log.Should().Contain(
             l => l.StartsWith("[Warning] Skipping movie orphan cleanup: the movie category selection resolves to nothing", StringComparison.Ordinal),
             "the reason has to be distinguishable from a threshold-triggered skip");
+
+        // The blocked files still have to be counted and reported. Leaving them out is the exact
+        // silence GitHub #77 exists to remove, and a naive merge of the two fixes produces it:
+        // the counters end up inside the threshold branch and an empty-selection skip reports zero.
+        result.MovieOrphansSkipped.Should().Be(12);
+        result.MovieOrphansExamined.Should().Be(12);
+        result.OrphanCleanupSkipped.Should().BeTrue();
+
+        // Which reason blocked it decides the advice the user is given, so the two must not be
+        // conflated. Raising the safety threshold is the fix for a threshold block and would let
+        // the next sync delete the library after this one.
+        result.OrphanCleanupBlockedByEmptySelection.Should().BeTrue();
+        result.OrphanCleanupBlockedByThreshold.Should().BeFalse();
+        result.OrphanSafetyThresholdApplied.Should().Be(0, "no threshold was involved in this decision");
+
+        _log.Should().Contain(
+            l => l.Contains("Do not raise Orphan Safety Threshold", StringComparison.Ordinal),
+            "the end-of-run summary must not hand out the threshold remedy for this reason");
+        _log.Should().NotContain(
+            l => l.Contains("Raise Orphan Safety Threshold in the plugin settings", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ThresholdSkip_StillReportsTheThresholdAndItsRemedy()
+    {
+        // The counterpart of the test above: an ordinary threshold block must keep #77's wording
+        // and keep recording the limit that caused it, now that a second skip reason shares the
+        // same counters.
+        var seeded = SeedMovieStrms(12);
+
+        var result = await RunMovieSyncAsync(p =>
+        {
+            // A healthy selection, so the empty-selection guard cannot be what fires. The provider
+            // simply stops offering the seeded movies, which is the provider-glitch case.
+            p.MovieFolderMode = "Single";
+            p.SelectedVodCategoryIds = [];
+            p.CleanupOrphans = true;
+            p.OrphanSafetyThreshold = 0.20;
+        }).ConfigureAwait(true);
+
+        seeded.Should().OnlyContain(f => File.Exists(f));
+        result.OrphanCleanupBlockedByThreshold.Should().BeTrue();
+        result.OrphanCleanupBlockedByEmptySelection.Should().BeFalse();
+        result.OrphanSafetyThresholdApplied.Should().Be(0.20);
+
+        _log.Should().Contain(
+            l => l.Contains("Raise Orphan Safety Threshold in the plugin settings", StringComparison.Ordinal));
     }
 
     private List<string> WrittenMovieStrms()

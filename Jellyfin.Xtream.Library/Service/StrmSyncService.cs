@@ -716,12 +716,28 @@ public partial class StrmSyncService
             {
                 // Restated at the end of the run so it sits next to the completion line rather
                 // than thousands of per-item entries earlier in the log.
-                _logger.LogWarning(
-                    "Sync finished with orphan cleanup blocked: {Total} orphaned STRM files ({Movies} movies, {Episodes} episodes) were left on disk because the deletion ratio exceeded the {Threshold:P0} safety threshold. Raise Orphan Safety Threshold in the plugin settings if the provider change was intentional.",
-                    globalResult.OrphansSkipped,
-                    globalResult.MovieOrphansSkipped,
-                    globalResult.EpisodeOrphansSkipped,
-                    globalResult.OrphanSafetyThresholdApplied);
+                //
+                // The two reasons get different advice on purpose. Telling someone to raise the
+                // safety threshold is right when a provider glitch tripped it, and is the worst
+                // possible advice when the block was an empty category selection: raising it would
+                // let the next sync delete the library this guard just saved (GitHub #78).
+                if (globalResult.OrphanCleanupBlockedByEmptySelection)
+                {
+                    _logger.LogWarning(
+                        "Sync finished with orphan cleanup blocked: {Total} orphaned STRM files ({Movies} movies, {Episodes} episodes) were left on disk because a category selection resolves to nothing, so the sync had nothing to compare them against. Check the folder configuration - in Multiple folder mode only categories assigned to a folder are synced. Do not raise Orphan Safety Threshold to work around this.",
+                        globalResult.OrphansSkipped,
+                        globalResult.MovieOrphansSkipped,
+                        globalResult.EpisodeOrphansSkipped);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Sync finished with orphan cleanup blocked: {Total} orphaned STRM files ({Movies} movies, {Episodes} episodes) were left on disk because the deletion ratio exceeded the {Threshold:P0} safety threshold. Raise Orphan Safety Threshold in the plugin settings if the provider change was intentional.",
+                        globalResult.OrphansSkipped,
+                        globalResult.MovieOrphansSkipped,
+                        globalResult.EpisodeOrphansSkipped,
+                        globalResult.OrphanSafetyThresholdApplied);
+                }
             }
 
             // Flush metadata cache to disk
@@ -1094,53 +1110,69 @@ public partial class StrmSyncService
             bool skipMovieCleanup = skipMovieForEmptySelection || skipMovieForThreshold;
             bool skipEpisodeCleanup = skipEpisodeForEmptySelection || skipEpisodeForThreshold;
 
-            if (skipMovieForEmptySelection)
+            if (skipMovieCleanup)
             {
-                _logger.LogWarning(
-                    "Skipping movie orphan cleanup: the movie category selection resolves to nothing, so all {OrphanCount} existing movie files would be deleted. Fix the folder configuration first.",
-                    orphanedMovies);
-            }
-            else if (skipMovieForThreshold)
-            {
-                // Record the counts as well as logging them. Before this the numbers existed only
-                // as locals at the moment of the decision, so a run that refused to delete half
-                // the library reported Success/0 deleted/0 errors - identical to a clean run, and
-                // the only trace was one log line that scrolls away (GitHub #77).
+                // Record the counts as well as logging them, whichever reason blocked the cleanup.
+                // Before this the numbers existed only as locals at the moment of the decision, so
+                // a run that refused to delete half the library reported Success/0 deleted/0 errors
+                // - identical to a clean run, and the only trace was one log line that scrolls away
+                // (GitHub #77). The reason decides the wording below, never whether it is reported.
                 result.MovieOrphansSkipped += orphanedMovies;
                 result.MovieOrphansExamined += existingMovieCount;
 
-                _logger.LogWarning(
-                    "Skipping movie orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
-                    orphanedMovies,
-                    existingMovieCount,
-                    movieDeletionRatio,
-                    safetyThreshold);
+                if (skipMovieForEmptySelection)
+                {
+                    _logger.LogWarning(
+                        "Skipping movie orphan cleanup: the movie category selection resolves to nothing, so all {OrphanCount} existing movie files would be deleted. Fix the folder configuration first.",
+                        orphanedMovies);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Skipping movie orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
+                        orphanedMovies,
+                        existingMovieCount,
+                        movieDeletionRatio,
+                        safetyThreshold);
+                }
             }
 
-            if (skipEpisodeForEmptySelection)
-            {
-                _logger.LogWarning(
-                    "Skipping episode orphan cleanup: the series category selection resolves to nothing, so all {OrphanCount} existing episode files would be deleted. Fix the folder configuration first.",
-                    orphanedEpisodes);
-            }
-            else if (skipEpisodeForThreshold)
+            if (skipEpisodeCleanup)
             {
                 result.EpisodeOrphansSkipped += orphanedEpisodes;
                 result.EpisodeOrphansExamined += existingEpisodeCount;
 
-                _logger.LogWarning(
-                    "Skipping episode orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
-                    orphanedEpisodes,
-                    existingEpisodeCount,
-                    episodeDeletionRatio,
-                    safetyThreshold);
+                if (skipEpisodeForEmptySelection)
+                {
+                    _logger.LogWarning(
+                        "Skipping episode orphan cleanup: the series category selection resolves to nothing, so all {OrphanCount} existing episode files would be deleted. Fix the folder configuration first.",
+                        orphanedEpisodes);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Skipping episode orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
+                        orphanedEpisodes,
+                        existingEpisodeCount,
+                        episodeDeletionRatio,
+                        safetyThreshold);
+                }
             }
 
-            if (skipMovieCleanup || skipEpisodeCleanup)
+            if (skipMovieForThreshold || skipEpisodeForThreshold)
             {
+                // Gated on the threshold reasons alone. An empty-selection skip has no threshold
+                // behind it, and recording one here would make the summary and the last-sync panel
+                // quote a limit that had nothing to do with the decision.
                 // One provider, one cleanup pass, so this is the only threshold this result can
                 // carry. Merging several providers is where a choice has to be made.
                 result.OrphanSafetyThresholdApplied = safetyThreshold;
+                result.OrphanCleanupBlockedByThreshold = true;
+            }
+
+            if (skipMovieForEmptySelection || skipEpisodeForEmptySelection)
+            {
+                result.OrphanCleanupBlockedByEmptySelection = true;
             }
 
             // Filter orphans based on safety checks
@@ -1233,8 +1265,8 @@ public partial class StrmSyncService
     /// <param name="providerResult">The result from a single provider.</param>
     private static void MergeResult(SyncResult globalResult, SyncResult providerResult)
     {
-        // Read before the counts below make it true for this provider's own contribution.
-        bool anEarlierProviderAlreadyBlocked = globalResult.OrphanCleanupSkipped;
+        // Read before the merge below makes it true for this provider's own contribution.
+        bool anEarlierProviderAlreadyBlockedOnThreshold = globalResult.OrphanCleanupBlockedByThreshold;
 
         globalResult.MoviesCreated += providerResult.MoviesCreated;
         globalResult.MoviesUpdated += providerResult.MoviesUpdated;
@@ -1258,14 +1290,20 @@ public partial class StrmSyncService
         globalResult.MovieOrphansExamined += providerResult.MovieOrphansExamined;
         globalResult.EpisodeOrphansSkipped += providerResult.EpisodeOrphansSkipped;
         globalResult.EpisodeOrphansExamined += providerResult.EpisodeOrphansExamined;
-        if (providerResult.OrphanCleanupSkipped)
+        globalResult.OrphanCleanupBlockedByEmptySelection =
+            globalResult.OrphanCleanupBlockedByEmptySelection || providerResult.OrphanCleanupBlockedByEmptySelection;
+
+        if (providerResult.OrphanCleanupBlockedByThreshold)
         {
             // The most conservative threshold in play is the one worth showing. Gated on the
-            // counts rather than on a non-zero threshold, because a provider set to 0% blocks
-            // every cleanup and still has to report the limit that did it.
-            globalResult.OrphanSafetyThresholdApplied = anEarlierProviderAlreadyBlocked
+            // dedicated flag rather than on a non-zero threshold, because a provider set to 0%
+            // blocks every cleanup and still has to report the limit that did it - and rather
+            // than on the counts, because a provider blocked only by an empty selection carries
+            // no threshold at all and would otherwise drag this minimum to zero.
+            globalResult.OrphanSafetyThresholdApplied = anEarlierProviderAlreadyBlockedOnThreshold
                 ? Math.Min(globalResult.OrphanSafetyThresholdApplied, providerResult.OrphanSafetyThresholdApplied)
                 : providerResult.OrphanSafetyThresholdApplied;
+            globalResult.OrphanCleanupBlockedByThreshold = true;
         }
 
         globalResult.SeriesUnmatched += providerResult.SeriesUnmatched;
@@ -4464,14 +4502,37 @@ public class SyncResult
     public double OrphanSafetyThresholdApplied { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether any orphan cleanup was blocked because a content
+    /// type's category selection resolved to nothing, rather than because the deletion ratio
+    /// exceeded the safety threshold (GitHub #78).
+    /// <para>
+    /// The two have opposite remedies, which is the whole reason this is a separate flag: raising
+    /// the safety threshold is the fix for a threshold block, and is exactly the wrong advice for
+    /// this one, because it would let the next sync delete the library the guard just saved.
+    /// </para>
+    /// </summary>
+    public bool OrphanCleanupBlockedByEmptySelection { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether any orphan cleanup was blocked by the safety
+    /// threshold. Tracked separately from <see cref="OrphanSafetyThresholdApplied"/> because 0% is
+    /// a legitimate threshold, so the value alone cannot say whether one was ever applied, and a
+    /// provider blocked only by an empty selection must not drag the merged minimum down to zero.
+    /// A single provider can be blocked for both reasons at once, one per content type.
+    /// </summary>
+    public bool OrphanCleanupBlockedByThreshold { get; set; }
+
+    /// <summary>
     /// Gets the total number of orphaned STRM files that were found but not deleted.
     /// </summary>
     public int OrphansSkipped => MovieOrphansSkipped + EpisodeOrphansSkipped;
 
     /// <summary>
-    /// Gets a value indicating whether orphan cleanup was blocked by the safety threshold. The
-    /// sync itself did not fail, so <see cref="Success"/> stays true; this is the separate signal
-    /// that the run deliberately did not finish part of its job.
+    /// Gets a value indicating whether orphan cleanup was blocked, by either the safety threshold
+    /// or a category selection that resolves to nothing. The sync itself did not fail, so
+    /// <see cref="Success"/> stays true; this is the separate signal that the run deliberately did
+    /// not finish part of its job. See <see cref="OrphanCleanupBlockedByEmptySelection"/> for which
+    /// reason applied.
     /// </summary>
     public bool OrphanCleanupSkipped => OrphansSkipped > 0;
 
