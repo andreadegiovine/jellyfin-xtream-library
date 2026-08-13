@@ -112,6 +112,15 @@ public partial class StrmSyncService
     }
 
     /// <summary>
+    /// Gets the comparer for STRM paths claimed during a sync run. Linux filesystems are case-sensitive,
+    /// Windows and macOS default to case-insensitive, and the collision guard is only correct when
+    /// it agrees with the filesystem underneath it. Exposed to the tests so they can assert the
+    /// behaviour their host actually produces rather than hard-coding one platform's answer.
+    /// </summary>
+    internal static StringComparer PathClaimComparer =>
+        OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
+
+    /// <summary>
     /// Gets the result of the last sync operation.
     /// </summary>
     public SyncResult? LastSyncResult { get; private set; }
@@ -589,6 +598,18 @@ public partial class StrmSyncService
         config.Validate();
         var globalResult = new SyncResult { StartTime = DateTime.UtcNow };
 
+        // STRM paths written during this run, shared across every provider. Providers are allowed
+        // to share a LibraryPath (PluginConfiguration only records HasDuplicateLibraryPaths, it
+        // does not refuse the config), so a per-provider set would let the second provider
+        // overwrite the first one's file with nothing counted.
+        //
+        // The comparer has to follow the filesystem, because neither choice is safe on both.
+        // Case-sensitively, "The Matrix" and "THE MATRIX" are two real paths and folding them
+        // would refuse a legitimate write. Case-insensitively they are one file, and not folding
+        // them would hand out two claims and let the second silently overwrite the first, which
+        // is the exact bug this guard exists to stop.
+        var claimedStrmPaths = new ConcurrentDictionary<string, byte>(PathClaimComparer);
+
         // Check if sync is suppressed (e.g., after CleanLibraries)
         if (_syncSuppressed)
         {
@@ -661,7 +682,7 @@ public partial class StrmSyncService
                     CurrentProgress.Phase = $"Provider {i + 1}/{enabledProviders.Count}: {provider.Name}";
                 }
 
-                var providerResult = await SyncProviderAsync(providerIndex, provider, linkedToken).ConfigureAwait(false);
+                var providerResult = await SyncProviderAsync(providerIndex, provider, claimedStrmPaths, linkedToken).ConfigureAwait(false);
                 MergeResult(globalResult, providerResult);
             }
 
@@ -819,12 +840,14 @@ public partial class StrmSyncService
     /// </summary>
     /// <param name="providerIndex">Zero-based index of this provider in the Providers list.</param>
     /// <param name="provider">The provider configuration.</param>
+    /// <param name="claimedStrmPaths">STRM paths already written during this sync run, shared across providers.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The sync result for this provider.</returns>
 #pragma warning disable CA5351
     private async Task<SyncResult> SyncProviderAsync(
         int providerIndex,
         ProviderConfig provider,
+        ConcurrentDictionary<string, byte> claimedStrmPaths,
         CancellationToken cancellationToken)
     {
         var result = new SyncResult { StartTime = DateTime.UtcNow };
@@ -943,6 +966,7 @@ public partial class StrmSyncService
                             provider,
                             moviesPath,
                             syncedFiles,
+                            claimedStrmPaths,
                             result,
                             previousSnapshot,
                             allCollectedMovies,
@@ -960,6 +984,7 @@ public partial class StrmSyncService
                         await SyncSeriesAsync(
                             provider,
                             seriesPath,
+                            claimedStrmPaths,
                             syncedFiles,
                             result,
                             previousSnapshot,
@@ -983,6 +1008,7 @@ public partial class StrmSyncService
                     provider,
                     moviesPath,
                     syncedFiles,
+                    claimedStrmPaths,
                     result,
                     previousSnapshot,
                     allCollectedMovies,
@@ -995,6 +1021,7 @@ public partial class StrmSyncService
                 await SyncSeriesAsync(
                     provider,
                     seriesPath,
+                    claimedStrmPaths,
                     syncedFiles,
                     result,
                     previousSnapshot,
@@ -1145,6 +1172,7 @@ public partial class StrmSyncService
         globalResult.MoviesSkipped += providerResult.MoviesSkipped;
         globalResult.MoviesDeleted += providerResult.MoviesDeleted;
         globalResult.MoviesUnmatched += providerResult.MoviesUnmatched;
+        globalResult.MovieNameCollisions += providerResult.MovieNameCollisions;
         globalResult.SeriesCreated += providerResult.SeriesCreated;
         globalResult.SeriesSkipped += providerResult.SeriesSkipped;
         globalResult.SeriesDeleted += providerResult.SeriesDeleted;
@@ -1155,6 +1183,7 @@ public partial class StrmSyncService
         globalResult.EpisodesUpdated += providerResult.EpisodesUpdated;
         globalResult.EpisodesSkipped += providerResult.EpisodesSkipped;
         globalResult.EpisodesDeleted += providerResult.EpisodesDeleted;
+        globalResult.EpisodeNameCollisions += providerResult.EpisodeNameCollisions;
         globalResult.FilesDeleted += providerResult.FilesDeleted;
         globalResult.SeriesUnmatched += providerResult.SeriesUnmatched;
         globalResult.Errors += providerResult.Errors;
@@ -1252,6 +1281,7 @@ public partial class StrmSyncService
         ProviderConfig provider,
         string moviesPath,
         ConcurrentDictionary<string, byte> syncedFiles,
+        ConcurrentDictionary<string, byte> claimedStrmPaths,
         SyncResult result,
         ContentSnapshot? previousSnapshot,
         ConcurrentBag<StreamInfo> allCollectedMovies,
@@ -1315,6 +1345,7 @@ public partial class StrmSyncService
         int moviesCreated = 0;
         int moviesUpdated = 0;
         int moviesSkipped = 0;
+        int nameCollisions = 0;
         int errors = 0;
         int unmatchedCount = 0;
         var failedItems = new ConcurrentBag<FailedItem>();
@@ -1825,6 +1856,24 @@ public partial class StrmSyncService
 
                         syncedFiles.TryAdd(strmPath, 0);
 
+                        // TryAdd fails when another stream in this run already wrote this exact
+                        // path. The name is built from the folder name and the version label only,
+                        // so two streams sharing a title and a quality tag produce the same one.
+                        // Writing anyway would silently replace the other stream's file: the
+                        // File.Exists branch below compares content against a URL that embeds the
+                        // stream id, so it can never match across two streams and always falls
+                        // through to the overwrite. Refuse instead, and count it.
+                        if (!claimedStrmPaths.TryAdd(strmPath, 0))
+                        {
+                            Interlocked.Increment(ref nameCollisions);
+                            _logger.LogWarning(
+                                "STRM name collision for movie {MovieName}: {Path} was already claimed by another stream in this run; refusing to overwrite it with stream {StreamId}",
+                                baseName,
+                                strmPath,
+                                stream.StreamId);
+                            continue;
+                        }
+
                         if (File.Exists(strmPath))
                         {
                             if (StrmContentMatches(strmPath, streamUrl))
@@ -1854,6 +1903,15 @@ public partial class StrmSyncService
                         {
                             // File was created by another thread/process, skip
                             continue;
+                        }
+                        catch
+                        {
+                            // The claim is only worth holding if this stream actually produced the
+                            // file. Keeping it after a failed create would refuse a later duplicate
+                            // that might have succeeded, and the name would end up with no STRM at
+                            // all. Hand it back and let the original handler count the error.
+                            claimedStrmPaths.TryRemove(strmPath, out _);
+                            throw;
                         }
 
                         _logger.LogDebug("Created movie STRM: {StrmPath}", strmPath);
@@ -1976,9 +2034,17 @@ public partial class StrmSyncService
         result.MoviesCreated += moviesCreated;
         result.MoviesUpdated += moviesUpdated;
         result.MoviesSkipped += moviesSkipped;
+        result.MovieNameCollisions += nameCollisions;
         result.AddErrors(errors);
         result.AddFailedItems(failedItems);
         result.MoviesUnmatched = unmatchedCount;
+
+        if (nameCollisions > 0)
+        {
+            _logger.LogWarning(
+                "{Count} movie STRM files were not written because a different provider stream had already claimed the same name. The provider is offering duplicate streams that share a title and a quality tag.",
+                nameCollisions);
+        }
 
         // Log unmatched movies
         if (unmatchedCount > 0)
@@ -1996,6 +2062,7 @@ public partial class StrmSyncService
     private async Task SyncSeriesAsync(
         ProviderConfig provider,
         string seriesPath,
+        ConcurrentDictionary<string, byte> claimedStrmPaths,
         ConcurrentDictionary<string, byte> syncedFiles,
         SyncResult result,
         ContentSnapshot? previousSnapshot,
@@ -2066,6 +2133,7 @@ public partial class StrmSyncService
         int episodesCreated = 0;
         int episodesUpdated = 0;
         int episodesSkipped = 0;
+        int episodeNameCollisions = 0;
         int errors = 0;
         int smartSkipped = 0;
         int unmatchedCount = 0;
@@ -2717,6 +2785,28 @@ public partial class StrmSyncService
 
                                 syncedFiles.TryAdd(strmPath, 0);
 
+                                // Same guard as the movie path: TryAdd fails when another episode
+                                // in this run already wrote this path, which happens when two
+                                // episodes share a series name and a season/episode number. The
+                                // File.Exists branch below cannot tell them apart, because it
+                                // compares against a URL carrying the episode id, so it would
+                                // silently overwrite. Refuse and count instead.
+                                if (!claimedStrmPaths.TryAdd(strmPath, 0))
+                                {
+                                    Interlocked.Increment(ref episodeNameCollisions);
+
+                                    // Counts as skipped, matching the movie path where a refused
+                                    // write leaves allSkipped true. The collision counter says why;
+                                    // without this an episode would land in no total at all.
+                                    Interlocked.Increment(ref episodesSkipped);
+                                    _logger.LogWarning(
+                                        "STRM name collision for series {SeriesName}: {Path} was already claimed by another episode in this run; refusing to overwrite it with episode {EpisodeId}",
+                                        baseName,
+                                        strmPath,
+                                        episode.EpisodeId);
+                                    continue;
+                                }
+
                                 // Build stream URL
                                 string extension = string.IsNullOrEmpty(episode.ContainerExtension) ? "mkv" : episode.ContainerExtension;
                                 string streamUrl = $"{connectionInfo.BaseUrl}/series/{connectionInfo.UserName}/{connectionInfo.Password}/{episode.EpisodeId}.{extension}";
@@ -2750,6 +2840,14 @@ public partial class StrmSyncService
                                 {
                                     // File was created by another thread/process, skip
                                     continue;
+                                }
+                                catch
+                                {
+                                    // See the movie path: a claim is only worth holding once the
+                                    // file exists, otherwise a later duplicate that could have
+                                    // succeeded is refused and the name gets no STRM at all.
+                                    claimedStrmPaths.TryRemove(strmPath, out _);
+                                    throw;
                                 }
 
                                 // Write episode NFO with media info if enabled (only for first target folder)
@@ -2893,6 +2991,15 @@ public partial class StrmSyncService
         result.EpisodesCreated += episodesCreated;
         result.EpisodesUpdated += episodesUpdated;
         result.EpisodesSkipped += episodesSkipped;
+        result.EpisodeNameCollisions += episodeNameCollisions;
+
+        if (episodeNameCollisions > 0)
+        {
+            _logger.LogWarning(
+                "{Count} episode STRM files were not written because a different episode had already claimed the same name. The provider is offering episodes that share a series name and a season/episode number.",
+                episodeNameCollisions);
+        }
+
         result.AddErrors(errors);
         result.AddFailedItems(failedItems);
         result.SeriesUnmatched = unmatchedCount;
@@ -3985,6 +4092,15 @@ public class SyncResult
     public int MoviesDeleted { get; set; }
 
     /// <summary>
+    /// Gets or sets the number of movie STRM files that were not written because another
+    /// provider stream in the same run had already claimed the identical path. Two streams
+    /// collapse to one path when they share a title and a recognised quality tag, since the
+    /// file name is built from those two alone. Non-zero means the provider is offering
+    /// duplicate streams the plugin cannot tell apart by name.
+    /// </summary>
+    public int MovieNameCollisions { get; set; }
+
+    /// <summary>
     /// Gets the total number of movies (created + skipped + updated).
     /// </summary>
     public int TotalMovies => MoviesCreated + MoviesSkipped + MoviesUpdated;
@@ -4048,6 +4164,14 @@ public class SyncResult
     /// Gets or sets the number of episodes deleted (orphans).
     /// </summary>
     public int EpisodesDeleted { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of episode STRM files that were not written because another
+    /// episode in the same run had already claimed the identical path. See
+    /// <see cref="MovieNameCollisions"/>; episode names are built from the series name plus
+    /// the season and episode numbers, so two episodes sharing those collide the same way.
+    /// </summary>
+    public int EpisodeNameCollisions { get; set; }
 
     /// <summary>
     /// Gets the total number of episodes (created + skipped + updated).
