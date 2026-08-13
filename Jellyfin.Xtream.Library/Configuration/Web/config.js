@@ -493,10 +493,16 @@ const XtreamLibraryConfig = {
                 continue;
             }
             var label = p.Name || ('Provider ' + (i + 1));
-            if (p.MovieFolderMode === 'Multiple' && !p.MovieFolderMappings) {
+
+            // Only complain about content the provider actually syncs. Without the Sync* check,
+            // someone who turns Movies off while its folder mode happens to be Multiple would be
+            // blocked out of saving anything at all, with no way through but changing a setting
+            // that no longer matters. Compared against false, not truthiness, because a provider
+            // object written by an older UI may not carry the field.
+            if (p.SyncMovies !== false && p.MovieFolderMode === 'Multiple' && !p.MovieFolderMappings) {
                 return label + ' / Movies';
             }
-            if (p.SeriesFolderMode === 'Multiple' && !p.SeriesFolderMappings) {
+            if (p.SyncSeries !== false && p.SeriesFolderMode === 'Multiple' && !p.SeriesFolderMappings) {
                 return label + ' / Series';
             }
         }
