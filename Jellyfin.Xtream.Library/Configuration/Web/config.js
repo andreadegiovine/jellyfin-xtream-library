@@ -2654,9 +2654,19 @@ function initXtreamLibraryConfig() {
     XtreamLibraryConfig.loadConfig();
 }
 
-// Try multiple initialization methods for compatibility
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initXtreamLibraryConfig);
-} else {
-    initXtreamLibraryConfig();
+// Try multiple initialization methods for compatibility.
+// Guarded on `document` so the file can also be required from Node by the tests under tests/js:
+// everything above this point is a plain object literal and a function declaration, so requiring
+// it costs nothing and starts no page lifecycle, no timers and no requests.
+if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initXtreamLibraryConfig);
+    } else {
+        initXtreamLibraryConfig();
+    }
+}
+
+// Not present in the browser, where this loads as a plain script and `module` is undefined.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = XtreamLibraryConfig;
 }
