@@ -51,6 +51,13 @@ public class LiveStreamInfo
     [JsonProperty("category_id")]
     public int? CategoryId { get; set; }
 
+    // The primary category above is a scalar, but the API also reports full membership as an
+    // array, and providers that let a channel sit in several categories only show the extras
+    // here. Include mode never needed it (it fetches per category, so the provider resolves
+    // membership server-side); exclude mode filters client-side and does. See GitHub #79.
+    [JsonProperty("category_ids")]
+    public int[]? CategoryIds { get; set; }
+
     [JsonProperty("custom_sid")]
     public string CustomSid { get; set; } = string.Empty;
 

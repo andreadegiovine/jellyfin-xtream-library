@@ -327,8 +327,8 @@ const XtreamLibraryConfig = {
             self.selectedLiveCategoryIds = config.SelectedLiveCategoryIds || [];
             self.excludedLiveStreamIds = config.ExcludedLiveStreamIds || [];
 
-            // Live channel selection mode (IncludeAll | Custom). Backend defaults to IncludeAll on
-            // fresh installs; existing configs with state are migrated to Custom on startup.
+            // Live channel selection mode (IncludeAll | Custom | ExcludeSelected). Backend defaults to
+            // IncludeAll on fresh installs; existing configs with state are migrated to Custom on startup.
             var liveMode = config.LiveChannelMode || 'IncludeAll';
             var modeRadios = document.getElementsByName('LiveChannelMode');
             for (var i = 0; i < modeRadios.length; i++) {
@@ -352,9 +352,11 @@ const XtreamLibraryConfig = {
 
             Dashboard.hideLoadingMsg();
 
-            // Live categories auto-load (uses provider 0 credentials). Only meaningful in Custom mode.
+            // Live categories auto-load (uses provider 0 credentials). Meaningful in both modes that
+            // read the category list - and required in them, because saveConfig reads the selection
+            // back off these checkboxes. See getLiveCategoryIdsForSave.
             var p0 = self.providers[0];
-            if (p0 && p0.BaseUrl && p0.Username && liveMode === 'Custom') {
+            if (p0 && p0.BaseUrl && p0.Username && (liveMode === 'Custom' || liveMode === 'ExcludeSelected')) {
                 self.loadLiveCategories();
             }
         });
@@ -412,7 +414,7 @@ const XtreamLibraryConfig = {
             config.EpgCacheMinutes = parseInt(document.getElementById('txtEpgCacheMinutes').value) || 30;
             config.EpgDaysToFetch = parseInt(document.getElementById('txtEpgDaysToFetch').value) || 2;
             config.EpgParallelism = parseInt(document.getElementById('txtEpgParallelism').value) || 5;
-            config.SelectedLiveCategoryIds = self.getSelectedCategoryIds('live');
+            config.SelectedLiveCategoryIds = self.getLiveCategoryIdsForSave();
             config.ExcludedLiveStreamIds = self.excludedLiveStreamIds.slice();
 
             var checkedMode = document.querySelector('input[name="LiveChannelMode"]:checked');
@@ -1665,6 +1667,20 @@ const XtreamLibraryConfig = {
         }
     },
 
+    getLiveCategoryIdsForSave: function () {
+        const self = this;
+        // The category checkboxes only exist once the list has been loaded from the provider.
+        // Reading them before that returns an empty array, which would quietly rewrite a saved
+        // selection to "nothing ticked" - syncing no channels in Custom mode, or every channel
+        // in ExcludeSelected mode. Fall back to what was loaded from the config instead.
+        const rendered = document.querySelectorAll('input[data-category-type="live"]');
+        if (rendered.length === 0) {
+            return self.selectedLiveCategoryIds.slice();
+        }
+
+        return self.getSelectedCategoryIds('live');
+    },
+
     getSelectedCategoryIds: function (type) {
         const checkboxes = document.querySelectorAll('input[data-category-type="' + type + '"]:checked');
         const ids = [];
@@ -1748,21 +1764,45 @@ const XtreamLibraryConfig = {
         });
     },
 
+    getLiveChannelMode: function () {
+        const checked = document.querySelector('input[name="LiveChannelMode"]:checked');
+        return checked ? checked.value : 'IncludeAll';
+    },
+
     updateLiveCategoryCounter: function () {
         const counter = document.getElementById('liveCategoryCounter');
         if (!counter) return;
         const all = document.querySelectorAll('input[data-category-type="live"]');
         const checked = document.querySelectorAll('input[data-category-type="live"]:checked');
-        counter.textContent = checked.length + ' of ' + all.length + ' categories selected';
+        // A ticked box means the opposite thing in each mode, so "N of M selected" would read
+        // backwards in exclude mode: it is the unticked categories that get synced there.
+        if (XtreamLibraryConfig.getLiveChannelMode() === 'ExcludeSelected') {
+            counter.textContent = checked.length + ' of ' + all.length + ' categories excluded';
+        } else {
+            counter.textContent = checked.length + ' of ' + all.length + ' categories selected';
+        }
     },
 
     updateLiveChannelModeVisibility: function () {
-        const checked = document.querySelector('input[name="LiveChannelMode"]:checked');
-        const mode = checked ? checked.value : 'IncludeAll';
+        const mode = XtreamLibraryConfig.getLiveChannelMode();
         const customSection = document.getElementById('liveCustomSection');
         if (customSection) {
-            customSection.style.display = (mode === 'Custom') ? '' : 'none';
+            customSection.style.display = (mode === 'Custom' || mode === 'ExcludeSelected') ? '' : 'none';
         }
+
+        const hint = document.getElementById('liveChannelModeHint');
+        if (hint) {
+            if (mode === 'Custom') {
+                hint.textContent = 'Only the categories you tick are synced. Tick nothing and nothing syncs.';
+            } else if (mode === 'ExcludeSelected') {
+                hint.textContent = 'Everything is synced except the categories you tick, so categories your '
+                    + 'provider adds later are picked up automatically. Tick nothing and everything syncs.';
+            } else {
+                hint.textContent = '';
+            }
+        }
+
+        XtreamLibraryConfig.updateLiveCategoryCounter();
     },
 
     filterLiveCategoryList: function () {
