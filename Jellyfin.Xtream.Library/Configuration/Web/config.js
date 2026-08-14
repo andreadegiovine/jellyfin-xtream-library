@@ -1700,7 +1700,11 @@ const XtreamLibraryConfig = {
             // Master "Select all" implies a clean slate: drop any per-channel exclusions so
             // the user gets every channel from every category. Existing expanded panels
             // need redrawing so the channel checkboxes follow the new state.
-            self.excludedLiveStreamIds = [];
+            //
+            // That reasoning is inverted in ExcludeSelected mode, where ticking everything means
+            // excluding every category. Per-channel exclusions there are not stale leftovers of a
+            // superseded selection, so wiping them would just destroy the user's list.
+            self.clearLiveChannelExclusionsIfMeaningless();
             self.redrawExpandedLiveChannelPanels();
             self.updateLiveCategoryCounter();
         } else if (type === 'vod' || type === 'series') {
@@ -1720,7 +1724,11 @@ const XtreamLibraryConfig = {
             // Same clean-slate logic as Select all — the per-channel exclusion list is
             // meaningless when no category is selected, and leaving stale state behind was
             // the root of the "Deselect All seems broken" report.
-            self.excludedLiveStreamIds = [];
+            //
+            // Also inverted in ExcludeSelected mode: unticking everything there means excluding no
+            // category, i.e. syncing the lot, and per-channel exclusions are the only filter the
+            // user has left. Clearing them would silently undo that.
+            self.clearLiveChannelExclusionsIfMeaningless();
             self.redrawExpandedLiveChannelPanels();
             self.updateLiveCategoryCounter();
         } else if (type === 'vod' || type === 'series') {
@@ -1769,6 +1777,19 @@ const XtreamLibraryConfig = {
         return checked ? checked.value : 'IncludeAll';
     },
 
+    /**
+     * Drops the per-channel exclusion list, but only where a bulk category toggle has genuinely
+     * made it meaningless - which is Custom mode, where the exclusions only ever qualified a
+     * category selection that has just been replaced wholesale. In ExcludeSelected mode they are
+     * an independent filter and must survive.
+     */
+    clearLiveChannelExclusionsIfMeaningless: function () {
+        const self = this;
+        if (self.getLiveChannelMode() !== 'ExcludeSelected') {
+            self.excludedLiveStreamIds = [];
+        }
+    },
+
     updateLiveCategoryCounter: function () {
         const counter = document.getElementById('liveCategoryCounter');
         if (!counter) return;
@@ -1800,6 +1821,15 @@ const XtreamLibraryConfig = {
             } else {
                 hint.textContent = '';
             }
+        }
+
+        // A ticked box excludes rather than includes in the new mode, so "Select all" would read as
+        // a way to get everything while actually syncing nothing.
+        const selectAllLabel = document.getElementById('btnLiveSelectAllLabel');
+        const deselectAllLabel = document.getElementById('btnLiveDeselectAllLabel');
+        if (selectAllLabel && deselectAllLabel) {
+            selectAllLabel.textContent = (mode === 'ExcludeSelected') ? 'Exclude all' : 'Select all';
+            deselectAllLabel.textContent = (mode === 'ExcludeSelected') ? 'Exclude none' : 'Deselect all';
         }
 
         XtreamLibraryConfig.updateLiveCategoryCounter();
@@ -2628,6 +2658,16 @@ function initXtreamLibraryConfig() {
     for (var i = 0; i < liveModeRadios.length; i++) {
         liveModeRadios[i].addEventListener('change', function () {
             XtreamLibraryConfig.updateLiveChannelModeVisibility();
+
+            // The auto-load on page open reads the *saved* mode, so switching into a mode that
+            // needs the category list would otherwise reveal an empty panel until the user found
+            // the Load Categories button.
+            var mode = XtreamLibraryConfig.getLiveChannelMode();
+            var needsList = (mode === 'Custom' || mode === 'ExcludeSelected');
+            var alreadyLoaded = document.querySelectorAll('input[data-category-type="live"]').length > 0;
+            if (needsList && !alreadyLoaded) {
+                XtreamLibraryConfig.loadLiveCategories();
+            }
         });
     }
 

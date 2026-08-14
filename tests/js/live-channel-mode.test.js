@@ -131,6 +131,89 @@ test('the category list is shown in both modes that read it', async (t) => {
     });
 });
 
+test('bulk category toggles do not destroy per-channel exclusions in exclude mode', async (t) => {
+    // In exclude mode, "Exclude none" means sync everything, and the per-channel exclusions are
+    // then the only filter left. The Custom-mode reasoning - that they are stale leftovers of a
+    // selection just replaced wholesale - does not hold, so they have to survive.
+    await t.test('deselect all keeps them in ExcludeSelected mode', () => {
+        const config = loadConfig();
+        config.excludedLiveStreamIds = [101, 102];
+        config.redrawExpandedLiveChannelPanels = () => {};
+        const restore = withDocument({}, liveDom('ExcludeSelected', []));
+
+        try {
+            config.deselectAllCategories('live');
+            assert.deepStrictEqual(config.excludedLiveStreamIds, [101, 102]);
+        } finally {
+            restore();
+        }
+    });
+
+    await t.test('select all keeps them in ExcludeSelected mode', () => {
+        const config = loadConfig();
+        config.excludedLiveStreamIds = [101];
+        config.redrawExpandedLiveChannelPanels = () => {};
+        const restore = withDocument({}, liveDom('ExcludeSelected', []));
+
+        try {
+            config.selectAllCategories('live');
+            assert.deepStrictEqual(config.excludedLiveStreamIds, [101]);
+        } finally {
+            restore();
+        }
+    });
+
+    await t.test('Custom mode still clears them, as before', () => {
+        const config = loadConfig();
+        config.excludedLiveStreamIds = [101, 102];
+        config.redrawExpandedLiveChannelPanels = () => {};
+        const restore = withDocument({}, liveDom('Custom', []));
+
+        try {
+            config.deselectAllCategories('live');
+            assert.deepStrictEqual(config.excludedLiveStreamIds, []);
+        } finally {
+            restore();
+        }
+    });
+});
+
+test('the bulk toggle buttons say what they actually do', async (t) => {
+    await t.test('exclude mode relabels them so "Select all" cannot read as "sync everything"', () => {
+        const config = loadConfig();
+        const selectAll = element({ textContent: 'Select all' });
+        const deselectAll = element({ textContent: 'Deselect all' });
+        const restore = withDocument(
+            { btnLiveSelectAllLabel: selectAll, btnLiveDeselectAllLabel: deselectAll },
+            liveDom('ExcludeSelected', []));
+
+        try {
+            config.updateLiveChannelModeVisibility();
+            assert.strictEqual(selectAll.textContent, 'Exclude all');
+            assert.strictEqual(deselectAll.textContent, 'Exclude none');
+        } finally {
+            restore();
+        }
+    });
+
+    await t.test('custom mode keeps the original labels', () => {
+        const config = loadConfig();
+        const selectAll = element({ textContent: '' });
+        const deselectAll = element({ textContent: '' });
+        const restore = withDocument(
+            { btnLiveSelectAllLabel: selectAll, btnLiveDeselectAllLabel: deselectAll },
+            liveDom('Custom', []));
+
+        try {
+            config.updateLiveChannelModeVisibility();
+            assert.strictEqual(selectAll.textContent, 'Select all');
+            assert.strictEqual(deselectAll.textContent, 'Deselect all');
+        } finally {
+            restore();
+        }
+    });
+});
+
 test('the counter says excluded or selected to match the mode', async (t) => {
     await t.test('exclude mode counts what will NOT be synced', () => {
         const config = loadConfig();
