@@ -510,24 +510,28 @@ public partial class StrmSyncService
         CancellationToken cancellationToken)
     {
         var connectionInfo = new ConnectionInfo(provider.BaseUrl, provider.Username, provider.Password);
-        var selectedIds = provider.SelectedSeriesCategoryIds;
+        var selection = ResolveCategorySelection(
+            provider.SeriesFolderMode,
+            provider.SeriesFolderMappings,
+            provider.SelectedSeriesCategoryIds,
+            provider.SeriesCategoriesMode);
 
         // This is the fallback path after a lookup has already failed, and it costs one
         // GetSeriesByCategoryAsync call per category it walks. Only a selection that actually
         // narrows the catalogue makes that worth doing: with nothing configured every category is
         // in scope, and scanning all of them would hammer a provider that is already misbehaving.
+        // A selection that resolves to nothing has nowhere to search either, so it takes the same
+        // exit rather than fetching the category list first.
         // Bailing out here also keeps the GetSeriesCategoryAsync call below off the common path.
-        if (!CategorySelectionFilter.NarrowsSelection(selectedIds))
+        if (!selection.NarrowsSelection)
         {
             _logger.LogDebug("No series categories configured, cannot search for series by name");
             return null;
         }
 
         var allSeriesCategories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
-        var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
-        bool exclude = CategorySelectionFilter.IsExcludeMode(provider.SeriesCategoriesMode);
         var categoryIds = allSeriesCategories
-            .Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude))
+            .Where(c => selection.ShouldSync(c.CategoryId))
             .Select(c => c.CategoryId)
             .ToArray();
 
@@ -707,6 +711,34 @@ public partial class StrmSyncService
                 globalResult.ChannelsUpdated,
                 globalResult.ChannelsSkipped,
                 globalResult.ChannelsDeleted);
+
+            if (globalResult.OrphanCleanupSkipped)
+            {
+                // Restated at the end of the run so it sits next to the completion line rather
+                // than thousands of per-item entries earlier in the log.
+                //
+                // The two reasons get different advice on purpose. Telling someone to raise the
+                // safety threshold is right when a provider glitch tripped it, and is the worst
+                // possible advice when the block was an empty category selection: raising it would
+                // let the next sync delete the library this guard just saved (GitHub #78).
+                if (globalResult.OrphanCleanupBlockedByEmptySelection)
+                {
+                    _logger.LogWarning(
+                        "Sync finished with orphan cleanup blocked: {Total} orphaned STRM files ({Movies} movies, {Episodes} episodes) were left on disk because a category selection resolves to nothing, so the sync had nothing to compare them against. Check the folder configuration - in Multiple folder mode only categories assigned to a folder are synced. Do not raise Orphan Safety Threshold to work around this.",
+                        globalResult.OrphansSkipped,
+                        globalResult.MovieOrphansSkipped,
+                        globalResult.EpisodeOrphansSkipped);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Sync finished with orphan cleanup blocked: {Total} orphaned STRM files ({Movies} movies, {Episodes} episodes) were left on disk because the deletion ratio exceeded the {Threshold:P0} safety threshold. Raise Orphan Safety Threshold in the plugin settings if the provider change was intentional.",
+                        globalResult.OrphansSkipped,
+                        globalResult.MovieOrphansSkipped,
+                        globalResult.EpisodeOrphansSkipped,
+                        globalResult.OrphanSafetyThresholdApplied);
+                }
+            }
 
             // Flush metadata cache to disk
             if (config.EnableMetadataLookup)
@@ -1054,27 +1086,93 @@ public partial class StrmSyncService
             double movieDeletionRatio = existingMovieCount > 0 ? (double)orphanedMovies / existingMovieCount : 0;
             double episodeDeletionRatio = existingEpisodeCount > 0 ? (double)orphanedEpisodes / existingEpisodeCount : 0;
 
-            bool skipMovieCleanup = existingMovieCount > 10 && movieDeletionRatio > safetyThreshold;
-            bool skipEpisodeCleanup = existingEpisodeCount > 10 && episodeDeletionRatio > safetyThreshold;
+            // Protection: a selection that resolves to nothing syncs no files, which would make
+            // the entire existing library an orphan. That is a misconfiguration to be corrected,
+            // not a deletion to be carried out - and it is reachable by upgrading into the #78 fix
+            // with a Multiple folder mode config that assigns no categories. The safety threshold
+            // above would normally catch it, but not for a provider set to 100%.
+            // The "> 0" conjuncts matter: with nothing on disk yet there is nothing to protect and
+            // the warning would be noise on every sync.
+            bool skipMovieForEmptySelection = orphanedMovies > 0 && ResolveCategorySelection(
+                provider.MovieFolderMode,
+                provider.MovieFolderMappings,
+                provider.SelectedVodCategoryIds,
+                provider.MovieCategoriesMode).SyncsNothing;
+            bool skipEpisodeForEmptySelection = orphanedEpisodes > 0 && ResolveCategorySelection(
+                provider.SeriesFolderMode,
+                provider.SeriesFolderMappings,
+                provider.SelectedSeriesCategoryIds,
+                provider.SeriesCategoriesMode).SyncsNothing;
+
+            bool skipMovieForThreshold = existingMovieCount > 10 && movieDeletionRatio > safetyThreshold;
+            bool skipEpisodeForThreshold = existingEpisodeCount > 10 && episodeDeletionRatio > safetyThreshold;
+
+            bool skipMovieCleanup = skipMovieForEmptySelection || skipMovieForThreshold;
+            bool skipEpisodeCleanup = skipEpisodeForEmptySelection || skipEpisodeForThreshold;
 
             if (skipMovieCleanup)
             {
-                _logger.LogWarning(
-                    "Skipping movie orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
-                    orphanedMovies,
-                    existingMovieCount,
-                    movieDeletionRatio,
-                    safetyThreshold);
+                // Record the counts as well as logging them, whichever reason blocked the cleanup.
+                // Before this the numbers existed only as locals at the moment of the decision, so
+                // a run that refused to delete half the library reported Success/0 deleted/0 errors
+                // - identical to a clean run, and the only trace was one log line that scrolls away
+                // (GitHub #77). The reason decides the wording below, never whether it is reported.
+                result.MovieOrphansSkipped += orphanedMovies;
+                result.MovieOrphansExamined += existingMovieCount;
+
+                if (skipMovieForEmptySelection)
+                {
+                    _logger.LogWarning(
+                        "Skipping movie orphan cleanup: the movie category selection resolves to nothing, so all {OrphanCount} existing movie files would be deleted. Fix the folder configuration first.",
+                        orphanedMovies);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Skipping movie orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
+                        orphanedMovies,
+                        existingMovieCount,
+                        movieDeletionRatio,
+                        safetyThreshold);
+                }
             }
 
             if (skipEpisodeCleanup)
             {
-                _logger.LogWarning(
-                    "Skipping episode orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
-                    orphanedEpisodes,
-                    existingEpisodeCount,
-                    episodeDeletionRatio,
-                    safetyThreshold);
+                result.EpisodeOrphansSkipped += orphanedEpisodes;
+                result.EpisodeOrphansExamined += existingEpisodeCount;
+
+                if (skipEpisodeForEmptySelection)
+                {
+                    _logger.LogWarning(
+                        "Skipping episode orphan cleanup: the series category selection resolves to nothing, so all {OrphanCount} existing episode files would be deleted. Fix the folder configuration first.",
+                        orphanedEpisodes);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Skipping episode orphan cleanup: {OrphanCount}/{ExistingCount} ({Percent:P0}) exceeds {Threshold:P0} safety threshold - possible provider issue",
+                        orphanedEpisodes,
+                        existingEpisodeCount,
+                        episodeDeletionRatio,
+                        safetyThreshold);
+                }
+            }
+
+            if (skipMovieForThreshold || skipEpisodeForThreshold)
+            {
+                // Gated on the threshold reasons alone. An empty-selection skip has no threshold
+                // behind it, and recording one here would make the summary and the last-sync panel
+                // quote a limit that had nothing to do with the decision.
+                // One provider, one cleanup pass, so this is the only threshold this result can
+                // carry. Merging several providers is where a choice has to be made.
+                result.OrphanSafetyThresholdApplied = safetyThreshold;
+                result.OrphanCleanupBlockedByThreshold = true;
+            }
+
+            if (skipMovieForEmptySelection || skipEpisodeForEmptySelection)
+            {
+                result.OrphanCleanupBlockedByEmptySelection = true;
             }
 
             // Filter orphans based on safety checks
@@ -1167,6 +1265,9 @@ public partial class StrmSyncService
     /// <param name="providerResult">The result from a single provider.</param>
     private static void MergeResult(SyncResult globalResult, SyncResult providerResult)
     {
+        // Read before the merge below makes it true for this provider's own contribution.
+        bool anEarlierProviderAlreadyBlockedOnThreshold = globalResult.OrphanCleanupBlockedByThreshold;
+
         globalResult.MoviesCreated += providerResult.MoviesCreated;
         globalResult.MoviesUpdated += providerResult.MoviesUpdated;
         globalResult.MoviesSkipped += providerResult.MoviesSkipped;
@@ -1185,6 +1286,26 @@ public partial class StrmSyncService
         globalResult.EpisodesDeleted += providerResult.EpisodesDeleted;
         globalResult.EpisodeNameCollisions += providerResult.EpisodeNameCollisions;
         globalResult.FilesDeleted += providerResult.FilesDeleted;
+        globalResult.MovieOrphansSkipped += providerResult.MovieOrphansSkipped;
+        globalResult.MovieOrphansExamined += providerResult.MovieOrphansExamined;
+        globalResult.EpisodeOrphansSkipped += providerResult.EpisodeOrphansSkipped;
+        globalResult.EpisodeOrphansExamined += providerResult.EpisodeOrphansExamined;
+        globalResult.OrphanCleanupBlockedByEmptySelection =
+            globalResult.OrphanCleanupBlockedByEmptySelection || providerResult.OrphanCleanupBlockedByEmptySelection;
+
+        if (providerResult.OrphanCleanupBlockedByThreshold)
+        {
+            // The most conservative threshold in play is the one worth showing. Gated on the
+            // dedicated flag rather than on a non-zero threshold, because a provider set to 0%
+            // blocks every cleanup and still has to report the limit that did it - and rather
+            // than on the counts, because a provider blocked only by an empty selection carries
+            // no threshold at all and would otherwise drag this minimum to zero.
+            globalResult.OrphanSafetyThresholdApplied = anEarlierProviderAlreadyBlockedOnThreshold
+                ? Math.Min(globalResult.OrphanSafetyThresholdApplied, providerResult.OrphanSafetyThresholdApplied)
+                : providerResult.OrphanSafetyThresholdApplied;
+            globalResult.OrphanCleanupBlockedByThreshold = true;
+        }
+
         globalResult.SeriesUnmatched += providerResult.SeriesUnmatched;
         globalResult.Errors += providerResult.Errors;
         globalResult.WasIncrementalSync = globalResult.WasIncrementalSync || providerResult.WasIncrementalSync;
@@ -1292,33 +1413,11 @@ public partial class StrmSyncService
         var categories = await _client.GetVodCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
         var processedStreamIds = new ConcurrentDictionary<int, bool>();
 
-        // Filter categories if user has selected specific ones
-        var selectedIds = provider.SelectedVodCategoryIds;
-        if (selectedIds.Length > 0)
-        {
-            var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
-            bool exclude = CategorySelectionFilter.IsExcludeMode(provider.MovieCategoriesMode);
-            var filteredCategories = categories.Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude)).ToList();
-            var skippedCount = categories.Count - filteredCategories.Count;
-            if (skippedCount > 0)
-            {
-                _logger.LogInformation("Filtering VOD categories: {Selected} selected, {Skipped} skipped", filteredCategories.Count, skippedCount);
-            }
-
-            // Warn about non-existent category IDs
-            var existingIds = categories.Select(c => c.CategoryId).ToHashSet();
-            var missingIds = selectedIds.Where(id => !existingIds.Contains(id)).ToList();
-            if (missingIds.Count > 0)
-            {
-                _logger.LogWarning("Selected VOD category IDs not found on provider: {MissingIds}", string.Join(", ", missingIds));
-            }
-
-            categories = filteredCategories;
-        }
-
-        // Parse folder mappings (category ID → folder names) - only in Multiple folder mode
+        // Parse folder mappings (category ID → folder names) - only in Multiple folder mode.
+        // This has to come before the category filter, because in Multiple folder mode the
+        // mappings are also what decides which categories are in scope at all.
         var folderMappings = new Dictionary<int, List<string>>();
-        if (string.Equals(provider.MovieFolderMode, "Multiple", StringComparison.OrdinalIgnoreCase))
+        if (IsMultipleFolderMode(provider.MovieFolderMode))
         {
             folderMappings = ParseFolderMappings(provider.MovieFolderMappings);
             if (folderMappings.Count > 0)
@@ -1327,8 +1426,70 @@ public partial class StrmSyncService
             }
         }
 
-        // Determine batch size - 0 means process all at once (legacy behavior)
-        var batchSize = provider.CategoryBatchSize > 0 ? provider.CategoryBatchSize : categories.Count;
+        // Filter categories down to the configured selection
+        var selection = ResolveCategorySelection(
+            provider.MovieFolderMode,
+            folderMappings,
+            provider.SelectedVodCategoryIds,
+            provider.MovieCategoriesMode);
+
+        if (selection.SyncsNothing)
+        {
+            _logger.LogWarning(
+                "No movies will be synced for provider '{Provider}': Multiple folder mode is on but no category is assigned to any folder. Assign categories to your movie folders, or switch to Single folder mode.",
+                provider.Name);
+        }
+
+        var filteredCategories = categories.Where(c => selection.ShouldSync(c.CategoryId)).ToList();
+        var skippedCount = categories.Count - filteredCategories.Count;
+        if (skippedCount > 0)
+        {
+            _logger.LogInformation("Filtering VOD categories: {Selected} selected, {Skipped} skipped", filteredCategories.Count, skippedCount);
+        }
+
+        // Warn about non-existent category IDs. The wording differs by mode: in Multiple folder
+        // mode there is no "selected categories" list on screen, there are folders with categories
+        // assigned to them.
+        var existingCategoryIds = categories.Select(c => c.CategoryId).ToHashSet();
+        var missingIds = selection.ConfiguredIds.Where(id => !existingCategoryIds.Contains(id)).ToList();
+        if (missingIds.Count > 0)
+        {
+            if (IsMultipleFolderMode(provider.MovieFolderMode))
+            {
+                _logger.LogWarning("Movie folder mappings reference VOD category IDs that no longer exist on the provider: {MissingIds}", string.Join(", ", missingIds));
+            }
+            else
+            {
+                _logger.LogWarning("Selected VOD category IDs not found on provider: {MissingIds}", string.Join(", ", missingIds));
+            }
+        }
+
+        // Configs written before v1.16.0.0 kept the folder mappings in a free-text box that was
+        // independent of the category checkboxes, so the two can genuinely disagree. Every save
+        // since then rewrites the selection from the folders, but a config that has not been saved
+        // since can still name categories no folder covers. Those stop syncing here, so say which.
+        if (IsMultipleFolderMode(provider.MovieFolderMode))
+        {
+            var unassignedIds = (provider.SelectedVodCategoryIds ?? [])
+                .Where(id => !selection.ConfiguredIds.Contains(id))
+                .ToList();
+            if (unassignedIds.Count > 0)
+            {
+                _logger.LogWarning(
+                    "Multiple folder mode: {Count} previously selected VOD category IDs are not assigned to any folder and will no longer be synced: {MissingIds}. Assign them to a folder to keep them.",
+                    unassignedIds.Count,
+                    string.Join(", ", unassignedIds));
+            }
+        }
+
+        categories = filteredCategories;
+
+        // Determine batch size - 0 means process all at once (legacy behavior).
+        // Math.Max keeps the division below defined when the selection resolves to no categories
+        // at all, which is now reachable from the config rather than only by accident: with
+        // CategoryBatchSize 0 the fallback would be 0 too, and (int)Math.Ceiling(0.0 / 0.0) is a
+        // NaN cast whose result the spec leaves undefined.
+        var batchSize = provider.CategoryBatchSize > 0 ? provider.CategoryBatchSize : Math.Max(1, categories.Count);
         var totalBatches = (int)Math.Ceiling((double)categories.Count / batchSize);
 
         _logger.LogInformation(
@@ -2076,33 +2237,11 @@ public partial class StrmSyncService
         var categories = await _client.GetSeriesCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
         var processedSeriesIds = new ConcurrentDictionary<int, bool>();
 
-        // Filter categories if user has selected specific ones
-        var selectedIds = provider.SelectedSeriesCategoryIds;
-        if (selectedIds.Length > 0)
-        {
-            var selectedIdSet = CategorySelectionFilter.BuildSet(selectedIds);
-            bool exclude = CategorySelectionFilter.IsExcludeMode(provider.SeriesCategoriesMode);
-            var filteredCategories = categories.Where(c => CategorySelectionFilter.ShouldSync(selectedIdSet, c.CategoryId, exclude)).ToList();
-            var skippedCount = categories.Count - filteredCategories.Count;
-            if (skippedCount > 0)
-            {
-                _logger.LogInformation("Filtering Series categories: {Selected} selected, {Skipped} skipped", filteredCategories.Count, skippedCount);
-            }
-
-            // Warn about non-existent category IDs
-            var existingIds = categories.Select(c => c.CategoryId).ToHashSet();
-            var missingIds = selectedIds.Where(id => !existingIds.Contains(id)).ToList();
-            if (missingIds.Count > 0)
-            {
-                _logger.LogWarning("Selected Series category IDs not found on provider: {MissingIds}", string.Join(", ", missingIds));
-            }
-
-            categories = filteredCategories;
-        }
-
-        // Parse folder mappings (category ID → folder names) - only in Multiple folder mode
+        // Parse folder mappings (category ID → folder names) - only in Multiple folder mode.
+        // This has to come before the category filter, because in Multiple folder mode the
+        // mappings are also what decides which categories are in scope at all.
         var folderMappings = new Dictionary<int, List<string>>();
-        if (string.Equals(provider.SeriesFolderMode, "Multiple", StringComparison.OrdinalIgnoreCase))
+        if (IsMultipleFolderMode(provider.SeriesFolderMode))
         {
             folderMappings = ParseFolderMappings(provider.SeriesFolderMappings);
             if (folderMappings.Count > 0)
@@ -2111,8 +2250,70 @@ public partial class StrmSyncService
             }
         }
 
-        // Determine batch size - 0 means process all at once (legacy behavior)
-        var batchSize = provider.CategoryBatchSize > 0 ? provider.CategoryBatchSize : categories.Count;
+        // Filter categories down to the configured selection
+        var selection = ResolveCategorySelection(
+            provider.SeriesFolderMode,
+            folderMappings,
+            provider.SelectedSeriesCategoryIds,
+            provider.SeriesCategoriesMode);
+
+        if (selection.SyncsNothing)
+        {
+            _logger.LogWarning(
+                "No series will be synced for provider '{Provider}': Multiple folder mode is on but no category is assigned to any folder. Assign categories to your series folders, or switch to Single folder mode.",
+                provider.Name);
+        }
+
+        var filteredCategories = categories.Where(c => selection.ShouldSync(c.CategoryId)).ToList();
+        var skippedCount = categories.Count - filteredCategories.Count;
+        if (skippedCount > 0)
+        {
+            _logger.LogInformation("Filtering Series categories: {Selected} selected, {Skipped} skipped", filteredCategories.Count, skippedCount);
+        }
+
+        // Warn about non-existent category IDs. The wording differs by mode: in Multiple folder
+        // mode there is no "selected categories" list on screen, there are folders with categories
+        // assigned to them.
+        var existingCategoryIds = categories.Select(c => c.CategoryId).ToHashSet();
+        var missingIds = selection.ConfiguredIds.Where(id => !existingCategoryIds.Contains(id)).ToList();
+        if (missingIds.Count > 0)
+        {
+            if (IsMultipleFolderMode(provider.SeriesFolderMode))
+            {
+                _logger.LogWarning("Series folder mappings reference Series category IDs that no longer exist on the provider: {MissingIds}", string.Join(", ", missingIds));
+            }
+            else
+            {
+                _logger.LogWarning("Selected Series category IDs not found on provider: {MissingIds}", string.Join(", ", missingIds));
+            }
+        }
+
+        // Configs written before v1.16.0.0 kept the folder mappings in a free-text box that was
+        // independent of the category checkboxes, so the two can genuinely disagree. Every save
+        // since then rewrites the selection from the folders, but a config that has not been saved
+        // since can still name categories no folder covers. Those stop syncing here, so say which.
+        if (IsMultipleFolderMode(provider.SeriesFolderMode))
+        {
+            var unassignedIds = (provider.SelectedSeriesCategoryIds ?? [])
+                .Where(id => !selection.ConfiguredIds.Contains(id))
+                .ToList();
+            if (unassignedIds.Count > 0)
+            {
+                _logger.LogWarning(
+                    "Multiple folder mode: {Count} previously selected Series category IDs are not assigned to any folder and will no longer be synced: {MissingIds}. Assign them to a folder to keep them.",
+                    unassignedIds.Count,
+                    string.Join(", ", unassignedIds));
+            }
+        }
+
+        categories = filteredCategories;
+
+        // Determine batch size - 0 means process all at once (legacy behavior).
+        // Math.Max keeps the division below defined when the selection resolves to no categories
+        // at all, which is now reachable from the config rather than only by accident: with
+        // CategoryBatchSize 0 the fallback would be 0 too, and (int)Math.Ceiling(0.0 / 0.0) is a
+        // NaN cast whose result the spec leaves undefined.
+        var batchSize = provider.CategoryBatchSize > 0 ? provider.CategoryBatchSize : Math.Max(1, categories.Count);
         var totalBatches = (int)Math.Ceiling((double)categories.Count / batchSize);
 
         _logger.LogInformation(
@@ -3388,6 +3589,61 @@ public partial class StrmSyncService
     }
 
     /// <summary>
+    /// Returns true when the given folder mode string selects Multiple folder mode.
+    /// </summary>
+    /// <param name="folderMode">The configured folder mode, "Single" or "Multiple".</param>
+    /// <returns>True for Multiple, false for anything else.</returns>
+    internal static bool IsMultipleFolderMode(string? folderMode)
+        => string.Equals(folderMode, "Multiple", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Resolves which categories take part in a sync. In Multiple folder mode the folder mappings
+    /// are the filter; in Single folder mode the flat category selection is.
+    /// <para>
+    /// The two always agree for a config written by the config page, which stores the union of the
+    /// folder-assigned categories in the selection array. Reading the mappings directly removes the
+    /// frontend's obligation to keep them in step, and gives "no folder holds a category" a meaning
+    /// ("sync nothing") that an empty selection array cannot carry (GitHub #78).
+    /// </para>
+    /// </summary>
+    /// <param name="folderMode">The provider's folder mode for this content type.</param>
+    /// <param name="parsedFolderMappings">The already-parsed folder mappings, empty in Single mode.</param>
+    /// <param name="selectedIds">The provider's flat category selection.</param>
+    /// <param name="categoriesMode">The provider's Include/Exclude mode.</param>
+    /// <returns>The resolved selection.</returns>
+    internal static CategorySelection ResolveCategorySelection(
+        string? folderMode,
+        Dictionary<int, List<string>> parsedFolderMappings,
+        int[]? selectedIds,
+        string? categoriesMode)
+    {
+        ArgumentNullException.ThrowIfNull(parsedFolderMappings);
+
+        return IsMultipleFolderMode(folderMode)
+            ? CategorySelection.FromFolderMappings(parsedFolderMappings.Keys)
+            : CategorySelection.FromCategoryList(selectedIds, categoriesMode);
+    }
+
+    /// <summary>
+    /// Resolves the category selection for a caller that does not already hold the parsed mappings.
+    /// </summary>
+    /// <param name="folderMode">The provider's folder mode for this content type.</param>
+    /// <param name="folderMappings">The raw folder mapping string.</param>
+    /// <param name="selectedIds">The provider's flat category selection.</param>
+    /// <param name="categoriesMode">The provider's Include/Exclude mode.</param>
+    /// <returns>The resolved selection.</returns>
+    internal static CategorySelection ResolveCategorySelection(
+        string? folderMode,
+        string? folderMappings,
+        int[]? selectedIds,
+        string? categoriesMode)
+        => ResolveCategorySelection(
+            folderMode,
+            IsMultipleFolderMode(folderMode) ? ParseFolderMappings(folderMappings) : new Dictionary<int, List<string>>(),
+            selectedIds,
+            categoriesMode);
+
+    /// <summary>
     /// Parses folder mapping configuration into a reverse lookup (category ID → folder names).
     /// </summary>
     /// <param name="config">The configuration string with one mapping per line.</param>
@@ -4207,6 +4463,78 @@ public class SyncResult
     /// Gets or sets the number of files deleted (orphans) - legacy, use specific counts.
     /// </summary>
     public int FilesDeleted { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of orphaned movie STRM files that were found but deliberately left
+    /// on disk because deleting them would have exceeded the provider's orphan safety threshold.
+    /// Non-zero means the library still holds that many files the sync believes are dead, and it
+    /// will keep holding them until the threshold is raised or the provider recovers.
+    /// </summary>
+    public int MovieOrphansSkipped { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of existing movie STRM files that <see cref="MovieOrphansSkipped"/>
+    /// was measured against - the denominator of the ratio that tripped the safety threshold.
+    /// The denominator is carried instead of the ratio so the figure stays meaningful after
+    /// several providers are merged into one result.
+    /// </summary>
+    public int MovieOrphansExamined { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of orphaned episode STRM files that were found but deliberately
+    /// left on disk. See <see cref="MovieOrphansSkipped"/>; movies and episodes are gated
+    /// separately, so one can be cleaned while the other is blocked.
+    /// </summary>
+    public int EpisodeOrphansSkipped { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of existing episode STRM files that
+    /// <see cref="EpisodeOrphansSkipped"/> was measured against.
+    /// </summary>
+    public int EpisodeOrphansExamined { get; set; }
+
+    /// <summary>
+    /// Gets or sets the orphan safety threshold, as a fraction of the library, that blocked the
+    /// cleanup. Zero when nothing was blocked. When several providers blocked at different
+    /// thresholds this holds the lowest of them, so the limit shown to the user is the most
+    /// conservative one in play.
+    /// </summary>
+    public double OrphanSafetyThresholdApplied { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether any orphan cleanup was blocked because a content
+    /// type's category selection resolved to nothing, rather than because the deletion ratio
+    /// exceeded the safety threshold (GitHub #78).
+    /// <para>
+    /// The two have opposite remedies, which is the whole reason this is a separate flag: raising
+    /// the safety threshold is the fix for a threshold block, and is exactly the wrong advice for
+    /// this one, because it would let the next sync delete the library the guard just saved.
+    /// </para>
+    /// </summary>
+    public bool OrphanCleanupBlockedByEmptySelection { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether any orphan cleanup was blocked by the safety
+    /// threshold. Tracked separately from <see cref="OrphanSafetyThresholdApplied"/> because 0% is
+    /// a legitimate threshold, so the value alone cannot say whether one was ever applied, and a
+    /// provider blocked only by an empty selection must not drag the merged minimum down to zero.
+    /// A single provider can be blocked for both reasons at once, one per content type.
+    /// </summary>
+    public bool OrphanCleanupBlockedByThreshold { get; set; }
+
+    /// <summary>
+    /// Gets the total number of orphaned STRM files that were found but not deleted.
+    /// </summary>
+    public int OrphansSkipped => MovieOrphansSkipped + EpisodeOrphansSkipped;
+
+    /// <summary>
+    /// Gets a value indicating whether orphan cleanup was blocked, by either the safety threshold
+    /// or a category selection that resolves to nothing. The sync itself did not fail, so
+    /// <see cref="Success"/> stays true; this is the separate signal that the run deliberately did
+    /// not finish part of its job. See <see cref="OrphanCleanupBlockedByEmptySelection"/> for which
+    /// reason applied.
+    /// </summary>
+    public bool OrphanCleanupSkipped => OrphansSkipped > 0;
 
     /// <summary>
     /// Gets or sets the number of errors encountered. Thread-safe for concurrent movie+series sync.

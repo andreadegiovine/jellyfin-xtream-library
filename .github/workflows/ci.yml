@@ -1,0 +1,62 @@
+name: CI
+
+# build-release.yml only fires on a version tag, so until this existed nothing ran the test
+# suite: it was on whoever happened to run `dotnet test` locally before pushing.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A push to a branch that also has a PR open would otherwise run this twice.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dotnet:
+    name: .NET tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      # TreatWarningsAsErrors is on, so this is also the analyser gate.
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Test
+        run: dotnet test -c Release --no-build
+
+  config-page:
+    name: Config page tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # config.js is embedded in the DLL and never compiled, so a syntax error would ship and
+      # only surface as a blank plugin config page.
+      - name: Syntax check config.js
+        run: node --check Jellyfin.Xtream.Library/Configuration/Web/config.js
+
+      # Quoted so node does the globbing; the runner's bash has globstar off and would pass
+      # the pattern through only partially expanded.
+      - name: Test
+        run: node --test "tests/js/**/*.test.js"

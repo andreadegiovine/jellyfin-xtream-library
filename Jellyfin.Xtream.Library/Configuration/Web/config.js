@@ -365,11 +365,26 @@ const XtreamLibraryConfig = {
     },
 
     saveConfig: function () {
-        Dashboard.showLoadingMsg();
         const self = this;
 
         // Flush current UI state into providers array before saving
         self.updateActiveProviderFromUI();
+
+        // Refuse a Multiple folder mode config that assigns no categories to any folder. Nothing
+        // would sync, and before GitHub #78 it did the opposite and ingested the provider's whole
+        // catalogue into the library root. Either way the user did not ask for it, so say so here
+        // rather than letting them find out from a sync result.
+        var emptyFolderContent = self.findEmptyFolderModeContent();
+        if (emptyFolderContent) {
+            Dashboard.alert(
+                emptyFolderContent + ' is set to Multiple folder mode but no category is assigned ' +
+                'to any folder, so nothing would sync.\n\n' +
+                'Assign categories to your folders, or switch to Single folder mode.\n\n' +
+                'Nothing has been saved.');
+            return;
+        }
+
+        Dashboard.showLoadingMsg();
 
         ApiClient.getPluginConfiguration(this.pluginUniqueId).then(function (config) {
             // Write providers array
@@ -464,6 +479,36 @@ const XtreamLibraryConfig = {
         return lines.join('\n');
     },
 
+    // Returns a "<Provider> / <Content>" label for the first provider whose Multiple folder mode
+    // configuration assigns no categories at all, or null when every provider is fine. Reads the
+    // mappings rather than Selected*CategoryIds because the mappings are what the sync now filters
+    // on (GitHub #78). Every provider is checked, not just the active one: switching providers
+    // flushes the outgoing one into this.providers, so a broken config can be sitting there
+    // unsaved while a different provider is on screen.
+    // Call only after updateActiveProviderFromUI, so this sees what would actually be persisted.
+    findEmptyFolderModeContent: function () {
+        for (var i = 0; i < this.providers.length; i++) {
+            var p = this.providers[i];
+            if (!p) {
+                continue;
+            }
+            var label = p.Name || ('Provider ' + (i + 1));
+
+            // Only complain about content the provider actually syncs. Without the Sync* check,
+            // someone who turns Movies off while its folder mode happens to be Multiple would be
+            // blocked out of saving anything at all, with no way through but changing a setting
+            // that no longer matters. Compared against false, not truthiness, because a provider
+            // object written by an older UI may not carry the field.
+            if (p.SyncMovies !== false && p.MovieFolderMode === 'Multiple' && !p.MovieFolderMappings) {
+                return label + ' / Movies';
+            }
+            if (p.SyncSeries !== false && p.SeriesFolderMode === 'Multiple' && !p.SeriesFolderMappings) {
+                return label + ' / Series';
+            }
+        }
+        return null;
+    },
+
     // Get all category IDs from folder definitions
     getAllCategoryIdsFromFolders: function (type) {
         var definitions = type === 'vod' ? this.vodFolderDefinitions : this.seriesFolderDefinitions;
@@ -488,6 +533,16 @@ const XtreamLibraryConfig = {
             return;
         }
         var folderItems = container.querySelectorAll('.folder-item');
+
+        // renderFolderList short-circuits to a "Load categories first" placeholder when the
+        // category fetch has not resolved (or failed), so an empty node list here means the folder
+        // UI was never drawn - not that the user removed every folder. Clearing the definitions in
+        // that case silently destroys a saved folder configuration and drops the provider into
+        // "no categories assigned", which is the state that used to sync the whole catalogue into
+        // the library root (GitHub #78).
+        if (folderItems.length === 0 && definitions.length > 0) {
+            return;
+        }
 
         definitions.length = 0; // Clear array
 
@@ -527,6 +582,15 @@ const XtreamLibraryConfig = {
             singleSection.style.display = 'block';
             categoriesModeSection.style.display = 'block';
             multiSection.style.display = 'none';
+
+            // Multiple folder mode never renders this list, so arriving here from it leaves an
+            // empty container. Saving an empty container writes "no categories selected", which
+            // means sync everything - the same failure as GitHub #78, hit while the user is
+            // narrowing their config. Mirror what the Multiple branch above does.
+            this.renderCategoryList(
+                type,
+                type === 'vod' ? this.vodCategories : this.seriesCategories,
+                type === 'vod' ? this.selectedVodCategoryIds : this.selectedSeriesCategoryIds);
         }
     },
 
@@ -728,7 +792,13 @@ const XtreamLibraryConfig = {
                         return r.ok ? r.json() : null;
                     }).then(function (result) {
                         if (result) {
-                            if (result.Success) {
+                            var skipped = self.orphanSkipSummary(result);
+                            if (result.Success && skipped) {
+                                // The one moment the user is definitely looking at the page, so
+                                // a blocked cleanup must not read as an unqualified success.
+                                statusSpan.innerHTML = '<span style="color: #e0c882;">Sync completed, but cleanup of '
+                                    + skipped.total.toLocaleString() + ' orphaned files was skipped - see Last Sync below.</span>';
+                            } else if (result.Success) {
                                 statusSpan.innerHTML = '<span style="color: green;">Sync completed!</span>';
                             } else if (result.Error && result.Error.toLowerCase().includes('cancel')) {
                                 statusSpan.innerHTML = '<span style="color: orange;">Sync was cancelled.</span>';
@@ -897,6 +967,29 @@ const XtreamLibraryConfig = {
         return seconds + 's';
     },
 
+    /**
+     * Describes a run whose orphan cleanup was blocked by the safety threshold, or null when
+     * nothing was blocked. A blocked run still reports Success with 0 deleted and 0 errors, which
+     * is byte-identical to a genuinely clean run, so the counts have to be spelled out (GitHub #77).
+     */
+    orphanSkipSummary: function (result) {
+        if (!result) return null;
+
+        var movies = result.MovieOrphansSkipped || 0;
+        var episodes = result.EpisodeOrphansSkipped || 0;
+        var total = movies + episodes;
+        if (total === 0) return null;
+
+        var examined = (result.MovieOrphansExamined || 0) + (result.EpisodeOrphansExamined || 0);
+        return {
+            total: total,
+            movies: movies,
+            episodes: episodes,
+            ratioPct: examined > 0 ? Math.round((total / examined) * 100) : null,
+            thresholdPct: Math.round((result.OrphanSafetyThresholdApplied || 0) * 100)
+        };
+    },
+
     displaySyncResult: function (result) {
         const infoDiv = document.getElementById('lastSyncInfo');
         if (!result) {
@@ -905,8 +998,17 @@ const XtreamLibraryConfig = {
             return;
         }
 
+        const orphanSkip = this.orphanSkipSummary(result);
         const startTime = new Date(result.StartTime).toLocaleString();
-        const status = result.Success ? '<span style="color: green;">Success</span>' : '<span style="color: red;">Failed</span>';
+        let status;
+        if (!result.Success) {
+            status = '<span style="color: red;">Failed</span>';
+        } else if (orphanSkip) {
+            status = '<span style="color: #e0c882;">Completed with warnings</span>';
+        } else {
+            status = '<span style="color: green;">Success</span>';
+        }
+
         const duration = this.formatDuration(result.StartTime, result.EndTime);
 
         // Sync type badge
@@ -918,7 +1020,25 @@ const XtreamLibraryConfig = {
         }
 
         let html = '<strong>Last Sync:</strong> ' + startTime + ' - ' + status + syncBadge;
-        html += '<br/><span style="color: #aaa;">Duration: ' + duration + '</span><br/><br/>';
+        html += '<br/><span style="color: #aaa;">Duration: ' + duration + '</span>';
+
+        if (orphanSkip) {
+            var parts = [];
+            if (orphanSkip.movies > 0) parts.push(orphanSkip.movies.toLocaleString() + ' movies');
+            if (orphanSkip.episodes > 0) parts.push(orphanSkip.episodes.toLocaleString() + ' episodes');
+            var ratioText = orphanSkip.ratioPct !== null
+                ? orphanSkip.ratioPct + '% of the library, over the ' + orphanSkip.thresholdPct + '% safety limit'
+                : 'over the ' + orphanSkip.thresholdPct + '% safety limit';
+
+            html += '<div class="sync-warning-panel">';
+            html += '<div class="sync-warning-title">Skipped cleanup of ' + orphanSkip.total.toLocaleString() + ' orphaned files (' + ratioText + ')</div>';
+            html += '<div class="sync-warning-detail">' + parts.join(' and ') + ' are still on disk but no longer offered by the provider. ';
+            html += 'They stay until the cause is fixed or Orphan Safety Threshold is raised in the provider settings. ';
+            html += 'A high ratio usually means a provider outage or a changed base URL - check before raising the limit.</div>';
+            html += '</div>';
+        }
+
+        html += '<br/><br/>';
         html += '<strong>Movies</strong><br/>';
         html += '&nbsp;&nbsp;Total: ' + (result.TotalMovies || (result.MoviesCreated + result.MoviesSkipped)) + '<br/>';
         html += '&nbsp;&nbsp;' + result.MoviesCreated + ' added' + ((result.MoviesUpdated || 0) > 0 ? ', ' + result.MoviesUpdated + ' updated' : '') + ', ' + (result.MoviesDeleted || 0) + ' deleted<br/><br/>';
@@ -1880,9 +2000,16 @@ const XtreamLibraryConfig = {
             return;
         }
 
-        var statusBadge = lastSync.Success
-            ? '<span class="status-badge status-badge-success">Success</span>'
-            : '<span class="status-badge status-badge-failed">Failed</span>';
+        var orphanSkip = this.orphanSkipSummary(lastSync);
+
+        var statusBadge;
+        if (!lastSync.Success) {
+            statusBadge = '<span class="status-badge status-badge-failed">Failed</span>';
+        } else if (orphanSkip) {
+            statusBadge = '<span class="status-badge status-badge-warning">Warnings</span>';
+        } else {
+            statusBadge = '<span class="status-badge status-badge-success">Success</span>';
+        }
 
         var typeBadge = lastSync.WasIncrementalSync
             ? '<span class="status-badge status-badge-incremental">Incremental</span>'
@@ -1909,7 +2036,21 @@ const XtreamLibraryConfig = {
             html += '<span class="stat-value" style="color: #e08282;">' + lastSync.Errors + '</span>';
             html += '<span class="stat-label">Errors</span></div>';
         }
+        if (orphanSkip) {
+            html += '<div class="dashboard-stat" style="border: 1px solid rgba(224,200,130,0.35);">';
+            html += '<span class="stat-value" style="color: #e0c882;">' + orphanSkip.total.toLocaleString() + '</span>';
+            html += '<span class="stat-label">Cleanup skipped</span></div>';
+        }
         html += '</div>';
+
+        if (orphanSkip) {
+            html += '<div class="sync-warning-panel">';
+            html += '<div class="sync-warning-title">' + orphanSkip.total.toLocaleString() + ' orphaned files were not deleted</div>';
+            html += '<div class="sync-warning-detail">';
+            html += (orphanSkip.ratioPct !== null ? orphanSkip.ratioPct + '% of the library ' : 'The deletion ratio ');
+            html += 'exceeds the ' + orphanSkip.thresholdPct + '% safety limit, so cleanup was blocked. See Last Sync details below.';
+            html += '</div></div>';
+        }
 
         container.innerHTML = html;
     },
@@ -1991,9 +2132,17 @@ const XtreamLibraryConfig = {
 
         history.forEach(function (entry) {
             var time = new Date(entry.StartTime).toLocaleString();
-            var statusBadge = entry.Success
-                ? '<span class="status-badge status-badge-success">OK</span>'
-                : '<span class="status-badge status-badge-failed">Fail</span>';
+            var entrySkip = self.orphanSkipSummary(entry);
+            var statusBadge;
+            if (!entry.Success) {
+                statusBadge = '<span class="status-badge status-badge-failed">Fail</span>';
+            } else if (entrySkip) {
+                statusBadge = '<span class="status-badge status-badge-warning" title="Skipped cleanup of '
+                    + entrySkip.total.toLocaleString() + ' orphaned files">Warn</span>';
+            } else {
+                statusBadge = '<span class="status-badge status-badge-success">OK</span>';
+            }
+
             var typeBadge = entry.WasIncrementalSync ? 'Incr' : 'Full';
             var duration = self.formatDuration(entry.StartTime, entry.EndTime);
             var errors = entry.Errors || 0;
@@ -2505,9 +2654,19 @@ function initXtreamLibraryConfig() {
     XtreamLibraryConfig.loadConfig();
 }
 
-// Try multiple initialization methods for compatibility
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initXtreamLibraryConfig);
-} else {
-    initXtreamLibraryConfig();
+// Try multiple initialization methods for compatibility.
+// Guarded on `document` so the file can also be required from Node by the tests under tests/js:
+// everything above this point is a plain object literal and a function declaration, so requiring
+// it costs nothing and starts no page lifecycle, no timers and no requests.
+if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initXtreamLibraryConfig);
+    } else {
+        initXtreamLibraryConfig();
+    }
+}
+
+// Not present in the browser, where this loads as a plain script and `module` is undefined.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = XtreamLibraryConfig;
 }
