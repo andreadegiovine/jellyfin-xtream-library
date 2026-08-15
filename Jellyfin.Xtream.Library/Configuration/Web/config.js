@@ -566,8 +566,11 @@ const XtreamLibraryConfig = {
         });
     },
 
-    // Update visibility based on folder mode
-    updateFolderModeVisibility: function (type) {
+    // Update visibility based on folder mode.
+    //
+    // fromModeSwitch marks the two folder-mode dropdowns as the caller. Only then may the flat
+    // category list be seeded from the folder assignments - see the Single branch below.
+    updateFolderModeVisibility: function (type, fromModeSwitch) {
         var modeSelect = document.getElementById(type === 'vod' ? 'selMovieFolderMode' : 'selSeriesFolderMode');
         var categoriesModeSection = document.getElementById(type === 'vod' ? 'movieCategoriesModeContainer' : 'seriesCategoriesModeContainer');
         var singleSection = document.getElementById(type === 'vod' ? 'vodSingleFolderSection' : 'seriesSingleFolderSection');
@@ -589,10 +592,38 @@ const XtreamLibraryConfig = {
             // empty container. Saving an empty container writes "no categories selected", which
             // means sync everything - the same failure as GitHub #78, hit while the user is
             // narrowing their config. Mirror what the Multiple branch above does.
+            var selected = type === 'vod' ? this.selectedVodCategoryIds : this.selectedSeriesCategoryIds;
+
+            // In Multiple folder mode the user's category choices live in the folder assignments,
+            // not in this flat list, and any config last saved before the #78 fix carries an empty
+            // SelectedVodCategoryIds. Seeding the repaint from that field alone paints every box
+            // unticked over a real selection, and the save that follows means "sync everything"
+            // (GitHub #81).
+            //
+            // Gated on an actual mode switch: loadProviderIntoUI also calls this, before the folder
+            // UI has been drawn and with the render discarded a few lines later, so seeding there
+            // would only mutate state nobody asked to change.
+            //
+            // Not an emby-checkbox problem, whatever the issue says. Measured against the real
+            // component on 10.11, the checked attribute and property both survive insertion on
+            // every path, including from inside a change dispatch.
+            if (fromModeSwitch && (!selected || selected.length === 0)) {
+                this.updateFolderDefinitionsFromUI(type);
+                var fromFolders = this.getAllCategoryIdsFromFolders(type);
+                if (fromFolders.length > 0) {
+                    selected = fromFolders;
+                    if (type === 'vod') {
+                        this.selectedVodCategoryIds = fromFolders;
+                    } else {
+                        this.selectedSeriesCategoryIds = fromFolders;
+                    }
+                }
+            }
+
             this.renderCategoryList(
                 type,
                 type === 'vod' ? this.vodCategories : this.seriesCategories,
-                type === 'vod' ? this.selectedVodCategoryIds : this.selectedSeriesCategoryIds);
+                selected);
         }
     },
 
@@ -2625,14 +2656,14 @@ function initXtreamLibraryConfig() {
     var selMovieFolderMode = document.getElementById('selMovieFolderMode');
     if (selMovieFolderMode) {
         selMovieFolderMode.addEventListener('change', function () {
-            XtreamLibraryConfig.updateFolderModeVisibility('vod');
+            XtreamLibraryConfig.updateFolderModeVisibility('vod', true);
         });
     }
 
     var selSeriesFolderMode = document.getElementById('selSeriesFolderMode');
     if (selSeriesFolderMode) {
         selSeriesFolderMode.addEventListener('change', function () {
-            XtreamLibraryConfig.updateFolderModeVisibility('series');
+            XtreamLibraryConfig.updateFolderModeVisibility('series', true);
         });
     }
 
