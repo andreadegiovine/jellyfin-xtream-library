@@ -52,6 +52,7 @@ public class SyncController : ControllerBase
     private readonly IDispatcharrClient _dispatcharrClient;
     private readonly IMetadataLookupService _metadataLookup;
     private readonly SnapshotService _snapshotService;
+    private readonly LibraryDatabaseService _libraryDatabase;
     private readonly IServerApplicationPaths _appPaths;
     private readonly ILogger<SyncController> _logger;
 
@@ -63,6 +64,7 @@ public class SyncController : ControllerBase
     /// <param name="dispatcharrClient">The Dispatcharr REST API client.</param>
     /// <param name="metadataLookup">The metadata lookup service.</param>
     /// <param name="snapshotService">The snapshot service.</param>
+    /// <param name="libraryDatabase">The library database service.</param>
     /// <param name="appPaths">The server application paths.</param>
     /// <param name="logger">The logger instance.</param>
     public SyncController(
@@ -71,6 +73,7 @@ public class SyncController : ControllerBase
         IDispatcharrClient dispatcharrClient,
         IMetadataLookupService metadataLookup,
         SnapshotService snapshotService,
+        LibraryDatabaseService libraryDatabase,
         IServerApplicationPaths appPaths,
         ILogger<SyncController> logger)
     {
@@ -79,6 +82,7 @@ public class SyncController : ControllerBase
         _dispatcharrClient = dispatcharrClient;
         _metadataLookup = metadataLookup;
         _snapshotService = snapshotService;
+        _libraryDatabase = libraryDatabase;
         _appPaths = appPaths;
         _logger = logger;
     }
@@ -561,7 +565,7 @@ public class SyncController : ControllerBase
     /// <returns>Dashboard data.</returns>
     [HttpGet("Dashboard")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public ActionResult GetDashboard()
+    public async Task<ActionResult> GetDashboard()
     {
         var config = TryGetConfig();
         var lastSync = _syncService.LastSyncResult;
@@ -607,15 +611,23 @@ public class SyncController : ControllerBase
             }
         }
 
-        // Calculate library stats across all configured providers
-        var perProviderStats = config?.Providers
-            .Select((p, i) => new
+        // Calculate library stats across all configured providers. Written as a loop rather than
+        // a projection because reading the database is asynchronous.
+        List<ProviderStatsDto>? perProviderStats = null;
+        if (config?.Providers != null)
+        {
+            perProviderStats = new List<ProviderStatsDto>(config.Providers.Count);
+            for (int i = 0; i < config.Providers.Count; i++)
             {
-                ProviderIndex = i,
-                ProviderName = p.Name,
-                Stats = GetLibraryStats(p.LibraryPath),
-            })
-            .ToList();
+                var providerConfig = config.Providers[i];
+                perProviderStats.Add(new ProviderStatsDto
+                {
+                    ProviderIndex = i,
+                    ProviderName = providerConfig.Name,
+                    Stats = await GetLibraryStatsAsync(providerConfig).ConfigureAwait(false),
+                });
+            }
+        }
 
         var aggregateStats = new LibraryStatsDto();
         if (perProviderStats != null)
@@ -837,6 +849,16 @@ public class SyncController : ControllerBase
                 _logger.LogInformation("Deleted {Count} items from {Path}", deleted, folderPath);
             }
 
+            // Drop this provider's rows under the folder that was emptied. Leaving them would
+            // keep every name reserved for a file that no longer exists, and the resync would be
+            // handed a numbered variant of each one: a wipe followed by a sync would rebuild the
+            // library as "Title #2" throughout.
+            // Rows of other providers sharing this path are left alone even though their files
+            // were deleted too. A row without its file is the case the sync already handles by
+            // rewriting the file under the recorded name, which is the outcome those providers
+            // want; removing their rows would renumber them instead.
+            await ClearLibraryRowsAsync(provider, folderName).ConfigureAwait(false);
+
             // Clear snapshots for this provider so next sync starts fresh
             if (!string.IsNullOrEmpty(provider.BaseUrl))
             {
@@ -868,28 +890,136 @@ public class SyncController : ControllerBase
 #pragma warning restore CA5351
 
     /// <summary>
-    /// Computes library statistics by counting matched and unmatched content folders
-    /// within the Movies and Series library directories.
+    /// Removes a provider's database rows for one top-level library folder.
     /// </summary>
-    private static LibraryStatsDto GetLibraryStats(string? libraryPath)
+    /// <param name="provider">The provider whose rows are cleared.</param>
+    /// <param name="folderName">The folder that was emptied, "Movies" or "Series".</param>
+    /// <returns>A task that completes when the database has been written.</returns>
+    private async Task ClearLibraryRowsAsync(ProviderConfig provider, string folderName)
+    {
+        if (string.IsNullOrEmpty(provider.LibraryPath))
+        {
+            return;
+        }
+
+        try
+        {
+            LibraryDatabaseState state = await _libraryDatabase
+                .GetOrLoadAsync(provider.LibraryPath, CancellationToken.None)
+                .ConfigureAwait(false);
+
+            string providerId = ProviderIdentity.Compute(provider.BaseUrl);
+            string prefix = folderName + "/";
+
+            bool InFolder(string directory) =>
+                string.Equals(directory, folderName, StringComparison.OrdinalIgnoreCase)
+                || directory.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+
+            int removed = string.Equals(folderName, "Movies", StringComparison.Ordinal)
+                ? state.RemoveMovies(e =>
+                    string.Equals(e.ProviderId, providerId, StringComparison.Ordinal)
+                    && InFolder(e.DirectoryName))
+                : state.RemoveSeries(e =>
+                    string.Equals(e.ProviderId, providerId, StringComparison.Ordinal)
+                    && InFolder(e.DirectoryName));
+
+            await _libraryDatabase.SaveAsync(state, CancellationToken.None).ConfigureAwait(false);
+            _logger.LogInformation("Removed {Count} database rows for the cleaned {Folder} library", removed, folderName);
+        }
+        catch (Exception ex)
+        {
+            // The files are already gone; a stale database is recoverable and a failed request is
+            // not worth returning for it.
+            _logger.LogWarning(ex, "Failed to clear database rows for the cleaned {Folder} library", folderName);
+        }
+    }
+
+    /// <summary>
+    /// Computes library statistics for one provider from its database rows, falling back to a
+    /// directory scan when the database has nothing to say yet.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A folder counts as matched when its name carries a metadata tag, not when the row has a
+    /// TMDB identifier. The two are different: the column holds only identifiers the provider
+    /// supplied, while the tag in the name may also have come from a lookup by title. Counting the
+    /// column would make every lookup-matched folder disappear from the matched total.
+    /// </para>
+    /// <para>
+    /// Reading the rows also scopes the numbers to one provider, which a directory scan cannot do:
+    /// two providers sharing a library path each reported the other's folders as their own.
+    /// </para>
+    /// </remarks>
+    private async Task<LibraryStatsDto> GetLibraryStatsAsync(ProviderConfig provider)
     {
         var stats = new LibraryStatsDto();
-        if (string.IsNullOrEmpty(libraryPath))
+        if (string.IsNullOrEmpty(provider.LibraryPath))
         {
             return stats;
         }
 
-        CountFolders(Path.Combine(libraryPath, "Movies"), out int movieTotal, out int movieMatched);
+        LibraryDatabaseState? state = null;
+        try
+        {
+            state = await _libraryDatabase
+                .GetOrLoadAsync(provider.LibraryPath, HttpContext?.RequestAborted ?? default)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not read the library database for statistics, falling back to a scan");
+        }
+
+        string providerId = ProviderIdentity.Compute(provider.BaseUrl);
+        if (state != null)
+        {
+            var movieDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in state.GetMovieEntries(providerId))
+            {
+                movieDirectories.Add(entry.DirectoryName);
+            }
+
+            var seriesDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in state.GetSeriesEntries(providerId))
+            {
+                // Rows record the season directory; the folder a user counts is the series above it.
+                int slash = entry.DirectoryName.LastIndexOf('/');
+                seriesDirectories.Add(slash > 0 ? entry.DirectoryName[..slash] : entry.DirectoryName);
+            }
+
+            if (movieDirectories.Count > 0 || seriesDirectories.Count > 0)
+            {
+                stats.TotalMovieFolders = movieDirectories.Count;
+                stats.MatchedMovies = movieDirectories.Count(HasMetadataTag);
+                stats.UnmatchedMovies = stats.TotalMovieFolders - stats.MatchedMovies;
+
+                stats.TotalSeriesFolders = seriesDirectories.Count;
+                stats.MatchedSeries = seriesDirectories.Count(HasMetadataTag);
+                stats.UnmatchedSeries = stats.TotalSeriesFolders - stats.MatchedSeries;
+
+                return stats;
+            }
+        }
+
+        // Nothing recorded yet: an install that has not synced since the database was introduced
+        // still has a library on disk, and reporting zero for it would look like data loss.
+        CountFolders(Path.Combine(provider.LibraryPath, "Movies"), out int movieTotal, out int movieMatched);
         stats.TotalMovieFolders = movieTotal;
         stats.MatchedMovies = movieMatched;
         stats.UnmatchedMovies = movieTotal - movieMatched;
 
-        CountFolders(Path.Combine(libraryPath, "Series"), out int seriesTotal, out int seriesMatched);
+        CountFolders(Path.Combine(provider.LibraryPath, "Series"), out int seriesTotal, out int seriesMatched);
         stats.TotalSeriesFolders = seriesTotal;
         stats.MatchedSeries = seriesMatched;
         stats.UnmatchedSeries = seriesTotal - seriesMatched;
 
         return stats;
+    }
+
+    private static bool HasMetadataTag(string directory)
+    {
+        return directory.Contains("[tmdbid-", StringComparison.OrdinalIgnoreCase)
+            || directory.Contains("[tvdbid-", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void CountFolders(string path, out int total, out int matched)
@@ -1091,7 +1221,28 @@ public class SeriesItemDto
 }
 
 /// <summary>
-/// Library statistics showing matched vs unmatched content.
+/// Library statistics for one configured provider.
+/// </summary>
+public class ProviderStatsDto
+{
+    /// <summary>
+    /// Gets or sets the zero-based index of the provider in the configuration.
+    /// </summary>
+    public int ProviderIndex { get; set; }
+
+    /// <summary>
+    /// Gets or sets the display name of the provider.
+    /// </summary>
+    public string? ProviderName { get; set; }
+
+    /// <summary>
+    /// Gets or sets the statistics of the provider's library.
+    /// </summary>
+    public LibraryStatsDto Stats { get; set; } = new LibraryStatsDto();
+}
+
+/// <summary>
+/// Counts of matched and unmatched content folders in a library.
 /// </summary>
 public class LibraryStatsDto
 {

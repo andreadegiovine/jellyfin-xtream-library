@@ -77,6 +77,7 @@ public class SyncControllerTests
             mockDispatcharrClient.Object,
             _mockMetadataLookup.Object,
             snapshotService,
+            new LibraryDatabaseService(NullLogger<LibraryDatabaseService>.Instance),
             appPathsMock.Object,
             _mockControllerLogger.Object);
     }
@@ -214,9 +215,9 @@ public class SyncControllerTests
     #region Dashboard Tests
 
     [Fact]
-    public void GetDashboard_ReturnsOk_WithExpectedShape()
+    public async Task GetDashboard_ReturnsOk_WithExpectedShape()
     {
-        var result = _controller.GetDashboard();
+        var result = await _controller.GetDashboard().ConfigureAwait(true);
 
         var okResult = result.Should().BeOfType<OkObjectResult>().Subject;
         okResult.Value.Should().NotBeNull();
@@ -280,6 +281,7 @@ public class SyncControllerTests
                 mockDispatcharrClient.Object,
                 _mockMetadataLookup.Object,
                 snapshotService,
+                new LibraryDatabaseService(NullLogger<LibraryDatabaseService>.Instance),
                 appPathsMock.Object,
                 _mockControllerLogger.Object);
 
