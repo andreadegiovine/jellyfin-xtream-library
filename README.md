@@ -61,8 +61,11 @@ A Jellyfin plugin that syncs Xtream VOD, Series, and Live TV content to native J
 - **NFO Sidecar Files**: Writes Kodi-compatible NFO files with streamdetails for instant media info display
 
 ### Library Management
+- **Library Index**: `movies.json` and `series.json` in the library root record where every STRM file was written, so names stay stable across syncs
+- **Duplicate Handling**: Two items that resolve to the same name are numbered apart instead of one overwriting the other
 - **Orphan Cleanup**: Removes STRM files for content no longer on the provider
 - **Safety Protection**: Skips cleanup if >20% would be deleted (provider glitch protection)
+- **Folder Mode Changes**: Switching away from Multiple Folders removes the copies the old layout left behind
 - **Separate Clean Buttons**: Delete Movies or Series library content independently
 - **Sync History**: View last 10 sync runs with timestamps and stats
 - **Library Scan Trigger**: Automatically triggers Jellyfin scan after sync
@@ -144,6 +147,11 @@ To organize content into subfolders:
 4. Repeat for additional folders
 5. Categories not assigned to any folder sync to the root
 
+Switching back to **Single Folder**, or removing a folder from the mappings, moves the affected
+content to where the new configuration puts it and deletes the copies left in the old folders. The
+files are rewritten rather than moved on disk, so Jellyfin sees them as new items and their watched
+status does not follow. Empty folders are removed afterwards.
+
 ### Metadata Matching (Optional)
 
 For automatic TMDb/TVDb ID lookup:
@@ -186,6 +194,8 @@ Once enabled, go to **Dashboard → Live TV** in Jellyfin — the Xtream Library
 
 ```
 /config/xtream-library/
+├── movies.json                            # Library index (see below)
+├── series.json
 ├── Movies/
 │   ├── The Matrix (1999) [tmdbid-603]/
 │   │   ├── The Matrix (1999) [tmdbid-603].strm
@@ -204,6 +214,32 @@ Once enabled, go to **Dashboard → Live TV** in Jellyfin — the Xtream Library
     │       └── ...
     └── ...
 ```
+
+### The library index
+
+`movies.json` and `series.json` sit in the library root and hold one entry per STRM file the
+plugin has written: which provider it came from, which stream or episode it is, and the exact
+folder and file name it was given.
+
+They exist because the folder name alone cannot identify content. Two different films are often
+sold under the same title, providers change or omit their TMDB ids between calls, and the same
+item can be mapped into several folders at once. The index removes the guesswork: the plugin looks
+up what it wrote last time instead of rebuilding a name and hoping it matches.
+
+Three consequences worth knowing about:
+
+- **A name, once assigned, is never revised.** If a provider starts or stops supplying a TMDB id,
+  the index is updated and the folder is left where it is. Renaming would make Jellyfin treat the
+  item as new and drop its watched status and artwork.
+- **Renaming a folder by hand is destructive.** The index still points at the old name, so the next
+  sync recreates the file there and you end up with two copies. Rename in Jellyfin, or delete the
+  folder and let the sync rebuild it.
+- **Both files are rewritten on every sync.** On a large library they are big, and incremental
+  backup tools will see them change every time.
+
+If you delete them, the next sync rebuilds them by reading every STRM file in the library. That is
+safe but slow on network storage, and until it finishes without losing a file, orphan cleanup is
+held back — a partial index cannot tell a file it failed to read from a file that does not belong.
 
 ## API Endpoints
 
@@ -273,6 +309,18 @@ Trigger manually from **Dashboard → Scheduled Tasks**.
 2. Verify the category is selected in plugin settings
 3. Run a manual sync and check for errors
 4. Look for the content in failed items list
+
+### Content appears twice in Jellyfin
+
+The library index records where each file was written, and the plugin never renames what it has
+already placed. Two copies of the same item usually mean the folder was renamed or moved outside
+the plugin, so the sync recreated the file under the name it had on record.
+
+Delete the copy you do not want and let the next sync settle it. If a whole folder layout is
+duplicated, check the plugin log for a warning about rows recorded by a provider identifier that is
+not in the configuration: the identifier is derived from the provider's base URL, so editing the
+URL detaches the library from its index and the next sync rebuilds it under numbered names.
+Restoring the previous URL is the cheapest fix.
 
 ### Sync is slow
 

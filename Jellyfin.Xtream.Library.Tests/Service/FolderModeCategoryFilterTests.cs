@@ -359,7 +359,8 @@ public class FolderModeCategoryFilterTests : IDisposable
         }).ConfigureAwait(true);
 
         Directory.Exists(mappedFolder).Should().BeFalse("the emptied mapping folder is pruned too");
-        result.MoviesDeleted.Should().Be(1, "only the copy left behind by the old mode is removed");
+        result.MoviesRelocated.Should().Be(1, "the movie was moved, not lost, so it is not counted as a deletion");
+        result.MoviesDeleted.Should().Be(0);
 
         var written = WrittenMovieStrms();
         written.Should().HaveCount(2, "both movies end up at the root, and neither is duplicated");

@@ -1083,6 +1083,22 @@ const XtreamLibraryConfig = {
         html += '&nbsp;&nbsp;Episodes: ' + (result.TotalEpisodes || (result.EpisodesCreated + result.EpisodesSkipped)) + ' total';
         html += ', ' + result.EpisodesCreated + ' added' + ((result.EpisodesUpdated || 0) > 0 ? ', ' + result.EpisodesUpdated + ' updated' : '') + ', ' + (result.EpisodesDeleted || 0) + ' deleted';
 
+        // Library maintenance. Shown only when something happened, because on a normal run every
+        // one of these is zero and a row of zeroes invites the question of what went wrong.
+        var relocated = (result.MoviesRelocated || 0) + (result.EpisodesRelocated || 0);
+        var pruned = (result.MovieRowsPruned || 0) + (result.EpisodeRowsPruned || 0);
+        if (relocated > 0 || pruned > 0) {
+            html += '<br/><br/><strong>Library maintenance</strong><br/>';
+            if (relocated > 0) {
+                html += '&nbsp;&nbsp;' + relocated.toLocaleString() + ' files moved out of folders the current configuration no longer uses';
+                html += ' (' + (result.MoviesRelocated || 0).toLocaleString() + ' movies, ' + (result.EpisodesRelocated || 0).toLocaleString() + ' episodes)<br/>';
+            }
+            if (pruned > 0) {
+                html += '&nbsp;&nbsp;' + pruned.toLocaleString() + ' stale index entries removed for files that were already gone';
+                html += ' (' + (result.MovieRowsPruned || 0).toLocaleString() + ' movies, ' + (result.EpisodeRowsPruned || 0).toLocaleString() + ' episodes)<br/>';
+            }
+        }
+
         // Live TV channel counts (shown when Live TV is enabled and any field is populated).
         var hasLiveTv = (result.TotalChannels || 0) > 0
             || (result.ChannelsCreated || 0) > 0

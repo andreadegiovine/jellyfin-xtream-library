@@ -1489,7 +1489,8 @@ public partial class StrmSyncService
             libraryDatabase,
             moviesPath,
             seriesPath,
-            isIncrementalSync);
+            isIncrementalSync,
+            result);
 
         // Save snapshot for next incremental sync
         if (provider.EnableIncrementalSync && !cancellationToken.IsCancellationRequested)
@@ -1561,6 +1562,10 @@ public partial class StrmSyncService
         globalResult.EpisodesDeleted += providerResult.EpisodesDeleted;
         globalResult.EpisodeNameCollisions += providerResult.EpisodeNameCollisions;
         globalResult.FilesDeleted += providerResult.FilesDeleted;
+        globalResult.MoviesRelocated += providerResult.MoviesRelocated;
+        globalResult.EpisodesRelocated += providerResult.EpisodesRelocated;
+        globalResult.MovieRowsPruned += providerResult.MovieRowsPruned;
+        globalResult.EpisodeRowsPruned += providerResult.EpisodeRowsPruned;
         globalResult.MovieOrphansSkipped += providerResult.MovieOrphansSkipped;
         globalResult.MovieOrphansExamined += providerResult.MovieOrphansExamined;
         globalResult.EpisodeOrphansSkipped += providerResult.EpisodeOrphansSkipped;
@@ -4376,7 +4381,7 @@ public partial class StrmSyncService
                     string path = StrmPathOf(provider.LibraryPath, entry.DirectoryName, entry.FileName);
                     if (DeleteRelocatedFile(path, removedDirectories))
                     {
-                        result.MoviesDeleted++;
+                        result.MoviesRelocated++;
                         result.FilesDeleted++;
                     }
 
@@ -4430,7 +4435,7 @@ public partial class StrmSyncService
                     string path = StrmPathOf(provider.LibraryPath, entry.DirectoryName, entry.FileName);
                     if (DeleteRelocatedFile(path, removedDirectories))
                     {
-                        result.EpisodesDeleted++;
+                        result.EpisodesRelocated++;
                         result.FilesDeleted++;
                     }
 
@@ -4474,6 +4479,7 @@ public partial class StrmSyncService
     /// <param name="moviesPath">The absolute movie root.</param>
     /// <param name="seriesPath">The absolute series root.</param>
     /// <param name="isIncrementalSync">Whether this run only looked at what the delta reported.</param>
+    /// <param name="result">The result to count the removals into.</param>
     /// <remarks>
     /// <para>
     /// A row describes a file. When the file is gone and a full sync has just declined to recreate
@@ -4497,7 +4503,8 @@ public partial class StrmSyncService
         LibraryDatabaseState libraryDatabase,
         string moviesPath,
         string seriesPath,
-        bool isIncrementalSync)
+        bool isIncrementalSync,
+        SyncResult result)
     {
         if (isIncrementalSync)
         {
@@ -4525,6 +4532,7 @@ public partial class StrmSyncService
                     string.Equals(e.ProviderId, providerId, StringComparison.Ordinal)
                     && paths.Contains(StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName)));
 
+                result.MovieRowsPruned += removed;
                 _logger.LogInformation("Removed {Count} movie rows whose file no longer exists", removed);
             }
         }
@@ -4550,6 +4558,7 @@ public partial class StrmSyncService
                     string.Equals(e.ProviderId, providerId, StringComparison.Ordinal)
                     && paths.Contains(StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName)));
 
+                result.EpisodeRowsPruned += removed;
                 _logger.LogInformation("Removed {Count} episode rows whose file no longer exists", removed);
             }
         }
@@ -5356,6 +5365,39 @@ public class SyncResult
     /// duplicate streams the plugin cannot tell apart by name.
     /// </summary>
     public int MovieNameCollisions { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of movie files removed from a folder the current configuration no
+    /// longer produces, which is what a switch away from Multiple folder mode leaves behind.
+    /// </summary>
+    /// <remarks>
+    /// Counted apart from <see cref="MoviesDeleted"/> because nothing was lost: the movie is still
+    /// in the library, in the folder the configuration now asks for. Reporting it as a deletion
+    /// would make a routine reorganisation look like the provider had dropped content.
+    /// </remarks>
+    public int MoviesRelocated { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of episode files removed from a folder the current configuration no
+    /// longer produces.
+    /// </summary>
+    public int EpisodesRelocated { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of movie database rows dropped because their file was gone and a
+    /// full sync did not recreate it.
+    /// </summary>
+    /// <remarks>
+    /// No file is deleted for these: the file had already gone. The row is what is removed, which
+    /// releases the name it was holding for content the provider no longer offers.
+    /// </remarks>
+    public int MovieRowsPruned { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of episode database rows dropped because their file was gone and a
+    /// full sync did not recreate it.
+    /// </summary>
+    public int EpisodeRowsPruned { get; set; }
 
     /// <summary>
     /// Gets the total number of movies (created + skipped + updated).
