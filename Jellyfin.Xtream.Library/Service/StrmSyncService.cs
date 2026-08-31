@@ -80,6 +80,8 @@ public partial class StrmSyncService
     /// <param name="libraryManager">The Jellyfin library manager.</param>
     /// <param name="metadataLookup">The metadata lookup service.</param>
     /// <param name="snapshotService">The snapshot persistence service.</param>
+    /// <param name="libraryDatabase">The library database that indexes every STRM file.</param>
+    /// <param name="libraryBackfill">The service that rebuilds the library database from disk.</param>
     /// <param name="deltaCalculator">The delta calculator for incremental sync.</param>
     /// <param name="liveTvService">The Live TV service (used to refresh channels at the end of sync).</param>
     /// <param name="appPaths">The application paths service.</param>
@@ -2143,8 +2145,13 @@ public partial class StrmSyncService
                         if (File.Exists(strmPath))
                         {
                             AddMovieRowIfMissing(
-                                libraryDatabase, providerId, stream.StreamId, providerTmdbId,
-                                infoError, relativeDirectory, resolvedFileName);
+                                libraryDatabase,
+                                providerId,
+                                stream.StreamId,
+                                providerTmdbId,
+                                infoError,
+                                relativeDirectory,
+                                resolvedFileName);
 
                             if (StrmContentMatches(strmPath, streamUrl))
                             {
@@ -2169,8 +2176,13 @@ public partial class StrmSyncService
                             await File.WriteAllTextAsync(strmPath, streamUrl, ct).ConfigureAwait(false);
                             anyCreated = true;
                             AddMovieRowIfMissing(
-                                libraryDatabase, providerId, stream.StreamId, providerTmdbId,
-                                infoError, relativeDirectory, resolvedFileName);
+                                libraryDatabase,
+                                providerId,
+                                stream.StreamId,
+                                providerTmdbId,
+                                infoError,
+                                relativeDirectory,
+                                resolvedFileName);
                         }
                         catch (IOException) when (File.Exists(strmPath))
                         {
