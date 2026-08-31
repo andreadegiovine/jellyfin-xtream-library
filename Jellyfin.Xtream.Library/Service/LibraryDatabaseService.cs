@@ -319,7 +319,7 @@ public sealed class LibraryDatabaseState
 
         foreach (SeriesDatabaseEntry entry in series.Entries)
         {
-            _seriesDirectories.Add(entry.DirectoryName);
+            _seriesDirectories.Add(SeriesDirectoryOf(entry.DirectoryName));
             _seriesFiles.Add(CombineKey(entry.DirectoryName, entry.FileName));
         }
     }
@@ -568,17 +568,119 @@ public sealed class LibraryDatabaseState
         lock (_lock)
         {
             _series.Entries.Add(entry);
-            _seriesDirectories.Add(entry.DirectoryName);
+            _seriesDirectories.Add(SeriesDirectoryOf(entry.DirectoryName));
             _seriesFiles.Add(CombineKey(entry.DirectoryName, entry.FileName));
             _dirty = true;
         }
     }
 
     /// <summary>
+    /// Attributes the rows of a directory that was written before the database existed to a
+    /// series identifier, matching the directory by name.
+    /// </summary>
+    /// <param name="providerId">The provider identifier.</param>
+    /// <param name="seriesId">The series identifier to write into the rows.</param>
+    /// <param name="targetFolder">The normalised target folder the series is mapped into.</param>
+    /// <param name="candidateDirectoryName">The directory name the sync would build for this series.</param>
+    /// <param name="adopted">Set to the number of rows attributed.</param>
+    /// <returns>The directory that was adopted, or null when nothing unambiguous matched.</returns>
+    /// <remarks>
+    /// <para>
+    /// This is the one place a row is matched to a series by name rather than by identifier, and
+    /// it runs once per row: a backfill cannot fill the column itself, because the URL inside an
+    /// episode STRM carries the episode identifier and never the series one. Without it the first
+    /// sync after an upgrade would find no rows for any series, hand every one of them a numbered
+    /// directory and duplicate the entire library.
+    /// </para>
+    /// <para>
+    /// The comparison ignores the metadata tag and the numbering suffix, so a directory that
+    /// already carries <c>[tvdbid-N]</c> from an earlier version is still recognised. When more
+    /// than one unattributed directory reduces to the same name nothing is adopted: picking one
+    /// would attach a series to a directory that may hold a different show, and interleaving two
+    /// shows in shared season folders is the one outcome that cannot be undone. The unadopted
+    /// rows stay in the database, so their files keep their names and are not treated as orphans.
+    /// </para>
+    /// </remarks>
+    public string? AdoptSeriesRowsByName(
+        string providerId,
+        int seriesId,
+        string targetFolder,
+        string candidateDirectoryName,
+        out int adopted)
+    {
+        adopted = 0;
+        string wanted = BaseLeaf(candidateDirectoryName);
+
+        lock (_lock)
+        {
+            var attributed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (SeriesDatabaseEntry entry in _series.Entries)
+            {
+                if (!string.Equals(entry.ProviderId, providerId, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                string directory = SeriesDirectoryOf(entry.DirectoryName);
+                if (entry.SeriesId.HasValue)
+                {
+                    attributed.Add(directory);
+                    continue;
+                }
+
+                int slash = directory.LastIndexOf('/');
+                string parent = slash < 0 ? string.Empty : directory[..slash];
+                string leaf = slash < 0 ? directory : directory[(slash + 1)..];
+
+                if (string.Equals(parent, targetFolder, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(BaseLeaf(leaf), wanted, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidates.Add(directory);
+                }
+            }
+
+            candidates.ExceptWith(attributed);
+            if (candidates.Count != 1)
+            {
+                return null;
+            }
+
+            string resolved = candidates.First();
+            string prefix = resolved + "/";
+
+            foreach (SeriesDatabaseEntry entry in _series.Entries)
+            {
+                if (entry.SeriesId.HasValue
+                    || !string.Equals(entry.ProviderId, providerId, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (string.Equals(entry.DirectoryName, resolved, StringComparison.OrdinalIgnoreCase)
+                    || entry.DirectoryName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    entry.SeriesId = seriesId;
+                    adopted++;
+                }
+            }
+
+            if (adopted > 0)
+            {
+                _dirty = true;
+            }
+
+            _seriesGroups[BuildSeriesGroupKey(providerId, targetFolder, seriesId)] = resolved;
+            _seriesDirectories.Add(resolved);
+            return resolved;
+        }
+    }
+
+    /// <summary>
     /// Removes every movie row matching a predicate.
     /// </summary>
-    /// <param name="predicate">The predicate.</param>
-    /// <returns>The number of rows removed.</returns>
+    /// <param name="predicate">The predicate.</param>    /// <returns>The number of rows removed.</returns>
     public int RemoveMovies(Func<MovieDatabaseEntry, bool> predicate)
     {
         ArgumentNullException.ThrowIfNull(predicate);
@@ -796,6 +898,62 @@ public sealed class LibraryDatabaseState
         return string.Concat(directory, "/", fileName);
     }
 
+    /// <summary>
+    /// Reduces the directory stored in a series row to the directory of the series itself.
+    /// </summary>
+    /// <param name="storedDirectory">The directory stored in the row, normally a season directory.</param>
+    /// <returns>The series directory.</returns>
+    /// <remarks>
+    /// <para>
+    /// The set of taken series directories has to hold series directories, because that is what
+    /// the numbering suffix is applied to. Filling it with the season directories the rows carry
+    /// would leave every series directory looking free: a second series sanitizing to the name of
+    /// a series that exists but was not enumerated in this run — which is the normal case, since
+    /// the snapshot skips unchanged series — would be handed that same directory, and the episodes
+    /// of the two shows would end up interleaved in shared <c>Season N</c> folders.
+    /// </para>
+    /// <para>
+    /// A row whose directory has no parent is left as-is rather than reduced to the library root.
+    /// </para>
+    /// </remarks>
+    private static string SeriesDirectoryOf(string storedDirectory)
+    {
+        int slash = storedDirectory.LastIndexOf('/');
+        return slash > 0 ? storedDirectory[..slash] : storedDirectory;
+    }
+
+    /// <summary>
+    /// Reduces a directory leaf to the part that identifies the title, dropping the metadata tag
+    /// and the numbering suffix.
+    /// </summary>
+    /// <param name="leaf">The directory leaf.</param>
+    /// <returns>The reduced leaf.</returns>
+    private static string BaseLeaf(string leaf)
+    {
+        string head = SplitMetadataTag(leaf).Head;
+
+        int hash = head.LastIndexOf(" #", StringComparison.Ordinal);
+        if (hash > 0 && head.Length > hash + 2)
+        {
+            bool allDigits = true;
+            for (int i = hash + 2; i < head.Length; i++)
+            {
+                if (!char.IsAsciiDigit(head[i]))
+                {
+                    allDigits = false;
+                    break;
+                }
+            }
+
+            if (allDigits)
+            {
+                head = head[..hash];
+            }
+        }
+
+        return head;
+    }
+
     private void RebuildMovieIndexes()
     {
         _movieDirectories.Clear();
@@ -823,7 +981,7 @@ public sealed class LibraryDatabaseState
         _seriesFiles.Clear();
         foreach (SeriesDatabaseEntry entry in _series.Entries)
         {
-            _seriesDirectories.Add(entry.DirectoryName);
+            _seriesDirectories.Add(SeriesDirectoryOf(entry.DirectoryName));
             _seriesFiles.Add(CombineKey(entry.DirectoryName, entry.FileName));
         }
 
