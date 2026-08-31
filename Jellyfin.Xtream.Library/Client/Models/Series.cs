@@ -47,6 +47,13 @@ public class Series
     [JsonProperty("genre")]
     public string Genre { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Gets or sets the raw TMDB identifier as advertised in the series listing. Unvalidated: read
+    /// it through <see cref="Service.TmdbIdParser"/>.
+    /// </summary>
+    [JsonProperty("tmdb")]
+    public string? Tmdb { get; set; }
+
     [JsonConverter(typeof(UnixDateTimeConverter))]
     [JsonProperty("last_modified")]
     public DateTime? LastModified { get; set; }

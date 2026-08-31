@@ -38,6 +38,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<MetadataCache>();
         serviceCollection.AddSingleton<IMetadataLookupService, MetadataLookupService>();
         serviceCollection.AddSingleton<SnapshotService>();
+        serviceCollection.AddSingleton<LibraryDatabaseService>();
+        serviceCollection.AddSingleton<LibraryBackfillService>();
         serviceCollection.AddSingleton<DeltaCalculator>();
         serviceCollection.AddSingleton<StrmSyncService>();
         serviceCollection.AddSingleton<LiveTvService>();

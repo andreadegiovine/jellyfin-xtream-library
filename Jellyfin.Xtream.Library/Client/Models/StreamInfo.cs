@@ -58,4 +58,12 @@ public class StreamInfo
 
     [JsonProperty("tv_archive_duration")]
     public int TvArchiveDuration { get; set; }
+
+    /// <summary>
+    /// Gets or sets the raw TMDB identifier as advertised in the VOD listing. Many panels expose
+    /// it here, which avoids one details request per movie; the value is unvalidated and must be
+    /// read through <see cref="Service.TmdbIdParser"/>.
+    /// </summary>
+    [JsonProperty("tmdb_id")]
+    public string? TmdbId { get; set; }
 }
