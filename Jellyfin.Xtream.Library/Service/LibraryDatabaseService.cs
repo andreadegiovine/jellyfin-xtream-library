@@ -398,6 +398,34 @@ public sealed class LibraryDatabaseState
     }
 
     /// <summary>
+    /// Returns every movie row, whichever provider it belongs to.
+    /// </summary>
+    /// <returns>The rows.</returns>
+    /// <remarks>
+    /// Two providers may share a library root, so a file that one provider does not recognise may
+    /// still be another's. Deciding that requires seeing all the rows, not just one provider's.
+    /// </remarks>
+    public IReadOnlyList<MovieDatabaseEntry> GetAllMovieEntries()
+    {
+        lock (_lock)
+        {
+            return _movies.Entries.ToList();
+        }
+    }
+
+    /// <summary>
+    /// Returns every series row, whichever provider it belongs to.
+    /// </summary>
+    /// <returns>The rows.</returns>
+    public IReadOnlyList<SeriesDatabaseEntry> GetAllSeriesEntries()
+    {
+        lock (_lock)
+        {
+            return _series.Entries.ToList();
+        }
+    }
+
+    /// <summary>
     /// Returns every movie row belonging to a provider.
     /// </summary>
     /// <param name="providerId">The provider identifier.</param>

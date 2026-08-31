@@ -183,6 +183,26 @@ public class OrphanCleanupSkipTests : IDisposable
         result.OrphanSafetyThresholdApplied.Should().Be(0.0, "0% is a real limit, not an unset value");
     }
 
+    // Two providers are allowed to share a library path, and each one cleans up after itself.
+    // The second provider's file list is gathered after the first has already written, so the
+    // first provider's movie looks like an orphan to it. Only the database can tell the two
+    // apart, and before it existed the second provider deleted the first one's work.
+    [Fact]
+    public async Task AFileWrittenByAnotherProviderSurvivesTheCleanup()
+    {
+        var result = await RunMovieSyncAsync(orphanSafetyThreshold: 0.20, secondProviderThreshold: 0.20)
+            .ConfigureAwait(true);
+
+        Directory.GetFiles(Path.Combine(_libraryPath, "Movies"), "*.strm", SearchOption.AllDirectories)
+            .Should().HaveCount(2, "each provider gets its own directory for the same title");
+
+        result.MoviesDeleted.Should().Be(0);
+        result.FilesDeleted.Should().Be(0);
+        _log.Should().Contain(l => l.StartsWith(
+            "[Information] Left 1 STRM files alone during orphan cleanup",
+            StringComparison.Ordinal));
+    }
+
     private List<string> SeedDeadMovies(int count)
     {
         var created = new List<string>();

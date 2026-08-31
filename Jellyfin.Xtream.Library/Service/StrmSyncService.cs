@@ -1323,6 +1323,11 @@ public partial class StrmSyncService
                 result.OrphanCleanupBlockedByEmptySelection = true;
             }
 
+            // Who owns each file on disk. A file another provider recorded is not this
+            // provider's to delete: providers are allowed to share a library root, and before this
+            // each one saw the other's files as orphans and raced to remove them.
+            var ownership = BuildStrmOwnership(libraryDatabase, provider.LibraryPath);
+
             // Filter orphans based on safety checks
             var safeOrphans = orphanedFiles
                 .Where(f =>
@@ -1330,10 +1335,72 @@ public partial class StrmSyncService
                     !(skipEpisodeCleanup && f.StartsWith(seriesPath, StringComparison.OrdinalIgnoreCase)))
                 .ToList();
 
-            CurrentProgress.TotalItems = safeOrphans.Count;
-            CurrentProgress.ItemsProcessed = 0;
+            int foreignOrphans = 0;
+            int unrecordedOrphans = 0;
+            var deletableOrphans = new List<string>(safeOrphans.Count);
 
             foreach (var orphan in safeOrphans)
+            {
+                // An empty owner is a row the backfill created for a file whose URL names no
+                // configured provider — a decommissioned one, or an unreadable file. Nobody will
+                // ever claim it, so it is not somebody else's to protect.
+                if (ownership.TryGetValue(orphan, out string? owner) && owner.Length > 0)
+                {
+                    if (string.Equals(owner, providerId, StringComparison.Ordinal))
+                    {
+                        deletableOrphans.Add(orphan);
+                    }
+                    else
+                    {
+                        foreignOrphans++;
+                    }
+
+                    continue;
+                }
+
+                // Nothing claims this file. It is either something the plugin never wrote, or
+                // something it wrote before the database existed and the backfill failed to
+                // record. Those two are indistinguishable here, so deletion waits until a
+                // backfill has completed without losing a file.
+                bool isMovie = orphan.StartsWith(moviesPath, StringComparison.OrdinalIgnoreCase);
+                bool backfilled = isMovie
+                    ? libraryDatabase.IsMovieBackfillComplete
+                    : libraryDatabase.IsSeriesBackfillComplete;
+
+                if (backfilled)
+                {
+                    deletableOrphans.Add(orphan);
+                }
+                else
+                {
+                    unrecordedOrphans++;
+                }
+            }
+
+            if (foreignOrphans > 0)
+            {
+                _logger.LogInformation(
+                    "Left {Count} STRM files alone during orphan cleanup: they belong to another provider sharing this library path",
+                    foreignOrphans);
+            }
+
+            if (unrecordedOrphans > 0)
+            {
+                _logger.LogWarning(
+                    "Left {Count} STRM files alone during orphan cleanup: they have no database row and the library scan that would record them has not completed. They will be reconsidered once it has.",
+                    unrecordedOrphans);
+            }
+
+            CurrentProgress.TotalItems = deletableOrphans.Count;
+            CurrentProgress.ItemsProcessed = 0;
+
+            // Directories are emptied by the deletions, so they are pruned once at the end. Doing
+            // it inside the loop prunes a season folder before the next orphan in the same folder
+            // is reached, and the counters then describe a tree that no longer exists.
+            var emptiedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var deletedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var orphan in deletableOrphans)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -1342,6 +1409,8 @@ public partial class StrmSyncService
                     CurrentProgress.IncrementItemsProcessed();
                     File.Delete(orphan);
                     result.FilesDeleted++;
+                    deletedPaths.Add(orphan);
+                    emptiedDirectories.Add(Path.GetDirectoryName(orphan)!);
 
                     // Track movie vs episode deletions separately
                     if (orphan.StartsWith(moviesPath, StringComparison.OrdinalIgnoreCase))
@@ -1354,9 +1423,6 @@ public partial class StrmSyncService
                     }
 
                     _logger.LogDebug("Deleted orphaned file: {FilePath}", orphan);
-
-                    // Try to clean up empty parent directories
-                    CleanupEmptyDirectories(Path.GetDirectoryName(orphan)!, provider.LibraryPath, seriesPath, result);
                 }
                 catch (Exception ex)
                 {
@@ -1364,11 +1430,39 @@ public partial class StrmSyncService
                 }
             }
 
-            if (safeOrphans.Count > 0)
+            // The row describes a file, so it goes when the file goes. Leaving it would keep the
+            // name reserved for a file that no longer exists, and the next sync of the same title
+            // would be handed a numbered variant of a free name.
+            if (deletedPaths.Count > 0)
+            {
+                int removedMovieRows = libraryDatabase.RemoveMovies(e =>
+                    IsOwnedHere(e.ProviderId, providerId)
+                    && deletedPaths.Contains(StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName)));
+
+                int removedSeriesRows = libraryDatabase.RemoveSeries(e =>
+                    IsOwnedHere(e.ProviderId, providerId)
+                    && deletedPaths.Contains(StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName)));
+
+                if (removedMovieRows + removedSeriesRows > 0)
+                {
+                    _logger.LogDebug(
+                        "Removed {Movies} movie and {Series} episode rows for deleted files",
+                        removedMovieRows,
+                        removedSeriesRows);
+                }
+            }
+
+            // Deepest first, so a season folder is considered before the series folder above it.
+            foreach (var directory in emptiedDirectories.OrderByDescending(d => d.Length))
+            {
+                CleanupEmptyDirectories(directory, provider.LibraryPath, seriesPath, result);
+            }
+
+            if (result.FilesDeleted > 0)
             {
                 _logger.LogInformation(
                     "Cleaned up {Count} orphaned STRM files ({Movies} movies, {Episodes} episodes) and {Series} series, {Seasons} seasons",
-                    safeOrphans.Count,
+                    result.FilesDeleted,
                     result.MoviesDeleted,
                     result.EpisodesDeleted,
                     result.SeriesDeleted,
@@ -4182,6 +4276,60 @@ public partial class StrmSyncService
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Decides whether a row is this provider's to remove.
+    /// </summary>
+    /// <param name="rowProviderId">The provider recorded on the row.</param>
+    /// <param name="providerId">The provider doing the cleanup.</param>
+    /// <returns>True for its own rows and for rows no configured provider claims.</returns>
+    private static bool IsOwnedHere(string rowProviderId, string providerId)
+    {
+        return rowProviderId.Length == 0
+            || string.Equals(rowProviderId, providerId, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Builds the absolute path of the STRM file a row describes.
+    /// </summary>
+    /// <param name="libraryPath">The library root.</param>
+    /// <param name="directoryName">The directory of the row, relative to the library root.</param>
+    /// <param name="fileName">The file name of the row, without extension.</param>
+    /// <returns>The absolute path.</returns>
+    private static string StrmPathOf(string libraryPath, string directoryName, string fileName)
+    {
+        return LibraryDatabaseState.ToFullPath(libraryPath, directoryName + "/" + fileName + ".strm");
+    }
+
+    /// <summary>
+    /// Maps every STRM file the database knows about to the provider that recorded it.
+    /// </summary>
+    /// <param name="libraryDatabase">The database state.</param>
+    /// <param name="libraryPath">The library root.</param>
+    /// <returns>Absolute file path to owning provider identifier.</returns>
+    /// <remarks>
+    /// Every provider sharing a library root is included, which is the point: the caller needs to
+    /// tell "nobody wrote this" apart from "somebody else wrote this", and only the second is a
+    /// reason to leave a file alone.
+    /// </remarks>
+    private static Dictionary<string, string> BuildStrmOwnership(
+        LibraryDatabaseState libraryDatabase,
+        string libraryPath)
+    {
+        var ownership = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var entry in libraryDatabase.GetAllMovieEntries())
+        {
+            ownership[StrmPathOf(libraryPath, entry.DirectoryName, entry.FileName)] = entry.ProviderId;
+        }
+
+        foreach (var entry in libraryDatabase.GetAllSeriesEntries())
+        {
+            ownership[StrmPathOf(libraryPath, entry.DirectoryName, entry.FileName)] = entry.ProviderId;
+        }
+
+        return ownership;
     }
 
     private static void CollectExistingStrmFiles(string basePath, HashSet<string> files)
