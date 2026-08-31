@@ -334,6 +334,40 @@ public class FolderModeCategoryFilterTests : IDisposable
         return seeded;
     }
 
+    // Multiple folder mode writes an item into one directory per mapped category. Switching back
+    // to Single rewrites it at the library root, and without this the old copies stayed where they
+    // were and Jellyfin listed the movie twice. Orphan cleanup cannot cover it: it is off here,
+    // and even when on, a mode switch relocates everything at once and trips the safety threshold
+    // that exists to stop a provider glitch from emptying a library.
+    [Fact]
+    public async Task SwitchingFromMultipleBackToSingle_RemovesTheFoldersTheOldModeCreated()
+    {
+        await RunMovieSyncAsync(p =>
+        {
+            p.MovieFolderMode = "Multiple";
+            p.MovieFolderMappings = "Kids=" + KidsCategoryId;
+            p.SelectedVodCategoryIds = [KidsCategoryId];
+        }).ConfigureAwait(true);
+
+        var mappedFolder = Path.Combine(_libraryPath, "Movies", "Kids");
+        Directory.Exists(mappedFolder).Should().BeTrue("the first run is what puts the movie there");
+
+        var result = await RunMovieSyncAsync(p =>
+        {
+            p.MovieFolderMode = "Single";
+            p.SelectedVodCategoryIds = [];
+        }).ConfigureAwait(true);
+
+        Directory.Exists(mappedFolder).Should().BeFalse("the emptied mapping folder is pruned too");
+        result.MoviesDeleted.Should().Be(1, "only the copy left behind by the old mode is removed");
+
+        var written = WrittenMovieStrms();
+        written.Should().HaveCount(2, "both movies end up at the root, and neither is duplicated");
+        written.Should().OnlyContain(
+            f => !f.Contains(Path.Combine("Movies", "Kids"), StringComparison.Ordinal),
+            "nothing is left under the folder the old configuration created");
+    }
+
     private Task<SyncResult> RunMovieSyncAsync(Action<ProviderConfig> configure)
     {
         _client.Setup(c => c.GetVodCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))

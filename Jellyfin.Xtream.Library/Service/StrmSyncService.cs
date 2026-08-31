@@ -1218,6 +1218,17 @@ public partial class StrmSyncService
         CurrentProgress.MoviePhase = string.Empty;
         CurrentProgress.SeriesPhase = string.Empty;
 
+        // Content sitting in a folder the current configuration can no longer produce, which is
+        // what a switch from Multiple back to Single folder mode leaves behind.
+        RemoveContentOutsideConfiguredFolders(
+            provider,
+            providerId,
+            libraryDatabase,
+            moviesPath,
+            seriesPath,
+            existingStrmFiles,
+            result);
+
         // Cleanup orphaned files - works for both full and incremental syncs because
         // incrementally-skipped items have their existing STRM paths added to syncedFiles
         if (provider.CleanupOrphans)
@@ -1471,6 +1482,14 @@ public partial class StrmSyncService
                     result.SeasonsDeleted);
             }
         }
+
+        PruneRowsWithoutFiles(
+            provider,
+            providerId,
+            libraryDatabase,
+            moviesPath,
+            seriesPath,
+            isIncrementalSync);
 
         // Save snapshot for next incremental sync
         if (provider.EnableIncrementalSync && !cancellationToken.IsCancellationRequested)
@@ -4276,6 +4295,368 @@ public partial class StrmSyncService
         }
         catch (IOException)
         {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes content that sits in a folder the current configuration can no longer produce.
+    /// </summary>
+    /// <param name="provider">The provider being synced.</param>
+    /// <param name="providerId">Its database identifier.</param>
+    /// <param name="libraryDatabase">The database state of its library.</param>
+    /// <param name="moviesPath">The absolute movie root.</param>
+    /// <param name="seriesPath">The absolute series root.</param>
+    /// <param name="existingStrmFiles">The files gathered for orphan cleanup, kept in step.</param>
+    /// <param name="result">The result to count the deletions into.</param>
+    /// <remarks>
+    /// <para>
+    /// Multiple folder mode writes an item into one directory per mapped category. Switching back
+    /// to Single, or dropping a folder from the mappings, leaves all of those behind while the
+    /// item is rewritten in the folder the new configuration asks for, and Jellyfin shows the old
+    /// copies alongside the new one.
+    /// </para>
+    /// <para>
+    /// Orphan cleanup cannot be relied on for this. A mode switch relocates the whole library at
+    /// once, so every existing file looks orphaned and the safety threshold — which exists to stop
+    /// a provider glitch from wiping a library — blocks the cleanup outright. This pass is not
+    /// subject to that reasoning because it is not inferring anything from absence: a directory
+    /// whose parent is not a folder this configuration can produce is stale as a matter of fact.
+    /// It still refuses to act on a configuration that resolves to nothing, and acts on an item
+    /// only once that item has a copy where the configuration says it belongs, so a run that
+    /// wrote nothing removes nothing.
+    /// </para>
+    /// </remarks>
+    private void RemoveContentOutsideConfiguredFolders(
+        ProviderConfig provider,
+        string providerId,
+        LibraryDatabaseState libraryDatabase,
+        string moviesPath,
+        string seriesPath,
+        HashSet<string> existingStrmFiles,
+        SyncResult result)
+    {
+        var removedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var removedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (provider.SyncMovies && Directory.Exists(moviesPath))
+        {
+            var selection = ResolveCategorySelection(
+                provider.MovieFolderMode,
+                provider.MovieFolderMappings,
+                provider.SelectedVodCategoryIds,
+                provider.MovieCategoriesMode);
+
+            if (!selection.SyncsNothing)
+            {
+                var valid = BuildConfiguredFolders(
+                    provider.LibraryPath,
+                    moviesPath,
+                    IsMultipleFolderMode(provider.MovieFolderMode) ? provider.MovieFolderMappings : null);
+
+                string root = LibraryDatabaseState.ToRelativePath(provider.LibraryPath, moviesPath);
+                var rows = libraryDatabase.GetMovieEntries(providerId)
+                    .Where(e => IsUnder(e.DirectoryName, root))
+                    .ToList();
+
+                // Only for streams that already have a copy where the configuration wants one.
+                // Without that condition a mapping list that failed to parse, or a run that wrote
+                // nothing, would look exactly like a mode switch and empty the library.
+                var relocated = rows
+                    .Where(e => valid.Contains(ParentOf(e.DirectoryName)))
+                    .Select(e => e.StreamId)
+                    .ToHashSet();
+
+                var stale = rows
+                    .Where(e => relocated.Contains(e.StreamId) && !valid.Contains(ParentOf(e.DirectoryName)))
+                    .ToList();
+
+                foreach (var entry in stale)
+                {
+                    string path = StrmPathOf(provider.LibraryPath, entry.DirectoryName, entry.FileName);
+                    if (DeleteRelocatedFile(path, removedDirectories))
+                    {
+                        result.MoviesDeleted++;
+                        result.FilesDeleted++;
+                    }
+
+                    removedFiles.Add(path);
+                }
+
+                libraryDatabase.RemoveMovies(e =>
+                    string.Equals(e.ProviderId, providerId, StringComparison.Ordinal)
+                    && IsUnder(e.DirectoryName, root)
+                    && relocated.Contains(e.StreamId)
+                    && !valid.Contains(ParentOf(e.DirectoryName)));
+            }
+        }
+
+        if (provider.SyncSeries && Directory.Exists(seriesPath))
+        {
+            var selection = ResolveCategorySelection(
+                provider.SeriesFolderMode,
+                provider.SeriesFolderMappings,
+                provider.SelectedSeriesCategoryIds,
+                provider.SeriesCategoriesMode);
+
+            if (!selection.SyncsNothing)
+            {
+                var valid = BuildConfiguredFolders(
+                    provider.LibraryPath,
+                    seriesPath,
+                    IsMultipleFolderMode(provider.SeriesFolderMode) ? provider.SeriesFolderMappings : null);
+
+                string root = LibraryDatabaseState.ToRelativePath(provider.LibraryPath, seriesPath);
+
+                // A row records the season directory, so the folder to test is two levels up.
+                var rows = libraryDatabase.GetSeriesEntries(providerId)
+                    .Where(e => e.SeriesId.HasValue && IsUnder(e.DirectoryName, root))
+                    .ToList();
+
+                // A row a backfill could not attribute is excluded by the SeriesId test above: it
+                // names no series, so nothing can vouch for it having been rewritten elsewhere.
+                var relocated = rows
+                    .Where(e => valid.Contains(ParentOf(ParentOf(e.DirectoryName))))
+                    .Select(e => e.SeriesId!.Value)
+                    .ToHashSet();
+
+                var stale = rows
+                    .Where(e => relocated.Contains(e.SeriesId!.Value)
+                        && !valid.Contains(ParentOf(ParentOf(e.DirectoryName))))
+                    .ToList();
+
+                foreach (var entry in stale)
+                {
+                    string path = StrmPathOf(provider.LibraryPath, entry.DirectoryName, entry.FileName);
+                    if (DeleteRelocatedFile(path, removedDirectories))
+                    {
+                        result.EpisodesDeleted++;
+                        result.FilesDeleted++;
+                    }
+
+                    removedFiles.Add(path);
+                }
+
+                libraryDatabase.RemoveSeries(e =>
+                    string.Equals(e.ProviderId, providerId, StringComparison.Ordinal)
+                    && e.SeriesId.HasValue
+                    && IsUnder(e.DirectoryName, root)
+                    && relocated.Contains(e.SeriesId.Value)
+                    && !valid.Contains(ParentOf(ParentOf(e.DirectoryName))));
+            }
+        }
+
+        if (removedFiles.Count == 0)
+        {
+            return;
+        }
+
+        // Keep the orphan pass in step: these paths were gathered before the deletions and would
+        // otherwise be counted as orphans and retried, each one failing on a file already gone.
+        existingStrmFiles.ExceptWith(removedFiles);
+
+        foreach (var directory in removedDirectories.OrderByDescending(d => d.Length))
+        {
+            CleanupEmptyDirectories(directory, provider.LibraryPath, seriesPath, result);
+        }
+
+        _logger.LogInformation(
+            "Removed {Count} files left in folders the current configuration no longer produces",
+            removedFiles.Count);
+    }
+
+    /// <summary>
+    /// Removes rows whose file is missing after a full sync has had the chance to rewrite it.
+    /// </summary>
+    /// <param name="provider">The provider being synced.</param>
+    /// <param name="providerId">Its database identifier.</param>
+    /// <param name="libraryDatabase">The database state of its library.</param>
+    /// <param name="moviesPath">The absolute movie root.</param>
+    /// <param name="seriesPath">The absolute series root.</param>
+    /// <param name="isIncrementalSync">Whether this run only looked at what the delta reported.</param>
+    /// <remarks>
+    /// <para>
+    /// A row describes a file. When the file is gone and a full sync has just declined to recreate
+    /// it, the provider no longer offers that item and the row is describing nothing. Left in
+    /// place it keeps the name reserved forever, so a later title that sanitizes the same way is
+    /// handed a numbered variant of a name that is in fact free.
+    /// </para>
+    /// <para>
+    /// The conditions are what keeps this safe. It runs only after a full sync, because an
+    /// incremental one never enumerates unchanged items and their rows are perfectly valid. It
+    /// runs only once the backfill has completed, so a database still being built is not pruned.
+    /// It requires the root directory to exist, and it keeps the same proportional limit as orphan
+    /// cleanup, because the failure that matters here is an unmounted network share making every
+    /// file look missing at once — which would empty the database and have the next sync rebuild
+    /// the entire library under numbered names.
+    /// </para>
+    /// </remarks>
+    private void PruneRowsWithoutFiles(
+        ProviderConfig provider,
+        string providerId,
+        LibraryDatabaseState libraryDatabase,
+        string moviesPath,
+        string seriesPath,
+        bool isIncrementalSync)
+    {
+        if (isIncrementalSync)
+        {
+            return;
+        }
+
+        if (provider.SyncMovies && libraryDatabase.IsMovieBackfillComplete && Directory.Exists(moviesPath))
+        {
+            string root = LibraryDatabaseState.ToRelativePath(provider.LibraryPath, moviesPath);
+            var rows = libraryDatabase.GetMovieEntries(providerId)
+                .Where(e => IsUnder(e.DirectoryName, root))
+                .ToList();
+
+            var missing = rows
+                .Where(e => !File.Exists(StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName)))
+                .ToList();
+
+            if (missing.Count > 0 && IsProportionAcceptable("movie row", rows.Count, missing.Count, provider.OrphanSafetyThreshold))
+            {
+                var paths = missing
+                    .Select(e => StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                int removed = libraryDatabase.RemoveMovies(e =>
+                    string.Equals(e.ProviderId, providerId, StringComparison.Ordinal)
+                    && paths.Contains(StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName)));
+
+                _logger.LogInformation("Removed {Count} movie rows whose file no longer exists", removed);
+            }
+        }
+
+        if (provider.SyncSeries && libraryDatabase.IsSeriesBackfillComplete && Directory.Exists(seriesPath))
+        {
+            string root = LibraryDatabaseState.ToRelativePath(provider.LibraryPath, seriesPath);
+            var rows = libraryDatabase.GetSeriesEntries(providerId)
+                .Where(e => IsUnder(e.DirectoryName, root))
+                .ToList();
+
+            var missing = rows
+                .Where(e => !File.Exists(StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName)))
+                .ToList();
+
+            if (missing.Count > 0 && IsProportionAcceptable("episode row", rows.Count, missing.Count, provider.OrphanSafetyThreshold))
+            {
+                var paths = missing
+                    .Select(e => StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                int removed = libraryDatabase.RemoveSeries(e =>
+                    string.Equals(e.ProviderId, providerId, StringComparison.Ordinal)
+                    && paths.Contains(StrmPathOf(provider.LibraryPath, e.DirectoryName, e.FileName)));
+
+                _logger.LogInformation("Removed {Count} episode rows whose file no longer exists", removed);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds the set of folders, relative to the library root, that a configuration can produce.
+    /// </summary>
+    /// <param name="libraryPath">The library root.</param>
+    /// <param name="contentRoot">The absolute Movies or Series root.</param>
+    /// <param name="folderMappings">The raw mapping configuration, or null in Single folder mode.</param>
+    /// <returns>The folders content may legitimately sit directly inside.</returns>
+    /// <remarks>
+    /// The content root itself is always included: an item whose categories map to nothing is
+    /// written there in both modes.
+    /// </remarks>
+    private static HashSet<string> BuildConfiguredFolders(
+        string libraryPath,
+        string contentRoot,
+        string? folderMappings)
+    {
+        string root = LibraryDatabaseState.ToRelativePath(libraryPath, contentRoot);
+        var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { root };
+
+        if (string.IsNullOrEmpty(folderMappings))
+        {
+            return folders;
+        }
+
+        foreach (var mapped in ParseFolderMappings(folderMappings).Values)
+        {
+            foreach (var folder in mapped)
+            {
+                // Normalised exactly as the write path does, or a mapping written with a trailing
+                // slash would produce a folder that never matches and the library would be
+                // deleted for sitting somewhere the configuration supposedly cannot produce.
+                string normalized = MovieLibraryPathResolver.NormalizeFolder(folder);
+                if (normalized.Length > 0)
+                {
+                    folders.Add(MovieLibraryPathResolver.Join(root, normalized));
+                }
+            }
+        }
+
+        return folders;
+    }
+
+    /// <summary>
+    /// Applies the proportional safety limit shared with orphan cleanup.
+    /// </summary>
+    /// <param name="what">What is being removed, for the log line.</param>
+    /// <param name="total">How many rows were examined.</param>
+    /// <param name="affected">How many of them would be removed.</param>
+    /// <param name="threshold">The provider's safety threshold.</param>
+    /// <returns>True when the removal may proceed.</returns>
+    private bool IsProportionAcceptable(string what, int total, int affected, double threshold)
+    {
+        if (affected == 0 || total <= 10)
+        {
+            return true;
+        }
+
+        double ratio = (double)affected / total;
+        if (ratio <= threshold)
+        {
+            return true;
+        }
+
+        _logger.LogWarning(
+            "Skipping {What} removal: {Affected}/{Total} ({Percent:P0}) exceeds the {Threshold:P0} safety threshold",
+            what,
+            affected,
+            total,
+            ratio,
+            threshold);
+
+        return false;
+    }
+
+    private static bool IsUnder(string directory, string root)
+    {
+        return string.Equals(directory, root, StringComparison.OrdinalIgnoreCase)
+            || directory.StartsWith(root + "/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ParentOf(string directory)
+    {
+        int slash = directory.LastIndexOf('/');
+        return slash > 0 ? directory[..slash] : directory;
+    }
+
+    private bool DeleteRelocatedFile(string path, HashSet<string> emptiedDirectories)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return false;
+            }
+
+            File.Delete(path);
+            emptiedDirectories.Add(Path.GetDirectoryName(path)!);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete relocated file: {FilePath}", path);
             return false;
         }
     }
