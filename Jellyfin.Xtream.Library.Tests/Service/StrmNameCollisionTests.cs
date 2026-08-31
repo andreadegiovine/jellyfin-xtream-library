@@ -203,24 +203,30 @@ public class StrmNameCollisionTests : IDisposable
         (await File.ReadAllTextAsync(strm).ConfigureAwait(true)).Should().EndWith("/100.mkv");
     }
 
-    // Episodes collide on series name plus season and episode number. The wiring is the same two
-    // hops as the movie counter (local -> provider result -> global result), and the movie one was
-    // missing its second hop while the guard itself worked, so this path needs its own run.
+    // Episodes land on one name when they share a series, a season and an episode number, which
+    // providers produce routinely by sending no episode title. Like movies, the second claimant is
+    // numbered rather than refused. The file name keeps the "<series> - S01E01" shape Jellyfin
+    // parses the numbers out of, so the suffix goes on the end and the name does not follow the
+    // directory the way a movie file does.
     [Fact]
-    public async Task TwoEpisodesSharingSeasonAndEpisodeNumber_WriteOneFileAndCountTheCollision()
+    public async Task TwoEpisodesSharingSeasonAndEpisodeNumber_AreNumberedApart()
     {
-        // The episode title is part of the file name, so a collision needs that to match too.
-        // Providers routinely send no title at all, which collapses both to "<series> - S01E01.strm".
         var result = await RunSeriesSyncAsync(
             new Episode { EpisodeId = 11, EpisodeNum = 1, Season = 1, Title = string.Empty, ContainerExtension = "mkv" },
             new Episode { EpisodeId = 22, EpisodeNum = 1, Season = 1, Title = string.Empty, ContainerExtension = "mkv" })
             .ConfigureAwait(true);
 
-        result.EpisodeNameCollisions.Should().Be(1);
+        result.EpisodeNameCollisions.Should().Be(0);
+        result.EpisodesCreated.Should().Be(2);
         result.Errors.Should().Be(0);
-        Directory.GetFiles(Path.Combine(_libraryPath, "Series"), "*.strm", SearchOption.AllDirectories)
-            .Should().HaveCount(1);
-        _log.Should().Contain(l => l.StartsWith("[Warning] STRM name collision for series", StringComparison.Ordinal));
+
+        // The year is stripped from the episode name but kept on the directory, which is why the
+        // two differ here.
+        Directory.GetFiles(Path.Combine(_libraryPath, "Series", "Collide Show (2024)", "Season 1"), "*.strm")
+            .Select(Path.GetFileName)
+            .Should().BeEquivalentTo(["Collide Show - S01E01.strm", "Collide Show - S01E01 - #2.strm"]);
+
+        _log.Should().NotContain(l => l.StartsWith("[Warning] STRM name collision for series", StringComparison.Ordinal));
     }
 
     [Fact]

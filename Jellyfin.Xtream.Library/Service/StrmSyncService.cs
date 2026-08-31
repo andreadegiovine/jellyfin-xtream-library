@@ -1042,6 +1042,8 @@ public partial class StrmSyncService
                         await SyncSeriesAsync(
                             provider,
                             seriesPath,
+                            providerId,
+                            libraryDatabase,
                             claimedStrmPaths,
                             syncedFiles,
                             result,
@@ -1081,6 +1083,8 @@ public partial class StrmSyncService
                 await SyncSeriesAsync(
                     provider,
                     seriesPath,
+                    providerId,
+                    libraryDatabase,
                     claimedStrmPaths,
                     syncedFiles,
                     result,
@@ -1550,6 +1554,56 @@ public partial class StrmSyncService
             TmdbId = tmdbId,
             DirectoryName = directory,
             FileName = fileName,
+            InfoError = infoError
+        });
+    }
+
+    /// <summary>
+    /// Records an episode row, unless the same file is already recorded.
+    /// </summary>
+    /// <remarks>
+    /// The row is written only once the file exists on disk, because a row is a statement about a
+    /// file and not about an intention. The guard makes the call idempotent, which matters because
+    /// a re-sync walks the same episodes again and a second row would make the file look like two.
+    /// </remarks>
+    /// <param name="libraryDatabase">The database state.</param>
+    /// <param name="providerId">The provider identifier.</param>
+    /// <param name="seriesId">The Xtream series identifier.</param>
+    /// <param name="episodeId">The Xtream episode identifier.</param>
+    /// <param name="season">The season number.</param>
+    /// <param name="tmdbId">The TMDB identifier supplied by the provider, or null.</param>
+    /// <param name="infoError">Whether the details request failed.</param>
+    /// <param name="directory">The season directory, relative to the library root.</param>
+    /// <param name="fileName">The file name without extension.</param>
+    private static void AddSeriesRowIfMissing(
+        LibraryDatabaseState libraryDatabase,
+        string providerId,
+        int seriesId,
+        string episodeId,
+        int season,
+        int? tmdbId,
+        bool infoError,
+        string directory,
+        string fileName)
+    {
+        foreach (var existing in libraryDatabase.GetSeriesEntries(providerId, seriesId))
+        {
+            if (string.Equals(existing.DirectoryName, directory, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(existing.FileName, fileName, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+
+        libraryDatabase.AddSeries(new SeriesDatabaseEntry
+        {
+            ProviderId = providerId,
+            SeriesId = seriesId,
+            EpisodeId = episodeId,
+            TmdbId = tmdbId,
+            DirectoryName = directory,
+            FileName = fileName,
+            Season = season,
             InfoError = infoError
         });
     }
@@ -2358,6 +2412,8 @@ public partial class StrmSyncService
     private async Task SyncSeriesAsync(
         ProviderConfig provider,
         string seriesPath,
+        string providerId,
+        LibraryDatabaseState libraryDatabase,
         ConcurrentDictionary<string, byte> claimedStrmPaths,
         ConcurrentDictionary<string, byte> syncedFiles,
         SyncResult result,
@@ -3087,21 +3143,43 @@ public partial class StrmSyncService
                     // Sync to each target folder
                     foreach (var targetFolder in targetFolders)
                     {
-                        string seriesBasePath = string.IsNullOrEmpty(targetFolder)
-                            ? seriesPath
-                            : Path.Combine(seriesPath, targetFolder);
-                        // Resolve actual folder via seriesFolderLookup to handle suffix mismatch
-                        // (e.g. existing folder has [tvdbid-X] but lookup failed this sync)
-                        string seriesFolderPath;
-                        var lookupKey = seriesBasePath + "|" + baseName;
-                        if (seriesFolderLookup.TryGetValue(lookupKey, out var existingMatch))
+                        string relativeTarget = MovieLibraryPathResolver.Join(
+                            LibraryDatabaseState.ToRelativePath(provider.LibraryPath, seriesPath),
+                            MovieLibraryPathResolver.NormalizeFolder(targetFolder));
+
+                        // Rows recovered from disk carry no series id, because the URL inside an
+                        // episode STRM names the episode and never the show. They have to be
+                        // attributed before the directory is resolved: they are invisible to the
+                        // lookup by id but their directory is already taken, so resolving first
+                        // would put this series in a numbered directory next to the one holding
+                        // its own episodes, and the name would then never be revised.
+                        string? adoptedDirectory = SeriesLibraryPathResolver.AdoptBackfilledRows(
+                            libraryDatabase,
+                            providerId,
+                            series.SeriesId,
+                            relativeTarget,
+                            seriesFolderName,
+                            out int adoptedRows);
+
+                        if (adoptedRows > 0)
                         {
-                            seriesFolderPath = existingMatch.Path;
+                            _logger.LogDebug(
+                                "Attributed {Count} recovered rows in {Directory} to series {SeriesId}",
+                                adoptedRows,
+                                adoptedDirectory,
+                                series.SeriesId);
                         }
-                        else
-                        {
-                            seriesFolderPath = Path.Combine(seriesBasePath, seriesFolderName);
-                        }
+
+                        string relativeSeriesDirectory = SeriesLibraryPathResolver.ResolveDirectory(
+                            libraryDatabase,
+                            providerId,
+                            series.SeriesId,
+                            relativeTarget,
+                            seriesFolderName,
+                            out _);
+
+                        string seriesFolderPath =
+                            LibraryDatabaseState.ToFullPath(provider.LibraryPath, relativeSeriesDirectory);
 
                         bool isNewSeries = !Directory.Exists(seriesFolderPath);
 
@@ -3109,14 +3187,34 @@ public partial class StrmSyncService
                         {
                             int seasonNumber = seasonEntry.Key;
                             var episodes = seasonEntry.Value;
-                            string seasonFolder = Path.Combine(seriesFolderPath, $"Season {seasonNumber}");
+                            string relativeSeasonDirectory =
+                                SeriesLibraryPathResolver.SeasonDirectory(relativeSeriesDirectory, seasonNumber);
+                            string seasonFolder =
+                                LibraryDatabaseState.ToFullPath(provider.LibraryPath, relativeSeasonDirectory);
                             bool isNewSeason = !Directory.Exists(seasonFolder);
 
                             bool seasonHasNewEpisodes = false;
 
                             foreach (var episode in episodes)
                             {
-                                string episodeFileName = BuildEpisodeFileName(seriesName, seasonNumber, episode, provider.CustomTitleRemoveTerms, provider.RegexRemovalPatterns);
+                                string episodeId = episode.EpisodeId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+                                // The episode file keeps the "<series> - S01E01" convention rather
+                                // than following the directory name the way a movie file does:
+                                // Jellyfin parses the season and episode numbers out of it, and
+                                // the numbering suffix a directory may carry has no place there.
+                                string candidateEpisodeName = Path.GetFileNameWithoutExtension(
+                                    BuildEpisodeFileName(seriesName, seasonNumber, episode, provider.CustomTitleRemoveTerms, provider.RegexRemovalPatterns));
+
+                                string resolvedEpisodeName = SeriesLibraryPathResolver.ResolveFileName(
+                                    libraryDatabase,
+                                    providerId,
+                                    series.SeriesId,
+                                    episodeId,
+                                    relativeSeasonDirectory,
+                                    candidateEpisodeName);
+
+                                string episodeFileName = resolvedEpisodeName + ".strm";
                                 string strmPath = Path.Combine(seasonFolder, episodeFileName);
 
                                 syncedFiles.TryAdd(strmPath, 0);
@@ -3149,6 +3247,17 @@ public partial class StrmSyncService
 
                                 if (File.Exists(strmPath))
                                 {
+                                    AddSeriesRowIfMissing(
+                                        libraryDatabase,
+                                        providerId,
+                                        series.SeriesId,
+                                        episodeId,
+                                        seasonNumber,
+                                        providerTmdbId,
+                                        false,
+                                        relativeSeasonDirectory,
+                                        resolvedEpisodeName);
+
                                     if (StrmContentMatches(strmPath, streamUrl))
                                     {
                                         Interlocked.Increment(ref episodesSkipped);
@@ -3171,6 +3280,16 @@ public partial class StrmSyncService
                                     Interlocked.Increment(ref episodesCreated);
                                     seasonHasNewEpisodes = true;
                                     seriesHasNewEpisodes = true;
+                                    AddSeriesRowIfMissing(
+                                        libraryDatabase,
+                                        providerId,
+                                        series.SeriesId,
+                                        episodeId,
+                                        seasonNumber,
+                                        providerTmdbId,
+                                        false,
+                                        relativeSeasonDirectory,
+                                        resolvedEpisodeName);
                                 }
                                 catch (IOException) when (File.Exists(strmPath))
                                 {
