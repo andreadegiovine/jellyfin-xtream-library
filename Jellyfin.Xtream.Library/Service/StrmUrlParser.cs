@@ -4,31 +4,6 @@ using System.Globalization;
 namespace Jellyfin.Xtream.Library.Service;
 
 /// <summary>
-/// The kind of item a stream URL points at.
-/// </summary>
-public enum StrmUrlKind
-{
-    /// <summary>
-    /// A movie stream.
-    /// </summary>
-    Movie,
-
-    /// <summary>
-    /// A single series episode.
-    /// </summary>
-    Episode
-}
-
-/// <summary>
-/// The parts of a stream URL that identify what a <c>.strm</c> file points at.
-/// </summary>
-/// <param name="Kind">Whether the URL addresses a movie or an episode.</param>
-/// <param name="BaseUrl">The provider base URL, without a trailing slash.</param>
-/// <param name="ItemId">The identifier as it appears in the URL.</param>
-/// <param name="NumericItemId">The identifier as a number, when it is one.</param>
-public sealed record ParsedStrmUrl(StrmUrlKind Kind, string BaseUrl, string ItemId, int? NumericItemId);
-
-/// <summary>
 /// Recovers the provider and the item identifier from the URL stored inside a <c>.strm</c> file.
 /// </summary>
 /// <remarks>
