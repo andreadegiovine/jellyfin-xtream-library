@@ -297,6 +297,8 @@ public class OrphanCleanupSkipTests : IDisposable
             new Mock<ILibraryManager>().Object,
             new Mock<IMetadataLookupService>().Object,
             new SnapshotService(appPaths.Object, NullLogger<SnapshotService>.Instance),
+            new LibraryDatabaseService(NullLogger<LibraryDatabaseService>.Instance),
+            new LibraryBackfillService(NullLogger<LibraryBackfillService>.Instance),
             new DeltaCalculator(NullLogger<DeltaCalculator>.Instance),
             new LiveTvService(_client.Object, appPaths.Object, MockAppHost(), NullLogger<LiveTvService>.Instance),
             appPaths.Object,
