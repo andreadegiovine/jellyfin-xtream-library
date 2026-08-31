@@ -221,10 +221,15 @@ public class StrmNameCollisionTests : IDisposable
         result.Errors.Should().Be(0);
 
         // The year is stripped from the episode name but kept on the directory, which is why the
-        // two differ here.
+        // two differ here. An absent episode title sanitizes to "Unknown" rather than to an empty
+        // string, so it survives into the name: the guard in BuildEpisodeFileName that drops a
+        // missing title tests the sanitized value, which is never empty. That is pre-existing and
+        // is left alone deliberately — the names are already on disk in every library, and the
+        // database now treats them as immutable.
         Directory.GetFiles(Path.Combine(_libraryPath, "Series", "Collide Show (2024)", "Season 1"), "*.strm")
             .Select(Path.GetFileName)
-            .Should().BeEquivalentTo(["Collide Show - S01E01.strm", "Collide Show - S01E01 - #2.strm"]);
+            .Should().BeEquivalentTo(
+                ["Collide Show - S01E01 - Unknown.strm", "Collide Show - S01E01 - Unknown - #2.strm"]);
 
         _log.Should().NotContain(l => l.StartsWith("[Warning] STRM name collision for series", StringComparison.Ordinal));
     }
