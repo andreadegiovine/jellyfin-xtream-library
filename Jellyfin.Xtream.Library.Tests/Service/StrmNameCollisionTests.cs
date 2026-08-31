@@ -256,9 +256,11 @@ public class StrmNameCollisionTests : IDisposable
     // "Case Movie" and "CASE MOVIE" are two paths on Linux and one on Windows and macOS, so a
     // filesystem-driven decision here produces a library whose shape depends on the host. The
     // grouping key folds case, which takes the filesystem out of it: the two titles are one group
-    // everywhere, share one directory, and the second file is numbered. Asserting a single answer
-    // is the point — if this ever starts differing per platform, the database has stopped being
-    // the authority on names.
+    // everywhere, share one directory, and the second file is numbered. Which of the two spellings
+    // ends up on the directory is not pinned down: the streams of a batch are drained from a
+    // ConcurrentBag, so the one that claims the group first is an ordering detail, not a
+    // guarantee. What has to hold on every platform is that there is exactly one directory and
+    // that the file names follow whichever spelling won.
     [Fact]
     public async Task TitlesDifferingOnlyInCase_ShareOneDirectoryOnEveryPlatform()
     {
@@ -271,13 +273,17 @@ public class StrmNameCollisionTests : IDisposable
         result.MovieNameCollisions.Should().Be(0);
         result.MoviesCreated.Should().Be(2);
 
-        Directory.GetDirectories(Path.Combine(_libraryPath, "Movies"))
-            .Select(Path.GetFileName)
-            .Should().BeEquivalentTo(["Case Movie (2024)"], "the first spelling seen names the directory");
+        var directories = Directory.GetDirectories(Path.Combine(_libraryPath, "Movies"));
+        directories.Should().HaveCount(1, "folding case in the group key makes the two titles one group");
+
+        var leaf = Path.GetFileName(directories[0]);
+        leaf.Should().BeOneOf("Case Movie (2024)", "CASE MOVIE (2024)");
 
         Directory.GetFiles(Path.Combine(_libraryPath, "Movies"), "*.strm", SearchOption.AllDirectories)
             .Select(Path.GetFileName)
-            .Should().BeEquivalentTo(["Case Movie (2024).strm", "Case Movie (2024) - #2.strm"]);
+            .Should().BeEquivalentTo(
+                [leaf + ".strm", leaf + " - #2.strm"],
+                "the file name follows the directory, whichever spelling claimed it");
     }
 
     // Providers are allowed to share a LibraryPath: PluginConfiguration records
