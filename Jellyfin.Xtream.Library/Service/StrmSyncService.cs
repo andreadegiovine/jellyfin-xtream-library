@@ -1104,6 +1104,8 @@ public partial class StrmSyncService
             seriesPath,
             cancellationToken).ConfigureAwait(false);
 
+        ReportUnknownProviderRows(provider, libraryDatabase);
+
         // Collect existing STRM files for orphan cleanup
         if (provider.CleanupOrphans)
         {
@@ -4276,6 +4278,89 @@ public partial class StrmSyncService
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Warns about rows belonging to a provider identifier no longer in the configuration.
+    /// </summary>
+    /// <param name="provider">The provider being synced.</param>
+    /// <param name="libraryDatabase">The database state of its library.</param>
+    /// <remarks>
+    /// <para>
+    /// The identifier is derived from the base URL, so editing a provider's URL — a typo being
+    /// corrected, a move from http to https, a host rename — makes every one of its rows
+    /// unclaimable at once. Nothing is broken by that on its own, but the next sync sees a library
+    /// full of directories it has no rows for, and rebuilds all of it under numbered names.
+    /// </para>
+    /// <para>
+    /// Nothing is deleted or rewritten here. The rows may equally belong to a provider that is
+    /// merely disabled for now, and guessing which of the two it is by deleting is not a guess
+    /// worth making. The warning exists so that the cause is on the record before the duplicates
+    /// appear, rather than being reconstructed afterwards from a library that has doubled.
+    /// </para>
+    /// </remarks>
+    private void ReportUnknownProviderRows(ProviderConfig provider, LibraryDatabaseState libraryDatabase)
+    {
+        // Several providers may share a library root and would each report the same rows, so only
+        // the first one configured against this path speaks for it.
+        foreach (ProviderConfig candidate in Plugin.Instance.Configuration.Providers)
+        {
+            if (string.Equals(candidate.LibraryPath, provider.LibraryPath, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ReferenceEquals(candidate, provider))
+                {
+                    return;
+                }
+
+                break;
+            }
+        }
+
+        var configured = new HashSet<string>(StringComparer.Ordinal);
+        foreach (ProviderConfig candidate in Plugin.Instance.Configuration.Providers)
+        {
+            if (!string.IsNullOrEmpty(candidate.BaseUrl))
+            {
+                configured.Add(ProviderIdentity.Compute(candidate.BaseUrl));
+            }
+        }
+
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        void Tally(string rowProviderId)
+        {
+            // An empty identifier is a file the backfill could not attribute to any configured
+            // provider. That is reported by the backfill itself and is not an unknown provider.
+            if (rowProviderId.Length == 0 || configured.Contains(rowProviderId))
+            {
+                return;
+            }
+
+            counts.TryGetValue(rowProviderId, out int current);
+            counts[rowProviderId] = current + 1;
+        }
+
+        foreach (var entry in libraryDatabase.GetAllMovieEntries())
+        {
+            Tally(entry.ProviderId);
+        }
+
+        foreach (var entry in libraryDatabase.GetAllSeriesEntries())
+        {
+            Tally(entry.ProviderId);
+        }
+
+        if (counts.Count == 0)
+        {
+            return;
+        }
+
+        _logger.LogWarning(
+            "The library at {LibraryPath} holds {RowCount} rows recorded by {ProviderCount} provider identifier(s) that are not in the configuration ({Identifiers}). If a provider's URL was changed, its identifier changed with it and the next sync will rebuild that content under numbered names; restoring the previous URL avoids that. Nothing has been deleted.",
+            provider.LibraryPath,
+            counts.Values.Sum(),
+            counts.Count,
+            string.Join(", ", counts.Select(c => $"{c.Key}: {c.Value}")));
     }
 
     /// <summary>
