@@ -243,6 +243,15 @@ public partial class StrmSyncService
                 string moviesPath = Path.Combine(provider.LibraryPath, "Movies");
                 string seriesPath = Path.Combine(provider.LibraryPath, "Series");
 
+                // A retry writes files, so it has to go through the same index the sync uses.
+                // Rebuilding the paths from the item name, as this used to, put the file next to
+                // the numbered directory the sync had assigned rather than inside it, and left it
+                // with no row — which the orphan cleanup would then delete on the next run.
+                string providerId = ProviderIdentity.Compute(provider.BaseUrl);
+                LibraryDatabaseState libraryDatabase = await _libraryDatabase
+                    .GetOrLoadAsync(provider.LibraryPath, cancellationToken)
+                    .ConfigureAwait(false);
+
                 foreach (var item in group)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -253,11 +262,11 @@ public partial class StrmSyncService
 
                         if (item.ItemType == "Movie")
                         {
-                            await RetryMovieAsync(provider, moviesPath, item, result, cancellationToken).ConfigureAwait(false);
+                            await RetryMovieAsync(provider, moviesPath, providerId, libraryDatabase, item, result, cancellationToken).ConfigureAwait(false);
                         }
                         else if (item.ItemType == "Series")
                         {
-                            await RetrySingleSeriesAsync(provider, seriesPath, item, result, cancellationToken).ConfigureAwait(false);
+                            await RetrySingleSeriesAsync(provider, seriesPath, providerId, libraryDatabase, item, result, cancellationToken).ConfigureAwait(false);
                         }
                     }
                     catch (HttpRequestException ex) when (ex.Message.Contains("404", StringComparison.Ordinal))
@@ -282,7 +291,7 @@ public partial class StrmSyncService
                                         ItemId = foundSeries.SeriesId,
                                         Name = foundSeries.Name,
                                     };
-                                    await RetrySingleSeriesAsync(provider, seriesPath, newItem, result, cancellationToken).ConfigureAwait(false);
+                                    await RetrySingleSeriesAsync(provider, seriesPath, providerId, libraryDatabase, newItem, result, cancellationToken).ConfigureAwait(false);
                                 }
                                 catch (Exception retryEx)
                                 {
@@ -347,6 +356,10 @@ public partial class StrmSyncService
                         CurrentProgress.IncrementItemsProcessed();
                     }
                 }
+
+                // Unconditional, and with no cancellation token: the rows describe files that are
+                // already on disk, so dropping them would make those files unknown to the next run.
+                await _libraryDatabase.SaveAsync(libraryDatabase, CancellationToken.None).ConfigureAwait(false);
             }
 
             result.EndTime = DateTime.UtcNow;
@@ -394,6 +407,8 @@ public partial class StrmSyncService
     private async Task RetryMovieAsync(
         ProviderConfig provider,
         string moviesPath,
+        string providerId,
+        LibraryDatabaseState libraryDatabase,
         FailedItem item,
         SyncResult result,
         CancellationToken cancellationToken)
@@ -403,15 +418,50 @@ public partial class StrmSyncService
         int? year = ExtractYear(item.Name);
         string folderName = year.HasValue ? $"{movieName} ({year})" : movieName;
         string? versionLabel = ExtractVersionLabel(item.Name);
-        string movieFolder = Path.Combine(moviesPath, folderName);
-        string strmFileName = BuildMovieStrmFileName(folderName, versionLabel, provider.RegexRemovalPatterns);
-        string strmPath = Path.Combine(movieFolder, strmFileName);
+
+        // A retry has no details call behind it, so it has no TMDB identifier to group by and the
+        // name it proposes carries no [tmdbid-N] tag. That only decides the name if this stream
+        // has never been written; when a row exists the stored directory wins, tag and all.
+        string relativeTarget = LibraryDatabaseState.ToRelativePath(provider.LibraryPath, moviesPath);
+        string relativeDirectory = MovieLibraryPathResolver.ResolveDirectory(
+            libraryDatabase,
+            providerId,
+            item.ItemId,
+            relativeTarget,
+            folderName,
+            null,
+            movieName,
+            out _);
+
+        string movieFolder = LibraryDatabaseState.ToFullPath(provider.LibraryPath, relativeDirectory);
+        string resolvedLeaf = Path.GetFileName(movieFolder);
+
+        string candidateName = Path.GetFileNameWithoutExtension(
+            BuildMovieStrmFileName(resolvedLeaf, versionLabel, provider.RegexRemovalPatterns));
+
+        string resolvedFileName = MovieLibraryPathResolver.ResolveFileNames(
+            libraryDatabase,
+            providerId,
+            item.ItemId,
+            relativeDirectory,
+            new[] { candidateName })[0];
+
+        string strmPath = Path.Combine(movieFolder, resolvedFileName + ".strm");
 
         // Build stream URL using stored item ID (assume mp4 as default extension)
         string streamUrl = $"{provider.BaseUrl}/movie/{provider.Username}/{provider.Password}/{item.ItemId}.mp4";
 
         if (File.Exists(strmPath))
         {
+            AddMovieRowIfMissing(
+                libraryDatabase,
+                providerId,
+                item.ItemId,
+                null,
+                false,
+                relativeDirectory,
+                resolvedFileName);
+
             if (StrmContentMatches(strmPath, streamUrl))
             {
                 result.MoviesSkipped++;
@@ -429,6 +479,14 @@ public partial class StrmSyncService
 
         await File.WriteAllTextAsync(strmPath, streamUrl, cancellationToken).ConfigureAwait(false);
         result.MoviesCreated++;
+        AddMovieRowIfMissing(
+            libraryDatabase,
+            providerId,
+            item.ItemId,
+            null,
+            false,
+            relativeDirectory,
+            resolvedFileName);
 
         _logger.LogInformation("Retry successful for movie: {MovieName}", item.Name);
     }
@@ -436,6 +494,8 @@ public partial class StrmSyncService
     private async Task RetrySingleSeriesAsync(
         ProviderConfig provider,
         string seriesPath,
+        string providerId,
+        LibraryDatabaseState libraryDatabase,
         FailedItem item,
         SyncResult result,
         CancellationToken cancellationToken)
@@ -452,7 +512,28 @@ public partial class StrmSyncService
         string seriesName = SanitizeFileName(item.Name, provider.CustomTitleRemoveTerms);
         int? year = ExtractYear(item.Name);
         string seriesFolderName = year.HasValue ? $"{seriesName} ({year})" : seriesName;
-        string seriesFolder = Path.Combine(seriesPath, seriesFolderName);
+
+        // Retries only ever write into the root series folder: the failed item records no
+        // category, so the folder mappings cannot be replayed here.
+        string relativeTarget = LibraryDatabaseState.ToRelativePath(provider.LibraryPath, seriesPath);
+
+        SeriesLibraryPathResolver.AdoptBackfilledRows(
+            libraryDatabase,
+            providerId,
+            item.ItemId,
+            relativeTarget,
+            seriesFolderName,
+            out _);
+
+        string relativeSeriesDirectory = SeriesLibraryPathResolver.ResolveDirectory(
+            libraryDatabase,
+            providerId,
+            item.ItemId,
+            relativeTarget,
+            seriesFolderName,
+            out _);
+
+        string seriesFolder = LibraryDatabaseState.ToFullPath(provider.LibraryPath, relativeSeriesDirectory);
         bool isNewSeries = !Directory.Exists(seriesFolder);
         bool createdEpisodes = false;
 
@@ -460,20 +541,45 @@ public partial class StrmSyncService
         {
             int seasonNumber = seasonEntry.Key;
             var episodes = seasonEntry.Value;
-            string seasonFolder = Path.Combine(seriesFolder, $"Season {seasonNumber}");
+            string relativeSeasonDirectory =
+                SeriesLibraryPathResolver.SeasonDirectory(relativeSeriesDirectory, seasonNumber);
+            string seasonFolder =
+                LibraryDatabaseState.ToFullPath(provider.LibraryPath, relativeSeasonDirectory);
             bool isNewSeason = !Directory.Exists(seasonFolder);
             bool seasonCreatedEpisodes = false;
 
             foreach (var episode in episodes)
             {
-                string episodeFileName = BuildEpisodeFileName(seriesName, seasonNumber, episode, provider.CustomTitleRemoveTerms, provider.RegexRemovalPatterns);
-                string strmPath = Path.Combine(seasonFolder, episodeFileName);
+                string episodeId = episode.EpisodeId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                string candidateEpisodeName = Path.GetFileNameWithoutExtension(
+                    BuildEpisodeFileName(seriesName, seasonNumber, episode, provider.CustomTitleRemoveTerms, provider.RegexRemovalPatterns));
+
+                string resolvedEpisodeName = SeriesLibraryPathResolver.ResolveFileName(
+                    libraryDatabase,
+                    providerId,
+                    item.ItemId,
+                    episodeId,
+                    relativeSeasonDirectory,
+                    candidateEpisodeName);
+
+                string strmPath = Path.Combine(seasonFolder, resolvedEpisodeName + ".strm");
 
                 string extension = string.IsNullOrEmpty(episode.ContainerExtension) ? "mkv" : episode.ContainerExtension;
                 string streamUrl = $"{provider.BaseUrl}/series/{provider.Username}/{provider.Password}/{episode.EpisodeId}.{extension}";
 
                 if (File.Exists(strmPath))
                 {
+                    AddSeriesRowIfMissing(
+                        libraryDatabase,
+                        providerId,
+                        item.ItemId,
+                        episodeId,
+                        seasonNumber,
+                        null,
+                        false,
+                        relativeSeasonDirectory,
+                        resolvedEpisodeName);
+
                     if (StrmContentMatches(strmPath, streamUrl))
                     {
                         result.EpisodesSkipped++;
@@ -492,6 +598,16 @@ public partial class StrmSyncService
                 result.EpisodesCreated++;
                 seasonCreatedEpisodes = true;
                 createdEpisodes = true;
+                AddSeriesRowIfMissing(
+                    libraryDatabase,
+                    providerId,
+                    item.ItemId,
+                    episodeId,
+                    seasonNumber,
+                    null,
+                    false,
+                    relativeSeasonDirectory,
+                    resolvedEpisodeName);
             }
 
             if (isNewSeason && seasonCreatedEpisodes)
