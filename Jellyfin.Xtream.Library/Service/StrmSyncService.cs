@@ -2545,10 +2545,15 @@ public partial class StrmSyncService
         var enableProactiveMediaInfo = provider.EnableProactiveMediaInfo;
         _logger.LogInformation("Processing series with parallelism={Parallelism}, smartSkip={SmartSkip}, metadataLookup={MetadataLookup}, proactiveMediaInfo={ProactiveMediaInfo}", parallelism, provider.SmartSkipExisting, enableMetadataLookup, enableProactiveMediaInfo);
 
-        // Pre-scan existing series folders for fast skip-before-API-call detection
-        // seriesFolderLookup provides O(1) lookup by (parentDir, baseName) instead of O(N) linear scan
+        // Where each series lives comes from the database. How many files it actually has still
+        // comes from the disk, because the whole point of the skip checks is to notice that a file
+        // was deleted behind the plugin's back; a row count would happily skip a series whose
+        // folder someone emptied by hand.
+        var seriesDirectoryIndex = SeriesDirectoryIndex.Build(libraryDatabase, providerId, provider.LibraryPath);
+
+        // Pre-scan existing series folders for fast skip-before-API-call detection. One recursive
+        // count per series directory, done once for every series rather than per series.
         var existingSeriesFolderCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var seriesFolderLookup = new Dictionary<string, (string Path, int Count)>(StringComparer.OrdinalIgnoreCase);
         if ((provider.SmartSkipExisting || provider.CleanupOrphans) && Directory.Exists(seriesPath))
         {
             CurrentProgress.Phase = "Scanning existing series";
@@ -2576,14 +2581,6 @@ public partial class StrmSyncService
                     {
                         var strmCount = Directory.GetFiles(seriesDir, "*.strm", SearchOption.AllDirectories).Length;
                         existingSeriesFolderCounts.TryAdd(seriesDir, strmCount);
-
-                        // Build O(1) lookup: key = "parentDir|baseName" (strip " [...]" suffix)
-                        var folderName = Path.GetFileName(seriesDir);
-                        var bracketIndex = folderName.LastIndexOf(" [", StringComparison.Ordinal);
-                        var baseKey = bracketIndex > 0 ? folderName[..bracketIndex] : folderName;
-                        var parentDir = Path.GetDirectoryName(seriesDir)!;
-                        var lookupKey = parentDir + "|" + baseKey;
-                        seriesFolderLookup.TryAdd(lookupKey, (seriesDir, strmCount));
                     }
                 }
                 catch (Exception ex)
@@ -2699,11 +2696,14 @@ public partial class StrmSyncService
                         var checksum = SnapshotService.CalculateChecksum(s.Series, prev.EpisodeCount);
                         if (prev.Checksum == checksum)
                         {
-                            string seriesName = SanitizeFileName(s.Series.Name, provider.CustomTitleRemoveTerms);
-                            int? year = ExtractYear(s.Series.Name);
-                            string baseName = year.HasValue ? $"{seriesName} ({year})" : seriesName;
-
-                            if (HasCompleteExistingSeriesFolders(seriesPath, baseName, s.CategoryIds, folderMappings, seriesFolderLookup, prev.EpisodeCount))
+                            if (HasCompleteExistingSeriesFolders(
+                                seriesPath,
+                                s.Series.SeriesId,
+                                s.CategoryIds,
+                                folderMappings,
+                                seriesDirectoryIndex,
+                                existingSeriesFolderCounts,
+                                prev.EpisodeCount))
                             {
                                 unchangedSeries.Add(s);
                                 return false; // Unchanged and locally complete
@@ -2723,10 +2723,6 @@ public partial class StrmSyncService
                 // Track existing STRM paths for unchanged series (orphan protection)
                 foreach (var s in unchangedSeries)
                 {
-                    string seriesName = SanitizeFileName(s.Series.Name, provider.CustomTitleRemoveTerms);
-                    int? year = ExtractYear(s.Series.Name);
-                    string baseName = year.HasValue ? $"{seriesName} ({year})" : seriesName;
-
                     var targetFolders = BuildSeriesTargetFolders(s.CategoryIds, folderMappings);
 
                     foreach (var targetFolder in targetFolders)
@@ -2734,14 +2730,14 @@ public partial class StrmSyncService
                         string seriesBasePath = string.IsNullOrEmpty(targetFolder)
                             ? seriesPath
                             : Path.Combine(seriesPath, targetFolder);
-                        var lookupKey = seriesBasePath + "|" + baseName;
-                        if (seriesFolderLookup.TryGetValue(lookupKey, out var match))
+                        if (seriesDirectoryIndex.TryGetDirectory(s.Series.SeriesId, seriesBasePath, out string matchPath)
+                            && existingSeriesFolderCounts.TryGetValue(matchPath, out int matchCount))
                         {
                             // Count episodes and seasons for skipped series (dashboard totals)
-                            Interlocked.Add(ref episodesSkipped, match.Count);
+                            Interlocked.Add(ref episodesSkipped, matchCount);
                             try
                             {
-                                Interlocked.Add(ref seasonsSkipped, Directory.GetDirectories(match.Path, "Season *").Length);
+                                Interlocked.Add(ref seasonsSkipped, Directory.GetDirectories(matchPath, "Season *").Length);
                             }
                             catch (Exception)
                             {
@@ -2750,7 +2746,7 @@ public partial class StrmSyncService
 
                             try
                             {
-                                foreach (var strm in Directory.GetFiles(match.Path, "*.strm", SearchOption.AllDirectories))
+                                foreach (var strm in Directory.GetFiles(matchPath, "*.strm", SearchOption.AllDirectories))
                                 {
                                     syncedFiles.TryAdd(strm, 0);
                                 }
@@ -2791,10 +2787,6 @@ public partial class StrmSyncService
                     }
 
                     // Check if all target folders have matching content
-                    string sName = SanitizeFileName(s.Series.Name, provider.CustomTitleRemoveTerms);
-                    int? sYear = ExtractYear(s.Series.Name);
-                    string sBase = sYear.HasValue ? $"{sName} ({sYear})" : sName;
-
                     var checkFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     foreach (var catId in s.CategoryIds)
                     {
@@ -2815,8 +2807,9 @@ public partial class StrmSyncService
                     foreach (var folder in checkFolders)
                     {
                         string basePath = string.IsNullOrEmpty(folder) ? seriesPath : Path.Combine(seriesPath, folder);
-                        var key = basePath + "|" + sBase;
-                        if (!seriesFolderLookup.TryGetValue(key, out var m) || m.Count < hintEntry.EpisodeCount)
+                        if (!seriesDirectoryIndex.TryGetDirectory(s.Series.SeriesId, basePath, out string knownPath)
+                            || !existingSeriesFolderCounts.TryGetValue(knownPath, out int knownCount)
+                            || knownCount < hintEntry.EpisodeCount)
                         {
                             return true; // Would not be smart-skipped
                         }
@@ -2921,17 +2914,18 @@ public partial class StrmSyncService
                                 ? seriesPath
                                 : Path.Combine(seriesPath, targetFolder);
 
-                            // Find matching folder via O(1) lookup (baseName may have [tmdbid-X]/[tvdbid-X] suffix)
+                            // The directory is the one the database recorded for this series id;
+                            // the count is what the disk actually holds.
                             bool foundMatch = false;
-                            var lookupKey = seriesBasePath + "|" + baseName;
-                            if (seriesFolderLookup.TryGetValue(lookupKey, out var match) &&
-                                match.Count >= hintEntry.EpisodeCount)
+                            if (seriesDirectoryIndex.TryGetDirectory(series.SeriesId, seriesBasePath, out string matchPath)
+                                && existingSeriesFolderCounts.TryGetValue(matchPath, out int matchCount)
+                                && matchCount >= hintEntry.EpisodeCount)
                             {
                                 foundMatch = true;
-                                preSkipEpisodes += match.Count;
+                                preSkipEpisodes += matchCount;
                                 try
                                 {
-                                    preSkipSeasons += Directory.GetDirectories(match.Path, "Season *").Length;
+                                    preSkipSeasons += Directory.GetDirectories(matchPath, "Season *").Length;
                                 }
                                 catch (Exception)
                                 {
@@ -2941,7 +2935,7 @@ public partial class StrmSyncService
                                 // Add existing files to synced set (for orphan protection)
                                 try
                                 {
-                                    foreach (var strm in Directory.GetFiles(match.Path, "*.strm", SearchOption.AllDirectories))
+                                    foreach (var strm in Directory.GetFiles(matchPath, "*.strm", SearchOption.AllDirectories))
                                     {
                                         syncedFiles.TryAdd(strm, 0);
                                     }
@@ -3056,15 +3050,10 @@ public partial class StrmSyncService
                             string seriesBasePath = string.IsNullOrEmpty(targetFolder)
                                 ? seriesPath
                                 : Path.Combine(seriesPath, targetFolder);
-                            // Resolve actual folder via seriesFolderLookup to handle suffix mismatch
-                            // (e.g. existing folder has [tvdbid-X] but lookup failed this sync)
-                            string seriesFolderPath;
-                            var lookupKey = seriesBasePath + "|" + baseName;
-                            if (seriesFolderLookup.TryGetValue(lookupKey, out var existingMatch))
-                            {
-                                seriesFolderPath = existingMatch.Path;
-                            }
-                            else
+                            // The database says where this series is. Falling back to the name it
+                            // would be given today is only for a series it has never recorded,
+                            // and that one is about to be written anyway.
+                            if (!seriesDirectoryIndex.TryGetDirectory(series.SeriesId, seriesBasePath, out string seriesFolderPath))
                             {
                                 seriesFolderPath = Path.Combine(seriesBasePath, seriesFolderName);
                             }
@@ -3109,14 +3098,7 @@ public partial class StrmSyncService
                                 string seriesBasePath = string.IsNullOrEmpty(targetFolder)
                                     ? seriesPath
                                     : Path.Combine(seriesPath, targetFolder);
-                                // Resolve actual folder via seriesFolderLookup to handle suffix mismatch
-                                string seriesFolderPath;
-                                var lookupKey = seriesBasePath + "|" + baseName;
-                                if (seriesFolderLookup.TryGetValue(lookupKey, out var existingMatch))
-                                {
-                                    seriesFolderPath = existingMatch.Path;
-                                }
-                                else
+                                if (!seriesDirectoryIndex.TryGetDirectory(series.SeriesId, seriesBasePath, out string seriesFolderPath))
                                 {
                                     seriesFolderPath = Path.Combine(seriesBasePath, seriesFolderName);
                                 }
@@ -3525,12 +3507,29 @@ public partial class StrmSyncService
         return TruncateFileNameToFsLimit(ApplyFileNameRegexPatterns(fileName, regexRemovalPatterns));
     }
 
+    /// <summary>
+    /// Decides whether every folder a series is mapped into already holds all of its episodes.
+    /// </summary>
+    /// <remarks>
+    /// The directory comes from the database and the file count from the disk. A series the
+    /// database does not know — one whose rows a backfill recovered without an identifier, or one
+    /// that has never been synced — is reported incomplete, so it is synced rather than skipped.
+    /// </remarks>
+    /// <param name="seriesPath">The root series directory of the provider.</param>
+    /// <param name="seriesId">The Xtream series identifier.</param>
+    /// <param name="categoryIds">The categories the series belongs to.</param>
+    /// <param name="folderMappings">The category to folder mappings.</param>
+    /// <param name="seriesDirectoryIndex">The directories known to the database.</param>
+    /// <param name="existingSeriesFolderCounts">The STRM counts found on disk, by directory.</param>
+    /// <param name="expectedEpisodeCount">The number of episodes the provider advertises.</param>
+    /// <returns>True when nothing needs to be written.</returns>
     internal static bool HasCompleteExistingSeriesFolders(
         string seriesPath,
-        string baseName,
+        int seriesId,
         IEnumerable<int> categoryIds,
         Dictionary<int, List<string>> folderMappings,
-        Dictionary<string, (string Path, int Count)> seriesFolderLookup,
+        SeriesDirectoryIndex seriesDirectoryIndex,
+        IReadOnlyDictionary<string, int> existingSeriesFolderCounts,
         int expectedEpisodeCount)
     {
         if (expectedEpisodeCount <= 0)
@@ -3543,9 +3542,10 @@ public partial class StrmSyncService
             string seriesBasePath = string.IsNullOrEmpty(targetFolder)
                 ? seriesPath
                 : Path.Combine(seriesPath, targetFolder);
-            var lookupKey = seriesBasePath + "|" + baseName;
-            if (!seriesFolderLookup.TryGetValue(lookupKey, out var match) ||
-                match.Count < expectedEpisodeCount)
+
+            if (!seriesDirectoryIndex.TryGetDirectory(seriesId, seriesBasePath, out string directory)
+                || !existingSeriesFolderCounts.TryGetValue(directory, out int count)
+                || count < expectedEpisodeCount)
             {
                 return false;
             }

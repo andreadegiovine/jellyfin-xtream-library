@@ -16,6 +16,7 @@
 using FluentAssertions;
 using Jellyfin.Xtream.Library.Client.Models;
 using Jellyfin.Xtream.Library.Service;
+using Jellyfin.Xtream.Library.Service.Models;
 using Jellyfin.Xtream.Library.Tests.Helpers;
 using Xunit;
 
@@ -1162,21 +1163,49 @@ public class StrmSyncServiceTests
 
     #region HasCompleteExistingSeriesFolders Tests
 
+    // The directory a series lives in now comes from the database, keyed by series id, and only
+    // the file count still comes from the disk. That is what lets a folder carrying a [tmdbid-X]
+    // suffix be recognised without guessing at names, and what stops two shows with the same
+    // sanitized title from being mistaken for one another.
+    private static (SeriesDirectoryIndex Index, Dictionary<string, int> Counts) BuildSeriesIndex(
+        string libraryPath,
+        params (int SeriesId, string RelativeSeriesDirectory, int StrmCount)[] series)
+    {
+        var file = new LibraryDatabaseFile<SeriesDatabaseEntry>();
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (seriesId, relativeDirectory, strmCount) in series)
+        {
+            file.Entries.Add(new SeriesDatabaseEntry
+            {
+                ProviderId = "prov1234",
+                SeriesId = seriesId,
+                EpisodeId = "1",
+                DirectoryName = relativeDirectory + "/Season 1",
+                FileName = "episode",
+                Season = 1,
+            });
+
+            counts[LibraryDatabaseState.ToFullPath(libraryPath, relativeDirectory)] = strmCount;
+        }
+
+        var state = new LibraryDatabaseState(libraryPath, new LibraryDatabaseFile<MovieDatabaseEntry>(), file);
+        return (SeriesDirectoryIndex.Build(state, "prov1234", libraryPath), counts);
+    }
+
     [Fact]
     public void HasCompleteExistingSeriesFolders_SuffixFolderWithEnoughStrms_ReturnsTrue()
     {
-        var seriesPath = Path.Combine(Path.GetTempPath(), "Series");
-        var folderLookup = new Dictionary<string, (string Path, int Count)>(StringComparer.OrdinalIgnoreCase)
-        {
-            [seriesPath + "|Zoey 101"] = (Path.Combine(seriesPath, "Zoey 101 [tmdbid-1778]"), 4),
-        };
+        var libraryPath = Path.GetTempPath();
+        var (index, counts) = BuildSeriesIndex(libraryPath, (7, "Series/Zoey 101 [tmdbid-1778]", 4));
 
         var result = StrmSyncService.HasCompleteExistingSeriesFolders(
-            seriesPath,
-            "Zoey 101",
+            Path.Combine(libraryPath, "Series"),
+            7,
             new[] { 1 },
             new Dictionary<int, List<string>>(),
-            folderLookup,
+            index,
+            counts,
             expectedEpisodeCount: 4);
 
         result.Should().BeTrue();
@@ -1185,18 +1214,16 @@ public class StrmSyncServiceTests
     [Fact]
     public void HasCompleteExistingSeriesFolders_SuffixFolderWithNoStrms_ReturnsFalse()
     {
-        var seriesPath = Path.Combine(Path.GetTempPath(), "Series");
-        var folderLookup = new Dictionary<string, (string Path, int Count)>(StringComparer.OrdinalIgnoreCase)
-        {
-            [seriesPath + "|Zoey 101"] = (Path.Combine(seriesPath, "Zoey 101 [tmdbid-1778]"), 0),
-        };
+        var libraryPath = Path.GetTempPath();
+        var (index, counts) = BuildSeriesIndex(libraryPath, (7, "Series/Zoey 101 [tmdbid-1778]", 0));
 
         var result = StrmSyncService.HasCompleteExistingSeriesFolders(
-            seriesPath,
-            "Zoey 101",
+            Path.Combine(libraryPath, "Series"),
+            7,
             new[] { 1 },
             new Dictionary<int, List<string>>(),
-            folderLookup,
+            index,
+            counts,
             expectedEpisodeCount: 1);
 
         result.Should().BeFalse();
@@ -1205,24 +1232,41 @@ public class StrmSyncServiceTests
     [Fact]
     public void HasCompleteExistingSeriesFolders_MappedFolderMissingStrms_ReturnsFalse()
     {
-        var seriesPath = Path.Combine(Path.GetTempPath(), "Series");
-        var kidsPath = Path.Combine(seriesPath, "Kids");
+        var libraryPath = Path.GetTempPath();
         var folderMappings = new Dictionary<int, List<string>>
         {
             [5] = new List<string> { "Kids" },
         };
-        var folderLookup = new Dictionary<string, (string Path, int Count)>(StringComparer.OrdinalIgnoreCase)
-        {
-            [kidsPath + "|Zoey 101"] = (Path.Combine(kidsPath, "Zoey 101 [tmdbid-1778]"), 0),
-        };
+        var (index, counts) = BuildSeriesIndex(libraryPath, (7, "Series/Kids/Zoey 101 [tmdbid-1778]", 0));
 
         var result = StrmSyncService.HasCompleteExistingSeriesFolders(
-            seriesPath,
-            "Zoey 101",
+            Path.Combine(libraryPath, "Series"),
+            7,
             new[] { 5 },
             folderMappings,
-            folderLookup,
+            index,
+            counts,
             expectedEpisodeCount: 3);
+
+        result.Should().BeFalse();
+    }
+
+    // A series the database has never recorded is reported incomplete rather than complete, so an
+    // un-upgraded library syncs instead of skipping everything it cannot see.
+    [Fact]
+    public void HasCompleteExistingSeriesFolders_SeriesUnknownToTheDatabase_ReturnsFalse()
+    {
+        var libraryPath = Path.GetTempPath();
+        var (index, counts) = BuildSeriesIndex(libraryPath, (7, "Series/Zoey 101", 4));
+
+        var result = StrmSyncService.HasCompleteExistingSeriesFolders(
+            Path.Combine(libraryPath, "Series"),
+            9,
+            new[] { 1 },
+            new Dictionary<int, List<string>>(),
+            index,
+            counts,
+            expectedEpisodeCount: 4);
 
         result.Should().BeFalse();
     }
