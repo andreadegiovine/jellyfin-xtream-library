@@ -57,8 +57,14 @@ public static class MovieLibraryPathResolver
         ArgumentNullException.ThrowIfNull(candidateFileNames);
 
         string directory = ResolveDirectory(
-            database, providerId, streamId, targetFolder, candidateDirectoryName, providerTmdbId,
-            groupingName, out bool isExisting);
+            database,
+            providerId,
+            streamId,
+            targetFolder,
+            candidateDirectoryName,
+            providerTmdbId,
+            groupingName,
+            out bool isExisting);
 
         return new MoviePathPlan(
             directory,
