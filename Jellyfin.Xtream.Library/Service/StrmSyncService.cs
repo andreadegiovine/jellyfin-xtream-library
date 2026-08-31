@@ -59,6 +59,8 @@ public partial class StrmSyncService
     private readonly ILibraryManager _libraryManager;
     private readonly IMetadataLookupService _metadataLookup;
     private readonly SnapshotService _snapshotService;
+    private readonly LibraryDatabaseService _libraryDatabase;
+    private readonly LibraryBackfillService _libraryBackfill;
     private readonly DeltaCalculator _deltaCalculator;
     private readonly LiveTvService _liveTvService;
     private readonly IServerApplicationPaths _appPaths;
@@ -88,6 +90,8 @@ public partial class StrmSyncService
         ILibraryManager libraryManager,
         IMetadataLookupService metadataLookup,
         SnapshotService snapshotService,
+        LibraryDatabaseService libraryDatabase,
+        LibraryBackfillService libraryBackfill,
         DeltaCalculator deltaCalculator,
         LiveTvService liveTvService,
         IServerApplicationPaths appPaths,
@@ -98,6 +102,8 @@ public partial class StrmSyncService
         _libraryManager = libraryManager;
         _metadataLookup = metadataLookup;
         _snapshotService = snapshotService;
+        _libraryDatabase = libraryDatabase;
+        _libraryBackfill = libraryBackfill;
         _deltaCalculator = deltaCalculator;
         _liveTvService = liveTvService;
         _appPaths = appPaths;
@@ -964,6 +970,22 @@ public partial class StrmSyncService
         Directory.CreateDirectory(moviesPath);
         Directory.CreateDirectory(seriesPath);
 
+        // The library database is the index of every STRM file this plugin owns. It is
+        // keyed by the provider base URL rather than by the provider position, so that
+        // reordering the providers in the settings page cannot detach a whole library.
+        string providerId = ProviderIdentity.Compute(provider.BaseUrl);
+        _logger.LogDebug("Library database provider id for {BaseUrl} is {ProviderId}", provider.BaseUrl, providerId);
+        LibraryDatabaseState libraryDatabase = await _libraryDatabase
+            .GetOrLoadAsync(provider.LibraryPath, cancellationToken)
+            .ConfigureAwait(false);
+
+        await BackfillLibraryDatabaseAsync(
+            provider,
+            libraryDatabase,
+            moviesPath,
+            seriesPath,
+            cancellationToken).ConfigureAwait(false);
+
         // Collect existing STRM files for orphan cleanup
         if (provider.CleanupOrphans)
         {
@@ -997,6 +1019,8 @@ public partial class StrmSyncService
                         await SyncMoviesAsync(
                             provider,
                             moviesPath,
+                            providerId,
+                            libraryDatabase,
                             syncedFiles,
                             claimedStrmPaths,
                             result,
@@ -1039,6 +1063,8 @@ public partial class StrmSyncService
                 await SyncMoviesAsync(
                     provider,
                     moviesPath,
+                    providerId,
+                    libraryDatabase,
                     syncedFiles,
                     claimedStrmPaths,
                     result,
@@ -1235,6 +1261,18 @@ public partial class StrmSyncService
             await SaveSnapshotAsync(provider, providerKey, allCollectedMovies, allCollectedSeries, allSeriesInfoDict, result.FailedItems, cancellationToken).ConfigureAwait(false);
         }
 
+        // Saved unconditionally, and with no cancellation token: the rows describe files that are
+        // already on disk, so discarding them would make those files look unknown to the next run,
+        // which is exactly the state that produces numbered twins.
+        try
+        {
+            await _libraryDatabase.SaveAsync(libraryDatabase, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (IOException ex)
+        {
+            _logger.LogError(ex, "Could not save the library database for {LibraryPath}", provider.LibraryPath);
+        }
+
         result.WasIncrementalSync = isIncrementalSync;
         result.EndTime = DateTime.UtcNow;
         result.Success = true;
@@ -1398,9 +1436,127 @@ public partial class StrmSyncService
         }
     }
 
+    /// <summary>
+    /// Populates the library database from the files already on disk.
+    /// </summary>
+    /// <remarks>
+    /// Runs on the first sync after the database was introduced, and again whenever the file has
+    /// been lost or was found corrupt. Rows are created for every STRM file, including files whose
+    /// URL cannot be read or whose provider is no longer configured: an unindexed file would leave
+    /// its directory name free, and the next sync would create a numbered twin beside it.
+    /// </remarks>
+    /// <param name="provider">The provider being synced.</param>
+    /// <param name="libraryDatabase">The database state to populate.</param>
+    /// <param name="moviesPath">The absolute movie root.</param>
+    /// <param name="seriesPath">The absolute series root.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>A task representing the backfill.</returns>
+    private async Task BackfillLibraryDatabaseAsync(
+        ProviderConfig provider,
+        LibraryDatabaseState libraryDatabase,
+        string moviesPath,
+        string seriesPath,
+        CancellationToken cancellationToken)
+    {
+        bool moviesPending = !libraryDatabase.IsMovieBackfillComplete;
+        bool seriesPending = !libraryDatabase.IsSeriesBackfillComplete;
+
+        if (!moviesPending && !seriesPending)
+        {
+            return;
+        }
+
+        // Every enabled provider is considered, not just the one being synced: providers are
+        // allowed to share a library root, and a file must be attributed to whichever provider
+        // actually wrote it.
+        Dictionary<string, string> providersByBaseUrl = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (ProviderConfig candidate in Plugin.Instance.Configuration.Providers)
+        {
+            if (string.IsNullOrEmpty(candidate.BaseUrl))
+            {
+                continue;
+            }
+
+            providersByBaseUrl[StrmUrlParser.NormalizeBaseUrl(candidate.BaseUrl)] =
+                ProviderIdentity.Compute(candidate.BaseUrl);
+        }
+
+        int parallelism = Math.Max(1, provider.SyncParallelism);
+        CurrentProgress.Phase = "Indexing existing library";
+
+        if (moviesPending)
+        {
+            _logger.LogInformation("Building the movie library database from {Path}", moviesPath);
+            await _libraryBackfill.BackfillMoviesAsync(
+                libraryDatabase,
+                moviesPath,
+                providersByBaseUrl,
+                parallelism,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        if (seriesPending)
+        {
+            _logger.LogInformation("Building the series library database from {Path}", seriesPath);
+            await _libraryBackfill.BackfillSeriesAsync(
+                libraryDatabase,
+                seriesPath,
+                providersByBaseUrl,
+                parallelism,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        await _libraryDatabase.SaveAsync(libraryDatabase, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Records a movie STRM file in the library database, unless it is already recorded.
+    /// </summary>
+    /// <remarks>
+    /// Called only where the file is known to exist on disk. Writing the row before the file
+    /// would leave a phantom row holding a name hostage if the write then failed.
+    /// </remarks>
+    /// <param name="libraryDatabase">The database state.</param>
+    /// <param name="providerId">The provider identifier.</param>
+    /// <param name="streamId">The Xtream stream identifier.</param>
+    /// <param name="tmdbId">The TMDB identifier supplied by the provider, or null.</param>
+    /// <param name="infoError">Whether the details request failed.</param>
+    /// <param name="directory">The directory, relative to the library root.</param>
+    /// <param name="fileName">The file name without extension.</param>
+    private static void AddMovieRowIfMissing(
+        LibraryDatabaseState libraryDatabase,
+        string providerId,
+        int streamId,
+        int? tmdbId,
+        bool infoError,
+        string directory,
+        string fileName)
+    {
+        foreach (var existing in libraryDatabase.GetMovieEntries(providerId, streamId))
+        {
+            if (string.Equals(existing.DirectoryName, directory, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(existing.FileName, fileName, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+
+        libraryDatabase.AddMovie(new MovieDatabaseEntry
+        {
+            ProviderId = providerId,
+            StreamId = streamId,
+            TmdbId = tmdbId,
+            DirectoryName = directory,
+            FileName = fileName,
+            InfoError = infoError
+        });
+    }
+
     private async Task SyncMoviesAsync(
         ProviderConfig provider,
         string moviesPath,
+        string providerId,
+        LibraryDatabaseState libraryDatabase,
         ConcurrentDictionary<string, byte> syncedFiles,
         ConcurrentDictionary<string, byte> claimedStrmPaths,
         SyncResult result,
@@ -1532,53 +1688,10 @@ public partial class StrmSyncService
 
         _logger.LogInformation("Processing movies with parallelism={Parallelism}, metadataLookup={MetadataLookup}, proactiveMediaInfo={ProactiveMediaInfo}", parallelism, enableMetadataLookup, enableProactiveMediaInfo);
 
-        // Pre-scan existing movie folders for faster skip detection
-        var existingMovieFolders = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-        if (Directory.Exists(moviesPath))
-        {
-            _logger.LogInformation("Pre-scanning existing movie folders...");
-            CurrentProgress.Phase = "Scanning existing movies";
-
-            // Scan root movie folder
-            var rootFolders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var folder in Directory.GetDirectories(moviesPath))
-            {
-                var folderName = Path.GetFileName(folder);
-                // Extract base name (remove [tmdbid-X] suffix if present)
-                var bracketIndex = folderName.LastIndexOf(" [", StringComparison.Ordinal);
-                var baseKey = bracketIndex > 0 ? folderName[..bracketIndex] : folderName;
-                rootFolders.TryAdd(baseKey, folderName);
-            }
-
-            existingMovieFolders[string.Empty] = rootFolders;
-
-            // Scan category subfolders if using Multiple folder mode
-            if (folderMappings.Count > 0)
-            {
-                var subfolderNames = folderMappings.Values.SelectMany(v => v).Distinct();
-                foreach (var subfolder in subfolderNames)
-                {
-                    var subPath = Path.Combine(moviesPath, subfolder);
-                    if (Directory.Exists(subPath))
-                    {
-                        var subFolders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                        foreach (var folder in Directory.GetDirectories(subPath))
-                        {
-                            var folderName = Path.GetFileName(folder);
-                            var bracketIndex = folderName.LastIndexOf(" [", StringComparison.Ordinal);
-                            var baseKey = bracketIndex > 0 ? folderName[..bracketIndex] : folderName;
-                            subFolders.TryAdd(baseKey, folderName);
-                        }
-
-                        existingMovieFolders[subfolder] = subFolders;
-                    }
-                }
-            }
-
-            var totalFolders = existingMovieFolders.Values.Sum(d => d.Count);
-            _logger.LogInformation("Found {Count} existing movie folders", totalFolders);
-        }
-
+        // Directory and file names come from the library database, never from a filesystem scan.
+        // Resolving by stream id rather than by name is what keeps the anti-collision counter from
+        // escalating: a name lookup cannot recognise a directory that already carries a "#2" and
+        // would mint a fresh number on every run.
         // Build the per-provider VOD exclusion set once; read-only inside the parallel fetch.
         var excludedVodSet = ContentExclusionFilter.BuildSet(provider.ExcludedVodStreamIds);
 
@@ -1684,47 +1797,17 @@ public partial class StrmSyncService
                     return true; // New or modified
                 }).ToList();
 
-                // Track existing STRM paths for unchanged movies (orphan protection)
+                // Track existing STRM paths for unchanged movies (orphan protection). The rows
+                // hold every file this provider wrote for the stream, so no directory walk is
+                // needed and files in mapped subfolders are covered too.
                 foreach (var m in unchangedMovies)
                 {
-                    string movieName = SanitizeFileName(m.Stream.Name, provider.CustomTitleRemoveTerms);
-                    int? year = ExtractYear(m.Stream.Name);
-                    string baseName = year.HasValue ? $"{movieName} ({year})" : movieName;
-
-                    var targetFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var categoryId in m.CategoryIds)
+                    foreach (var row in libraryDatabase.GetMovieEntries(providerId, m.Stream.StreamId))
                     {
-                        if (folderMappings.TryGetValue(categoryId, out var mappedFolders))
-                        {
-                            foreach (var folder in mappedFolders)
-                            {
-                                targetFolders.Add(folder);
-                            }
-                        }
-                    }
-
-                    if (targetFolders.Count == 0)
-                    {
-                        targetFolders.Add(string.Empty);
-                    }
-
-                    foreach (var targetFolder in targetFolders)
-                    {
-                        if (existingMovieFolders.TryGetValue(targetFolder, out var folderCache) &&
-                            folderCache.TryGetValue(baseName, out var existingFolderName))
-                        {
-                            string movieBasePath = string.IsNullOrEmpty(targetFolder)
-                                ? moviesPath
-                                : Path.Combine(moviesPath, targetFolder);
-                            string movieFolder = Path.Combine(movieBasePath, existingFolderName);
-                            if (Directory.Exists(movieFolder))
-                            {
-                                foreach (var strmFile in Directory.GetFiles(movieFolder, "*.strm"))
-                                {
-                                    syncedFiles.TryAdd(strmFile, 0);
-                                }
-                            }
-                        }
+                        string strmPath = Path.Combine(
+                            LibraryDatabaseState.ToFullPath(provider.LibraryPath, row.DirectoryName),
+                            row.FileName + ".strm");
+                        syncedFiles.TryAdd(strmPath, 0);
                     }
                 }
 
@@ -1751,16 +1834,11 @@ public partial class StrmSyncService
                         return false;
                     }
 
-                    // Check if folder already exists (no need to fetch VOD info)
-                    foreach (var targetFolder in m.CategoryIds.SelectMany(cid =>
-                        folderMappings.TryGetValue(cid, out var f) ? f : Enumerable.Empty<string>())
-                        .DefaultIfEmpty(string.Empty))
+                    // Already known to the database, so its names are settled and there is nothing
+                    // the provider details could still tell us that would change them.
+                    if (libraryDatabase.GetMovieEntries(providerId, m.Stream.StreamId).Count > 0)
                     {
-                        if (existingMovieFolders.TryGetValue(targetFolder, out var fc) &&
-                            fc.ContainsKey(baseName))
-                        {
-                            return false;
-                        }
+                        return false;
                     }
 
                     return true;
@@ -1900,33 +1978,29 @@ public partial class StrmSyncService
                         targetFolders.Add(string.Empty);
                     }
 
-                    // Quick check: does a folder for this movie already exist? If so, skip API calls
-                    // Uses pre-scanned cache for O(1) lookup instead of filesystem scan
-                    string? existingFolderName = null;
-                    foreach (var targetFolder in targetFolders)
-                    {
-                        if (existingMovieFolders.TryGetValue(targetFolder, out var folderCache) &&
-                            folderCache.TryGetValue(baseName, out var cachedFolder))
-                        {
-                            existingFolderName = cachedFolder;
-                            break;
-                        }
-                    }
+                    // The database is the only place consulted for names. A stream it already
+                    // knows keeps whatever it was given, so no provider call can change anything.
+                    bool knownToDatabase =
+                        libraryDatabase.GetMovieEntries(providerId, stream.StreamId).Count > 0;
 
-                    // If folder exists, use existing name and skip API calls
                     VodInfoResponse? vodInfo = null;
-                    int? providerTmdbId = null;
+
+                    // Many panels advertise the identifier in the listing itself. Taking it here
+                    // avoids one details request per movie, which on a large catalogue is the
+                    // difference between a sync and an afternoon.
+                    int? providerTmdbId = TmdbIdParser.Parse(stream.TmdbId);
                     int? autoLookupTmdbId = null;
+                    bool infoError = false;
                     string folderName;
 
-                    if (existingFolderName != null)
+                    if (knownToDatabase)
                     {
-                        folderName = existingFolderName;
+                        folderName = BuildMovieFolderName(movieName, year, tmdbOverrides, providerTmdbId, null);
                     }
                     else
                     {
                         // New movie - get provider TMDB ID from pre-fetched cache
-                        if (enableMetadataLookup && !tmdbOverrides.ContainsKey(baseName))
+                        if (!providerTmdbId.HasValue && enableMetadataLookup && !tmdbOverrides.ContainsKey(baseName))
                         {
                             if (vodInfoCache.TryGetValue(stream.StreamId, out var cachedInfo))
                             {
@@ -1940,14 +2014,15 @@ public partial class StrmSyncService
                                 }
                                 catch (Exception ex)
                                 {
+                                    // A failed call is not the same as a provider without an
+                                    // identifier: the row records which of the two happened, so
+                                    // only the failures are retried on the next run.
+                                    infoError = true;
                                     _logger.LogDebug(ex, "Failed to fetch VOD info for provider TMDB: {StreamId}", stream.StreamId);
                                 }
                             }
 
-                            if (!string.IsNullOrEmpty(vodInfo?.Info?.TmdbId) && int.TryParse(vodInfo.Info.TmdbId, out int tmdbParsed))
-                            {
-                                providerTmdbId = tmdbParsed;
-                            }
+                            providerTmdbId = TmdbIdParser.Parse(vodInfo?.Info?.TmdbId);
                         }
 
                         // Only do metadata lookup if provider doesn't have TMDB ID
@@ -1976,7 +2051,10 @@ public partial class StrmSyncService
                     }
 
                     // Build STRM URLs and filenames — Dispatcharr multi-stream or standard single-stream
-                    var strmEntries = new List<(string StreamUrl, string StrmFileName)>();
+                    // URLs are properties of the stream, so they are built once. File names are
+                    // not: the name follows the directory name, and in multiple-folder mode the
+                    // same movie can land on a differently numbered directory in each mapping.
+                    var strmEntries = new List<(string StreamUrl, string? VersionLabel)>();
                     if (enableDispatcharrMode &&
                         dispatcharrCache.TryGetValue(stream.StreamId, out var movieProviderInfo))
                     {
@@ -1985,16 +2063,14 @@ public partial class StrmSyncService
                         for (int i = 0; i < providers.Count; i++)
                         {
                             string providerStreamUrl = $"{connectionInfo.BaseUrl}/proxy/vod/movie/{uuid}?stream_id={providers[i].StreamId}";
-                            string strmFileName = BuildMovieStrmFileName(folderName, i == 0 ? null : $"Version {i + 1}", provider.RegexRemovalPatterns);
-                            strmEntries.Add((providerStreamUrl, strmFileName));
+                            strmEntries.Add((providerStreamUrl, i == 0 ? null : $"Version {i + 1}"));
                         }
                     }
                     else
                     {
                         string extension = string.IsNullOrEmpty(stream.ContainerExtension) ? "mp4" : stream.ContainerExtension;
                         string streamUrl = $"{connectionInfo.BaseUrl}/movie/{connectionInfo.UserName}/{connectionInfo.Password}/{stream.StreamId}.{extension}";
-                        string strmFileName = BuildMovieStrmFileName(folderName, versionLabel, provider.RegexRemovalPatterns);
-                        strmEntries.Add((streamUrl, strmFileName));
+                        strmEntries.Add((streamUrl, versionLabel));
                     }
 
                     bool anyCreated = false;
@@ -2006,14 +2082,43 @@ public partial class StrmSyncService
                     // Sync to each target folder
                     foreach (var targetFolder in targetFolders)
                     {
-                        string movieBasePath = string.IsNullOrEmpty(targetFolder)
-                            ? moviesPath
-                            : Path.Combine(moviesPath, targetFolder);
-                        string movieFolder = Path.Combine(movieBasePath, folderName);
+                        string relativeTarget = MovieLibraryPathResolver.Join(
+                            LibraryDatabaseState.ToRelativePath(provider.LibraryPath, moviesPath),
+                            MovieLibraryPathResolver.NormalizeFolder(targetFolder));
 
-                        foreach (var (streamUrl, strmFileName) in strmEntries)
+                        string relativeDirectory = MovieLibraryPathResolver.ResolveDirectory(
+                            libraryDatabase,
+                            providerId,
+                            stream.StreamId,
+                            relativeTarget,
+                            folderName,
+                            providerTmdbId,
+                            baseName,
+                            out _);
+
+                        string movieFolder =
+                            LibraryDatabaseState.ToFullPath(provider.LibraryPath, relativeDirectory);
+                        string resolvedLeaf = Path.GetFileName(movieFolder);
+
+                        // The file takes the name of the directory it ends up in, so the candidates
+                        // can only be built once the directory is known.
+                        var candidateNames = strmEntries
+                            .Select(entry => Path.GetFileNameWithoutExtension(
+                                BuildMovieStrmFileName(resolvedLeaf, entry.VersionLabel, provider.RegexRemovalPatterns)))
+                            .ToList();
+
+                        var resolvedNames = MovieLibraryPathResolver.ResolveFileNames(
+                            libraryDatabase,
+                            providerId,
+                            stream.StreamId,
+                            relativeDirectory,
+                            candidateNames);
+
+                        for (int entryIndex = 0; entryIndex < strmEntries.Count; entryIndex++)
                         {
-                        string strmPath = Path.Combine(movieFolder, strmFileName);
+                        string streamUrl = strmEntries[entryIndex].StreamUrl;
+                        string resolvedFileName = resolvedNames[entryIndex];
+                        string strmPath = Path.Combine(movieFolder, resolvedFileName + ".strm");
 
                         syncedFiles.TryAdd(strmPath, 0);
 
@@ -2037,6 +2142,10 @@ public partial class StrmSyncService
 
                         if (File.Exists(strmPath))
                         {
+                            AddMovieRowIfMissing(
+                                libraryDatabase, providerId, stream.StreamId, providerTmdbId,
+                                infoError, relativeDirectory, resolvedFileName);
+
                             if (StrmContentMatches(strmPath, streamUrl))
                             {
                                 continue;
@@ -2059,6 +2168,9 @@ public partial class StrmSyncService
                         {
                             await File.WriteAllTextAsync(strmPath, streamUrl, ct).ConfigureAwait(false);
                             anyCreated = true;
+                            AddMovieRowIfMissing(
+                                libraryDatabase, providerId, stream.StreamId, providerTmdbId,
+                                infoError, relativeDirectory, resolvedFileName);
                         }
                         catch (IOException) when (File.Exists(strmPath))
                         {
