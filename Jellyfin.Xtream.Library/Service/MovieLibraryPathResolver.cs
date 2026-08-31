@@ -54,29 +54,82 @@ public static class MovieLibraryPathResolver
         string groupingName,
         IReadOnlyList<string> candidateFileNames)
     {
-        ArgumentNullException.ThrowIfNull(database);
         ArgumentNullException.ThrowIfNull(candidateFileNames);
+
+        string directory = ResolveDirectory(
+            database, providerId, streamId, targetFolder, candidateDirectoryName, providerTmdbId,
+            groupingName, out bool isExisting);
+
+        return new MoviePathPlan(
+            directory,
+            ResolveFileNames(database, providerId, streamId, directory, candidateFileNames),
+            isExisting);
+    }
+
+    /// <summary>
+    /// Resolves only the directory, for callers that must know the directory before they can build
+    /// the file names, because the file name is derived from the directory name.
+    /// </summary>
+    /// <param name="database">The library database state.</param>
+    /// <param name="providerId">The provider the movie belongs to.</param>
+    /// <param name="streamId">The Xtream stream identifier.</param>
+    /// <param name="targetFolder">The folder the movie is mapped into.</param>
+    /// <param name="candidateDirectoryName">The directory name the caller would like to use.</param>
+    /// <param name="providerTmdbId">The TMDB identifier advertised by the provider, or null.</param>
+    /// <param name="groupingName">The sanitized title used for grouping.</param>
+    /// <param name="isExisting">Set to true when the database already knew this stream here.</param>
+    /// <returns>The directory, relative to the library root.</returns>
+    public static string ResolveDirectory(
+        LibraryDatabaseState database,
+        string providerId,
+        int streamId,
+        string targetFolder,
+        string candidateDirectoryName,
+        int? providerTmdbId,
+        string groupingName,
+        out bool isExisting)
+    {
+        ArgumentNullException.ThrowIfNull(database);
 
         string prefix = NormalizeFolder(targetFolder);
 
-        List<MovieDatabaseEntryView> existing = database
+        string? known = database
             .GetMovieEntries(providerId, streamId)
-            .Where(e => IsInFolder(e.DirectoryName, prefix))
-            .Select(e => new MovieDatabaseEntryView(e.DirectoryName, e.FileName))
-            .OrderBy(e => e.FileName, StringComparer.Ordinal)
-            .ToList();
+            .Select(e => e.DirectoryName)
+            .FirstOrDefault(d => IsInFolder(d, prefix));
 
-        bool isExisting = existing.Count > 0;
+        isExisting = known is not null;
 
-        string directory = isExisting
-            ? existing[0].DirectoryName
-            : database.ResolveMovieDirectory(
-                LibraryDatabaseState.BuildMovieGroupKey(providerId, prefix, providerTmdbId, groupingName),
-                Join(prefix, candidateDirectoryName));
+        return known ?? database.ResolveMovieDirectory(
+            LibraryDatabaseState.BuildMovieGroupKey(providerId, prefix, providerTmdbId, groupingName),
+            Join(prefix, candidateDirectoryName));
+    }
+
+    /// <summary>
+    /// Resolves the file names to use inside an already resolved directory.
+    /// </summary>
+    /// <param name="database">The library database state.</param>
+    /// <param name="providerId">The provider the movie belongs to.</param>
+    /// <param name="streamId">The Xtream stream identifier.</param>
+    /// <param name="directory">The resolved directory, relative to the library root.</param>
+    /// <param name="candidateFileNames">The file names the caller would like to use.</param>
+    /// <returns>The resolved file names, in the order of the candidates.</returns>
+    public static IReadOnlyList<string> ResolveFileNames(
+        LibraryDatabaseState database,
+        string providerId,
+        int streamId,
+        string directory,
+        IReadOnlyList<string> candidateFileNames)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+        ArgumentNullException.ThrowIfNull(candidateFileNames);
 
         string[] resolved = new string[candidateFileNames.Count];
-        List<MovieDatabaseEntryView> unclaimed = existing
+        List<string> unclaimed = database
+            .GetMovieEntries(providerId, streamId)
             .Where(e => string.Equals(e.DirectoryName, directory, StringComparison.OrdinalIgnoreCase))
+            .Select(e => e.FileName)
+            .OrderBy(name => name, StringComparer.Ordinal)
             .ToList();
 
         // First pass: a candidate that matches a row of this same stream keeps that row's name,
@@ -84,10 +137,10 @@ public static class MovieLibraryPathResolver
         for (int i = 0; i < candidateFileNames.Count; i++)
         {
             int match = unclaimed.FindIndex(
-                e => string.Equals(e.FileName, candidateFileNames[i], StringComparison.OrdinalIgnoreCase));
+                name => string.Equals(name, candidateFileNames[i], StringComparison.OrdinalIgnoreCase));
             if (match >= 0)
             {
-                resolved[i] = unclaimed[match].FileName;
+                resolved[i] = unclaimed[match];
                 unclaimed.RemoveAt(match);
             }
         }
@@ -99,7 +152,7 @@ public static class MovieLibraryPathResolver
         {
             if (resolved[i] is null)
             {
-                resolved[i] = unclaimed[0].FileName;
+                resolved[i] = unclaimed[0];
                 unclaimed.RemoveAt(0);
             }
         }
@@ -110,7 +163,7 @@ public static class MovieLibraryPathResolver
             resolved[i] ??= database.ClaimMovieFileName(directory, candidateFileNames[i]);
         }
 
-        return new MoviePathPlan(directory, resolved, isExisting);
+        return resolved;
     }
 
     /// <summary>
@@ -151,6 +204,4 @@ public static class MovieLibraryPathResolver
         string parent = slash < 0 ? string.Empty : directory[..slash];
         return string.Equals(parent, folder, StringComparison.OrdinalIgnoreCase);
     }
-
-    private sealed record MovieDatabaseEntryView(string DirectoryName, string FileName);
 }
