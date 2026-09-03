@@ -437,10 +437,14 @@ public static class NfoWriter
             yield break;
         }
 
+        // Deduplicated case-insensitively: when NFO fields are merged from several
+        // provider "versions" of the same title, the same actor/genre/country can
+        // legitimately show up more than once across the merged sources.
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var part in csv.Split(','))
         {
             var trimmed = part.Trim();
-            if (trimmed.Length > 0)
+            if (trimmed.Length > 0 && seen.Add(trimmed))
             {
                 yield return trimmed;
             }

@@ -827,6 +827,153 @@ public class StrmSyncServiceTests
 
     #endregion
 
+    #region CleanupOrphanedDirectory Tests
+
+    [Fact]
+    public void CleanupOrphanedDirectory_EmptyDirectory_DeletesIt()
+    {
+        var tempDir = GetResolvedTempPath();
+        var subDir = Path.Combine(tempDir, "sub");
+        Directory.CreateDirectory(subDir);
+        var result = new SyncResult();
+
+        StrmSyncService.CleanupOrphanedDirectory(subDir, tempDir, tempDir, result);
+
+        Directory.Exists(subDir).Should().BeFalse();
+        Directory.Exists(tempDir).Should().BeTrue();
+
+        // Cleanup
+        Directory.Delete(tempDir, true);
+    }
+
+    [Fact]
+    public void CleanupOrphanedDirectory_StopsAtBasePath()
+    {
+        var tempDir = GetResolvedTempPath();
+        var result = new SyncResult();
+
+        StrmSyncService.CleanupOrphanedDirectory(tempDir, tempDir, tempDir, result);
+
+        Directory.Exists(tempDir).Should().BeTrue();
+
+        // Cleanup
+        Directory.Delete(tempDir);
+    }
+
+    [Fact]
+    public void CleanupOrphanedDirectory_LeftoverNonStrmFiles_RemovesDirectoryAndContent()
+    {
+        // A movie folder can end up with only leftover metadata (NFO/poster) once its last
+        // .strm was deleted as an orphan. That leftover content should not keep the folder
+        // around forever: the whole folder is orphaned and should be removed with it.
+        var tempDir = GetResolvedTempPath();
+        var subDir = Path.Combine(tempDir, "sub");
+        Directory.CreateDirectory(subDir);
+        File.WriteAllText(Path.Combine(subDir, "movie.nfo"), "<movie></movie>");
+        File.WriteAllText(Path.Combine(subDir, "poster.jpg"), "fake-image-bytes");
+        var result = new SyncResult();
+
+        StrmSyncService.CleanupOrphanedDirectory(subDir, tempDir, tempDir, result);
+
+        Directory.Exists(subDir).Should().BeFalse();
+
+        // Cleanup
+        Directory.Delete(tempDir, true);
+    }
+
+    [Fact]
+    public void CleanupOrphanedDirectory_ContainsStrmFile_KeepsDirectoryAndContent()
+    {
+        var tempDir = GetResolvedTempPath();
+        var subDir = Path.Combine(tempDir, "sub");
+        Directory.CreateDirectory(subDir);
+        File.WriteAllText(Path.Combine(subDir, "movie.strm"), "http://example.com/stream");
+        var result = new SyncResult();
+
+        StrmSyncService.CleanupOrphanedDirectory(subDir, tempDir, tempDir, result);
+
+        Directory.Exists(subDir).Should().BeTrue();
+        File.Exists(Path.Combine(subDir, "movie.strm")).Should().BeTrue();
+
+        // Cleanup
+        Directory.Delete(tempDir, true);
+    }
+
+    [Fact]
+    public void CleanupOrphanedDirectory_NestedEmptyDirs_DeletesAll()
+    {
+        var tempDir = GetResolvedTempPath();
+        var level1 = Path.Combine(tempDir, "level1");
+        var level2 = Path.Combine(level1, "level2");
+        var level3 = Path.Combine(level2, "level3");
+        Directory.CreateDirectory(level3);
+        var result = new SyncResult();
+
+        StrmSyncService.CleanupOrphanedDirectory(level3, tempDir, tempDir, result);
+
+        Directory.Exists(level3).Should().BeFalse();
+        Directory.Exists(level2).Should().BeFalse();
+        Directory.Exists(level1).Should().BeFalse();
+        Directory.Exists(tempDir).Should().BeTrue();
+
+        // Cleanup
+        Directory.Delete(tempDir);
+    }
+
+    [Fact]
+    public void CleanupOrphanedDirectory_TracksSeriesDeleted_EvenWithLeftoverFiles()
+    {
+        var tempDir = GetResolvedTempPath();
+        var seriesDir = Path.Combine(tempDir, "Series");
+        var showDir = Path.Combine(seriesDir, "Test Show (2024)");
+        var seasonDir = Path.Combine(showDir, "Season 1");
+        Directory.CreateDirectory(seasonDir);
+        // A leftover tvshow.nfo with no .strm anywhere under seriesDir no longer protects it.
+        File.WriteAllText(Path.Combine(seriesDir, "tvshow.nfo"), "<tvshow></tvshow>");
+        var result = new SyncResult();
+
+        // Clean up from season folder (simulating last episode deleted)
+        StrmSyncService.CleanupOrphanedDirectory(seasonDir, tempDir, seriesDir, result);
+
+        Directory.Exists(seasonDir).Should().BeFalse();
+        Directory.Exists(showDir).Should().BeFalse();
+        Directory.Exists(seriesDir).Should().BeFalse();
+        result.SeasonsDeleted.Should().Be(1);
+        result.SeriesDeleted.Should().Be(1);
+
+        // Cleanup
+        Directory.Delete(tempDir, true);
+    }
+
+    [Fact]
+    public void CleanupOrphanedDirectory_TracksOnlySeasonDeleted_WhenOtherSeasonHasStrm()
+    {
+        var tempDir = GetResolvedTempPath();
+        var seriesDir = Path.Combine(tempDir, "Series");
+        var showDir = Path.Combine(seriesDir, "Test Show (2024)");
+        var season1Dir = Path.Combine(showDir, "Season 1");
+        var season2Dir = Path.Combine(showDir, "Season 2");
+        Directory.CreateDirectory(season1Dir);
+        Directory.CreateDirectory(season2Dir);
+        // Season 2 still has a real episode, so the show/series folders must survive
+        File.WriteAllText(Path.Combine(season2Dir, "episode.strm"), "url");
+        var result = new SyncResult();
+
+        // Clean up Season 1 (empty)
+        StrmSyncService.CleanupOrphanedDirectory(season1Dir, tempDir, seriesDir, result);
+
+        Directory.Exists(season1Dir).Should().BeFalse();
+        Directory.Exists(showDir).Should().BeTrue();
+        Directory.Exists(season2Dir).Should().BeTrue();
+        result.SeasonsDeleted.Should().Be(1);
+        result.SeriesDeleted.Should().Be(0);
+
+        // Cleanup
+        Directory.Delete(tempDir, true);
+    }
+
+    #endregion
+
     #region ParseFolderMappings Tests
 
     [Fact]

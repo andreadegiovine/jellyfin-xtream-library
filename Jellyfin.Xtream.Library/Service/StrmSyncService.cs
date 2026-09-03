@@ -19,8 +19,10 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
@@ -1207,8 +1209,9 @@ public partial class StrmSyncService
 
                     _logger.LogDebug("Deleted orphaned file: {FilePath}", orphan);
 
-                    // Try to clean up empty parent directories
-                    CleanupEmptyDirectories(Path.GetDirectoryName(orphan)!, provider.LibraryPath, seriesPath, result);
+                    // Clean up parent directories that no longer hold any STRM file,
+                    // including any leftover NFO/artwork that would otherwise be orphaned.
+                    CleanupOrphanedDirectory(Path.GetDirectoryName(orphan)!, provider.LibraryPath, seriesPath, result);
                 }
                 catch (Exception ex)
                 {
@@ -1860,25 +1863,49 @@ public partial class StrmSyncService
             CurrentProgress.MoviePhase = $"Syncing Movies (batch {batchIndex + 1}/{totalBatches})";
             CurrentProgress.AddTotalItems(batchMovies.Count);
 
-            // Process movies in this batch
+            // Group streams that resolve to the same movie (multiple provider "versions"
+            // sharing the same sanitized title/year) so their STRM files and the single
+            // shared NFO are written by one task instead of racing across N parallel tasks
+            // that would all target the exact same nfoPath (see issue #90).
+            var movieGroups = batchMovies
+                .GroupBy(
+                    m =>
+                    {
+                        string groupMovieName = SanitizeFileName(m.Stream.Name, provider.CustomTitleRemoveTerms);
+                        int? groupYear = ExtractYear(m.Stream.Name);
+                        return groupYear.HasValue ? $"{groupMovieName} ({groupYear})" : groupMovieName;
+                    },
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.ToList())
+                .ToList();
+
+            // Process movies in this batch, one task per movie (i.e. per group of versions)
             await Parallel.ForEachAsync(
-                batchMovies,
+                movieGroups,
                 new ParallelOptions
                 {
                     MaxDegreeOfParallelism = parallelism,
                     CancellationToken = cancellationToken,
                 },
-                async (movieEntry, ct) =>
+                async (movieGroup, ct) =>
                 {
-                var stream = movieEntry.Stream;
-                var categoryIds = movieEntry.CategoryIds;
+                // Representative stream for naming/logging; category membership and metadata
+                // below are aggregated across every stream in the group, not just this one.
+                var stream = movieGroup[0].Stream;
+                var categoryIds = new HashSet<int>();
+                foreach (var groupMember in movieGroup)
+                {
+                    foreach (var categoryId in groupMember.CategoryIds)
+                    {
+                        categoryIds.Add(categoryId);
+                    }
+                }
 
                 try
                 {
                     string movieName = SanitizeFileName(stream.Name, provider.CustomTitleRemoveTerms);
                     int? year = ExtractYear(stream.Name);
                     string baseName = year.HasValue ? $"{movieName} ({year})" : movieName;
-                    string? versionLabel = ExtractVersionLabel(stream.Name);
 
                     CurrentProgress.MoviePhase = $"Syncing Movies (batch {batchIndex + 1}/{totalBatches}): {baseName}";
 
@@ -1914,10 +1941,15 @@ public partial class StrmSyncService
                     }
 
                     // If folder exists, use existing name and skip API calls
-                    VodInfoResponse? vodInfo = null;
                     int? providerTmdbId = null;
                     int? autoLookupTmdbId = null;
                     string folderName;
+
+                    // VOD info collected per stream_id across the whole group. Populated here
+                    // (when metadata lookup fetches it for the TMDB id) and topped up later,
+                    // right before the merged NFO is written, for any group member not yet
+                    // fetched (e.g. when metadata lookup is off but proactive media info is on).
+                    var groupVodInfo = new Dictionary<int, VodInfoResponse?>();
 
                     if (existingFolderName != null)
                     {
@@ -1925,28 +1957,39 @@ public partial class StrmSyncService
                     }
                     else
                     {
-                        // New movie - get provider TMDB ID from pre-fetched cache
+                        // New movie - get provider TMDB ID, trying every stream in the group
+                        // (not just one) since different provider "versions" of the same movie
+                        // can carry different, and differently complete, metadata.
                         if (enableMetadataLookup && !tmdbOverrides.ContainsKey(baseName))
                         {
-                            if (vodInfoCache.TryGetValue(stream.StreamId, out var cachedInfo))
+                            foreach (var groupMember in movieGroup)
                             {
-                                vodInfo = cachedInfo;
-                            }
-                            else
-                            {
-                                try
+                                VodInfoResponse? memberVodInfo;
+                                if (vodInfoCache.TryGetValue(groupMember.Stream.StreamId, out var cachedInfo))
                                 {
-                                    vodInfo = await _client.GetVodInfoAsync(connectionInfo, stream.StreamId, ct).ConfigureAwait(false);
+                                    memberVodInfo = cachedInfo;
                                 }
-                                catch (Exception ex)
+                                else
                                 {
-                                    _logger.LogDebug(ex, "Failed to fetch VOD info for provider TMDB: {StreamId}", stream.StreamId);
+                                    try
+                                    {
+                                        memberVodInfo = await _client.GetVodInfoAsync(connectionInfo, groupMember.Stream.StreamId, ct).ConfigureAwait(false);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        _logger.LogWarning(ex, "Failed to fetch VOD info for provider TMDB: {StreamId} ({MovieName})", groupMember.Stream.StreamId, baseName);
+                                        memberVodInfo = null;
+                                    }
                                 }
-                            }
 
-                            if (!string.IsNullOrEmpty(vodInfo?.Info?.TmdbId) && int.TryParse(vodInfo.Info.TmdbId, out int tmdbParsed))
-                            {
-                                providerTmdbId = tmdbParsed;
+                                groupVodInfo[groupMember.Stream.StreamId] = memberVodInfo;
+
+                                if (!providerTmdbId.HasValue &&
+                                    !string.IsNullOrEmpty(memberVodInfo?.Info?.TmdbId) &&
+                                    int.TryParse(memberVodInfo.Info.TmdbId, out int tmdbParsed))
+                                {
+                                    providerTmdbId = tmdbParsed;
+                                }
                             }
                         }
 
@@ -1975,26 +2018,36 @@ public partial class StrmSyncService
                         folderName = BuildMovieFolderName(movieName, year, tmdbOverrides, providerTmdbId, autoLookupTmdbId);
                     }
 
-                    // Build STRM URLs and filenames — Dispatcharr multi-stream or standard single-stream
-                    var strmEntries = new List<(string StreamUrl, string StrmFileName)>();
-                    if (enableDispatcharrMode &&
-                        dispatcharrCache.TryGetValue(stream.StreamId, out var movieProviderInfo))
+                    // Build STRM URLs and filenames for every stream in the group — Dispatcharr
+                    // multi-stream or standard single-stream — once, before touching any folder.
+                    var memberStrmEntries = new List<(StreamInfo Stream, List<(string StreamUrl, string StrmFileName)> Entries)>();
+                    foreach (var groupMember in movieGroup)
                     {
-                        var providers = movieProviderInfo.Providers;
-                        string uuid = movieProviderInfo.Uuid;
-                        for (int i = 0; i < providers.Count; i++)
+                        var memberStream = groupMember.Stream;
+                        var strmEntries = new List<(string StreamUrl, string StrmFileName)>();
+
+                        if (enableDispatcharrMode &&
+                            dispatcharrCache.TryGetValue(memberStream.StreamId, out var movieProviderInfo))
                         {
-                            string providerStreamUrl = $"{connectionInfo.BaseUrl}/proxy/vod/movie/{uuid}?stream_id={providers[i].StreamId}";
-                            string strmFileName = BuildMovieStrmFileName(folderName, i == 0 ? null : $"Version {i + 1}", provider.RegexRemovalPatterns);
-                            strmEntries.Add((providerStreamUrl, strmFileName));
+                            var providers = movieProviderInfo.Providers;
+                            string uuid = movieProviderInfo.Uuid;
+                            for (int i = 0; i < providers.Count; i++)
+                            {
+                                string providerStreamUrl = $"{connectionInfo.BaseUrl}/proxy/vod/movie/{uuid}?stream_id={providers[i].StreamId}";
+                                string strmFileName = BuildMovieStrmFileName(folderName, i == 0 ? null : $"Version {i + 1}", provider.RegexRemovalPatterns);
+                                strmEntries.Add((providerStreamUrl, strmFileName));
+                            }
                         }
-                    }
-                    else
-                    {
-                        string extension = string.IsNullOrEmpty(stream.ContainerExtension) ? "mp4" : stream.ContainerExtension;
-                        string streamUrl = $"{connectionInfo.BaseUrl}/movie/{connectionInfo.UserName}/{connectionInfo.Password}/{stream.StreamId}.{extension}";
-                        string strmFileName = BuildMovieStrmFileName(folderName, versionLabel, provider.RegexRemovalPatterns);
-                        strmEntries.Add((streamUrl, strmFileName));
+                        else
+                        {
+                            string? memberVersionLabel = ExtractVersionLabel(memberStream.Name);
+                            string extension = string.IsNullOrEmpty(memberStream.ContainerExtension) ? "mp4" : memberStream.ContainerExtension;
+                            string streamUrl = $"{connectionInfo.BaseUrl}/movie/{connectionInfo.UserName}/{connectionInfo.Password}/{memberStream.StreamId}.{extension}";
+                            string strmFileName = BuildMovieStrmFileName(folderName, memberVersionLabel, provider.RegexRemovalPatterns);
+                            strmEntries.Add((streamUrl, strmFileName));
+                        }
+
+                        memberStrmEntries.Add((memberStream, strmEntries));
                     }
 
                     bool anyCreated = false;
@@ -2002,8 +2055,12 @@ public partial class StrmSyncService
                     bool allSkipped = true;
                     string? firstPosterPath = null;
                     string? firstTargetFolder = targetFolders.Count > 0 ? targetFolders.First() : null;
+                    string firstMovieBasePath = string.IsNullOrEmpty(firstTargetFolder)
+                        ? moviesPath
+                        : Path.Combine(moviesPath, firstTargetFolder);
+                    string firstMovieFolder = Path.Combine(firstMovieBasePath, folderName);
 
-                    // Sync to each target folder
+                    // Sync every version to each target folder
                     foreach (var targetFolder in targetFolders)
                     {
                         string movieBasePath = string.IsNullOrEmpty(targetFolder)
@@ -2011,6 +2068,8 @@ public partial class StrmSyncService
                             : Path.Combine(moviesPath, targetFolder);
                         string movieFolder = Path.Combine(movieBasePath, folderName);
 
+                        foreach (var (memberStream, strmEntries) in memberStrmEntries)
+                        {
                         foreach (var (streamUrl, strmFileName) in strmEntries)
                         {
                         string strmPath = Path.Combine(movieFolder, strmFileName);
@@ -2031,7 +2090,7 @@ public partial class StrmSyncService
                                 "STRM name collision for movie {MovieName}: {Path} was already claimed by another stream in this run; refusing to overwrite it with stream {StreamId}",
                                 baseName,
                                 strmPath,
-                                stream.StreamId);
+                                memberStream.StreamId);
                             continue;
                         }
 
@@ -2077,71 +2136,29 @@ public partial class StrmSyncService
 
                         _logger.LogDebug("Created movie STRM: {StrmPath}", strmPath);
                         } // end strmEntries foreach
+                        } // end memberStrmEntries foreach
 
-                        // Write NFO with provider ID and/or media info (only for first target folder)
-                        if (anyCreated && firstTargetFolder == targetFolder)
-                        {
-                            int? effectiveTmdbId = tmdbOverrides.TryGetValue(baseName, out int overrideTmdbId)
-                                ? overrideTmdbId
-                                : (providerTmdbId ?? autoLookupTmdbId);
-
-                            VideoInfo? nfoVideo = null;
-                            AudioInfo? nfoAudio = null;
-                            int? nfoDurationSecs = null;
-
-                            if (enableProactiveMediaInfo)
-                            {
-                                try
-                                {
-                                    // Reuse vodInfo if already fetched, otherwise fetch now
-                                    if (vodInfo == null)
-                                    {
-                                        vodInfo = await _client.GetVodInfoAsync(connectionInfo, stream.StreamId, ct)
-                                            .ConfigureAwait(false);
-                                    }
-
-                                    nfoVideo = vodInfo?.Info?.Video;
-                                    nfoAudio = vodInfo?.Info?.Audio;
-                                    nfoDurationSecs = vodInfo?.Info?.DurationSecs;
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogDebug(ex, "Failed to fetch VOD info for NFO: {StreamId}", stream.StreamId);
-                                }
-                            }
-
-                            var nfoPath = Path.Combine(movieFolder, $"{folderName}.nfo");
-                            await NfoWriter.WriteMovieNfoAsync(
-                                nfoPath,
-                                movieName,
-                                nfoVideo,
-                                nfoAudio,
-                                nfoDurationSecs,
-                                effectiveTmdbId,
-                                year,
-                                ct,
-                                plot: vodInfo?.Info?.Plot,
-                                genre: vodInfo?.Info?.Genre,
-                                director: vodInfo?.Info?.Director,
-                                cast: vodInfo?.Info?.Cast,
-                                country: vodInfo?.Info?.Country,
-                                rating: vodInfo?.Info?.Rating,
-                                premiered: vodInfo?.Info?.ReleaseDate,
-                                youtubeTrailerId: vodInfo?.Info?.YoutubeTrailer,
-                                dateAdded: AddedDateParser.Parse(stream.Added),
-                                posterUrl: vodInfo?.Info?.MovieImage ?? stream.StreamIcon,
-                                backdropUrl: vodInfo?.Info?.BackdropPaths.FirstOrDefault()).ConfigureAwait(false);
-                        }
-
-                        // Download artwork for unmatched movies (only for first target folder)
+                        // Download artwork for unmatched movies (only for first target folder),
+                        // trying every version's icon in turn until one downloads successfully.
                         if (firstTargetFolder == targetFolder &&
                             !providerTmdbId.HasValue && !autoLookupTmdbId.HasValue && !tmdbOverrides.ContainsKey(baseName) &&
-                            provider.DownloadArtworkForUnmatched && !string.IsNullOrEmpty(stream.StreamIcon))
+                            provider.DownloadArtworkForUnmatched)
                         {
-                            var posterExt = GetImageExtension(stream.StreamIcon);
-                            var posterPath = Path.Combine(movieFolder, $"poster{posterExt}");
-                            await DownloadImageAsync(stream.StreamIcon, posterPath, ct).ConfigureAwait(false);
-                            firstPosterPath = posterPath;
+                            foreach (var groupMember in movieGroup)
+                            {
+                                if (string.IsNullOrEmpty(groupMember.Stream.StreamIcon))
+                                {
+                                    continue;
+                                }
+
+                                var posterExt = GetImageExtension(groupMember.Stream.StreamIcon);
+                                var posterPath = Path.Combine(movieFolder, $"poster{posterExt}");
+                                if (await DownloadImageAsync(groupMember.Stream.StreamIcon, posterPath, ct).ConfigureAwait(false))
+                                {
+                                    firstPosterPath = posterPath;
+                                    break;
+                                }
+                            }
                         }
 
                         // Copy artwork to additional folders
@@ -2160,6 +2177,89 @@ public partial class StrmSyncService
                         }
                     }
 
+                    // Write a single, merged NFO for the whole group (only when at least one
+                    // version's STRM was newly created — updating an existing NFO on later runs
+                    // is intentionally out of scope here, see the sync notes for this fix).
+                    if (anyCreated)
+                    {
+                        // Top up VOD info for every group member so the merge below has as much
+                        // data as possible, even when metadata lookup was off (proactive media
+                        // info alone can still justify a fetch, matching the prior single-stream
+                        // behavior for that setting).
+                        var groupInfos = new List<VodInfoDetails>();
+                        foreach (var groupMember in movieGroup)
+                        {
+                            VodInfoResponse? memberVodInfo = groupVodInfo.TryGetValue(groupMember.Stream.StreamId, out var existingInfo)
+                                ? existingInfo
+                                : null;
+
+                            if (memberVodInfo == null && enableProactiveMediaInfo)
+                            {
+                                try
+                                {
+                                    memberVodInfo = await _client.GetVodInfoAsync(connectionInfo, groupMember.Stream.StreamId, ct).ConfigureAwait(false);
+                                    groupVodInfo[groupMember.Stream.StreamId] = memberVodInfo;
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "Failed to fetch VOD info for NFO: {StreamId} ({MovieName})", groupMember.Stream.StreamId, baseName);
+                                }
+                            }
+
+                            if (memberVodInfo?.Info != null)
+                            {
+                                groupInfos.Add(memberVodInfo.Info);
+                            }
+                        }
+
+                        var merged = MergeMovieInfo(groupInfos);
+
+                        int? effectiveTmdbId = tmdbOverrides.TryGetValue(baseName, out int overrideTmdbId)
+                            ? overrideTmdbId
+                            : (providerTmdbId ?? autoLookupTmdbId ?? ParseTmdbId(merged?.TmdbId));
+
+                        // Oldest catalog "added" date across every version, per user preference:
+                        // it reflects when the movie first entered the library, not the last time
+                        // a new version showed up.
+                        var groupAddedDates = movieGroup
+                            .Select(m => AddedDateParser.Parse(m.Stream.Added))
+                            .Where(d => d.HasValue)
+                            .Select(d => d!.Value)
+                            .ToList();
+                        DateTime? dateAdded = groupAddedDates.Count > 0 ? groupAddedDates.Min() : null;
+
+                        // Validate image URLs before writing them: richest merged candidate
+                        // first, falling back to each version's own icon; omit the node entirely
+                        // if nothing resolves.
+                        var posterCandidates = new List<string?> { merged?.MovieImage };
+                        posterCandidates.AddRange(movieGroup.Select(m => m.Stream.StreamIcon));
+                        string? validPosterUrl = await FirstValidImageUrlAsync(posterCandidates, ct).ConfigureAwait(false);
+                        string? validBackdropUrl = await FirstValidImageUrlAsync(merged?.BackdropPaths, ct).ConfigureAwait(false);
+
+                        var nfoPath = Path.Combine(firstMovieFolder, $"{folderName}.nfo");
+                        Directory.CreateDirectory(firstMovieFolder);
+                        await NfoWriter.WriteMovieNfoAsync(
+                            nfoPath,
+                            movieName,
+                            merged?.Video,
+                            merged?.Audio,
+                            merged?.DurationSecs,
+                            effectiveTmdbId,
+                            year,
+                            ct,
+                            plot: merged?.Plot,
+                            genre: merged?.Genre,
+                            director: merged?.Director,
+                            cast: merged?.Cast,
+                            country: merged?.Country,
+                            rating: merged?.Rating,
+                            premiered: merged?.ReleaseDate,
+                            youtubeTrailerId: merged?.YoutubeTrailer,
+                            dateAdded: dateAdded,
+                            posterUrl: validPosterUrl,
+                            backdropUrl: validBackdropUrl).ConfigureAwait(false);
+                    }
+
                     if (anyCreated)
                     {
                         Interlocked.Increment(ref moviesCreated);
@@ -2175,7 +2275,7 @@ public partial class StrmSyncService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to create STRM for movie: {MovieName}", stream.Name);
+                    _logger.LogWarning(ex, "Failed to create STRM for movie: {MovieName} ({VersionCount} version(s))", stream.Name, movieGroup.Count);
                     Interlocked.Increment(ref errors);
                     Interlocked.Increment(ref moviesSkipped);
                     failedItems.Add(new FailedItem
@@ -2188,7 +2288,7 @@ public partial class StrmSyncService
                 }
                 finally
                 {
-                    CurrentProgress.IncrementItemsProcessed();
+                    CurrentProgress.IncrementItemsProcessed(movieGroup.Count);
                     CurrentProgress.MoviesCreated = moviesCreated;
                     CurrentProgress.MoviesUpdated = moviesUpdated;
                 }
@@ -3892,6 +3992,73 @@ public partial class StrmSyncService
         }
     }
 
+    /// <summary>
+    /// Walks up from a directory, removing each level as long as it contains no
+    /// <c>.strm</c> file anywhere underneath it. Unlike <see cref="CleanupEmptyDirectories"/>,
+    /// the directory does not need to be completely empty: once every STRM file it held has
+    /// been deleted as an orphan, any NFO/artwork left behind is orphaned too and is removed
+    /// (recursively) along with it.
+    /// </summary>
+    /// <param name="directory">The directory to start cleaning up from.</param>
+    /// <param name="stopAt">The directory at which to stop walking upward (exclusive).</param>
+    /// <param name="seriesPath">The root series path, used to identify series-level folders for result tracking.</param>
+    /// <param name="result">The sync result to update with deletion counts.</param>
+    internal static void CleanupOrphanedDirectory(string directory, string stopAt, string seriesPath, SyncResult result)
+    {
+        while (!string.IsNullOrEmpty(directory) &&
+               !directory.Equals(stopAt, StringComparison.OrdinalIgnoreCase) &&
+               Directory.Exists(directory))
+        {
+            bool hasStrmFiles;
+            try
+            {
+                hasStrmFiles = Directory.EnumerateFiles(directory, "*.strm", SearchOption.AllDirectories).Any();
+            }
+            catch
+            {
+                break;
+            }
+
+            if (hasStrmFiles)
+            {
+                break;
+            }
+
+            string? parentDir = Path.GetDirectoryName(directory);
+            string folderName = Path.GetFileName(directory);
+
+            try
+            {
+                // Check if this is a season folder (starts with "Season ")
+                bool isSeasonFolder = parentDir != null &&
+                    folderName.StartsWith("Season ", StringComparison.OrdinalIgnoreCase);
+
+                // Series folder: direct child of seriesPath (Single mode)
+                // or child of a subfolder under seriesPath (Multiple mode)
+                bool isSeriesFolder = parentDir != null &&
+                    (parentDir.Equals(seriesPath, StringComparison.OrdinalIgnoreCase) ||
+                     Path.GetDirectoryName(parentDir)?.Equals(seriesPath, StringComparison.OrdinalIgnoreCase) == true);
+
+                Directory.Delete(directory, recursive: true);
+
+                if (isSeasonFolder)
+                {
+                    result.SeasonsDeleted++;
+                }
+                else if (isSeriesFolder)
+                {
+                    result.SeriesDeleted++;
+                }
+
+                directory = parentDir!;
+            }
+            catch
+            {
+                break;
+            }
+        }
+    }
+
     private Task TriggerLibraryScanAsync()
     {
         // Use the library manager to trigger a scan
@@ -3969,6 +4136,141 @@ public partial class StrmSyncService
             ".gif" => ".gif",
             _ => ".jpg"
         };
+    }
+
+    /// <summary>
+    /// Returns the first candidate URL that resolves to a reachable image, in order,
+    /// skipping blank/duplicate/unreachable candidates. Returns null (so the caller omits
+    /// the NFO node entirely) when none of the candidates validate.
+    /// </summary>
+    private async Task<string?> FirstValidImageUrlAsync(IEnumerable<string?>? candidates, CancellationToken cancellationToken)
+    {
+        if (candidates == null)
+        {
+            return null;
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate) || !seen.Add(candidate))
+            {
+                continue;
+            }
+
+            if (await IsImageUrlValidAsync(candidate, cancellationToken).ConfigureAwait(false))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Checks that an image URL is reachable without downloading the whole file: tries
+    /// HEAD first, and falls back to a headers-only GET for hosts that reject HEAD.
+    /// </summary>
+    private async Task<bool> IsImageUrlValidAsync(string imageUrl, CancellationToken cancellationToken)
+    {
+        if (!Uri.TryCreate(imageUrl, UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var headRequest = new HttpRequestMessage(HttpMethod.Head, uri);
+            using var headResponse = await ImageHttpClient.SendAsync(headRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            if (headResponse.IsSuccessStatusCode)
+            {
+                return true;
+            }
+
+            // Some CDNs reject HEAD even though GET works; retry with a headers-only GET
+            // instead of assuming the image is unreachable.
+            if (headResponse.StatusCode is HttpStatusCode.MethodNotAllowed or HttpStatusCode.Forbidden or HttpStatusCode.NotImplemented)
+            {
+                using var getRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+                using var getResponse = await ImageHttpClient.SendAsync(getRequest, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                return getResponse.IsSuccessStatusCode;
+            }
+
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Image URL validation failed for {Url}", imageUrl);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Merges VOD info from every stream in a movie group into a single, richest-available
+    /// set of fields: the longest non-blank text field wins, backdrops are the union, and
+    /// scalar fields (rating, release date, trailer, tmdb id, duration, video/audio) take
+    /// the first usable value found across the group. Returns null if no member had usable
+    /// info at all.
+    /// </summary>
+    private static VodInfoDetails? MergeMovieInfo(IReadOnlyList<VodInfoDetails> infos)
+    {
+        if (infos.Count == 0)
+        {
+            return null;
+        }
+
+        if (infos.Count == 1)
+        {
+            return infos[0];
+        }
+
+        string? PickLongest(Func<VodInfoDetails, string?> selector) => infos
+            .Select(selector)
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .OrderByDescending(s => s!.Length)
+            .FirstOrDefault();
+
+        string? PickFirst(Func<VodInfoDetails, string?> selector) => infos
+            .Select(selector)
+            .FirstOrDefault(s => !string.IsNullOrWhiteSpace(s));
+
+        var merged = new VodInfoDetails
+        {
+            MovieImage = PickFirst(i => i.MovieImage),
+            TmdbId = PickFirst(i => i.TmdbId),
+            Name = PickFirst(i => i.Name),
+            OriginalName = PickFirst(i => i.OriginalName),
+            Plot = PickLongest(i => i.Plot),
+            Cast = PickLongest(i => i.Cast),
+            Director = PickLongest(i => i.Director),
+            Genre = PickLongest(i => i.Genre),
+            Country = PickLongest(i => i.Country),
+            ReleaseDate = PickFirst(i => i.ReleaseDate),
+            Rating = infos.Select(i => i.Rating).FirstOrDefault(r => decimal.TryParse(r, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed) && parsed > 0),
+            YoutubeTrailer = PickFirst(i => i.YoutubeTrailer),
+            Duration = PickFirst(i => i.Duration),
+            DurationSecs = infos.Select(i => i.DurationSecs).FirstOrDefault(d => d.HasValue && d.Value > 0),
+            Bitrate = infos.Select(i => i.Bitrate).FirstOrDefault(b => b.HasValue && b.Value > 0),
+            Video = infos.Select(i => i.Video).FirstOrDefault(v => v != null && (!string.IsNullOrEmpty(v.CodecName) || v.Width > 0 || v.Height > 0)),
+            Audio = infos.Select(i => i.Audio).FirstOrDefault(a => a != null && (!string.IsNullOrEmpty(a.CodecName) || a.Channels > 0)),
+        };
+
+        merged.BackdropPaths = infos
+            .SelectMany(i => i.BackdropPaths)
+            .Where(b => !string.IsNullOrWhiteSpace(b))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return merged;
+    }
+
+    /// <summary>
+    /// Parses a TMDb id string, returning null instead of throwing on blank/invalid values.
+    /// </summary>
+    private static int? ParseTmdbId(string? tmdbId)
+    {
+        return !string.IsNullOrEmpty(tmdbId) && int.TryParse(tmdbId, out int parsed) ? parsed : null;
     }
 
     [GeneratedRegex(@"\s*\((\d{4})\)\s*$")]
@@ -4297,6 +4599,15 @@ public class SyncProgress
     public void IncrementItemsProcessed()
     {
         Interlocked.Increment(ref _itemsProcessed);
+    }
+
+    /// <summary>
+    /// Atomically adds to the ItemsProcessed counter.
+    /// </summary>
+    /// <param name="count">The number of items to add.</param>
+    public void IncrementItemsProcessed(int count)
+    {
+        Interlocked.Add(ref _itemsProcessed, count);
     }
 
     /// <summary>
