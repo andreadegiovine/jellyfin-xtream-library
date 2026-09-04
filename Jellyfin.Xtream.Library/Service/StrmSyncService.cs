@@ -4213,7 +4213,7 @@ public partial class StrmSyncService
     /// the first usable value found across the group. Returns null if no member had usable
     /// info at all.
     /// </summary>
-    private static VodInfoDetails? MergeMovieInfo(IReadOnlyList<VodInfoDetails> infos)
+    private static VodInfoDetails? MergeMovieInfo(List<VodInfoDetails> infos)
     {
         if (infos.Count == 0)
         {
