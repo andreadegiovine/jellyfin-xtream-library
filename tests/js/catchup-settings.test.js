@@ -79,3 +79,31 @@ test('the setup URLs carry the security warning', () => {
     assert.match(block, /without a Jellyfin login/);
     assert.match(block, /Native Tuner above avoids this/);
 });
+
+test('the Live TV endpoint allow-list is bound and explained', () => {
+    // GitHub #109. Empty means unrestricted, which is what every version so far has done, so the
+    // binding must not coerce a blank value into something else.
+    assert.ok(HTML.includes('id="txtLiveTvEndpointAllowedIps"'), 'config.html has no allow-list field');
+    assert.ok(JS.includes("getElementById('txtLiveTvEndpointAllowedIps')"), 'config.js never binds it');
+    assert.match(JS, /config\.LiveTvEndpointAllowedIps \|\| ''/);
+
+    // The trap is that the operator's own server has to be on the list, because the URL this page
+    // hands out is built from whatever origin the admin is browsing on.
+    const section = HTML.slice(HTML.indexOf('id="txtLiveTvEndpointAllowedIps"'));
+    assert.match(section.slice(0, 1800), /Your own server has to be on the list too/);
+});
+
+test('the Publish Playlists switch is bound and says what needs it', () => {
+    // GitHub #109. Off means LiveTv.m3u and Catchup.m3u answer 404, so a new M3U tuner setup has
+    // to be told to turn it on, and the native tuner user has to be told they do not need it.
+    assert.ok(HTML.includes('id="chkPublishLiveTvPlaylists"'), 'config.html has no switch');
+    const uses = JS.split("getElementById('chkPublishLiveTvPlaylists')").length - 1;
+    assert.ok(uses >= 2, `chkPublishLiveTvPlaylists is bound ${uses} time(s); it needs a load and a save`);
+    assert.match(JS, /config\.PublishLiveTvPlaylists = document\.getElementById\('chkPublishLiveTvPlaylists'\)\.checked/);
+
+    const setup = HTML.slice(HTML.indexOf('Setup URLs'));
+    assert.match(setup, /Only served while <strong>Publish Playlists<\/strong> below is on/);
+    const section = HTML.slice(HTML.indexOf('id="chkPublishLiveTvPlaylists"'));
+    assert.match(section.slice(0, 1500), /Native Tuner does not need it/);
+    assert.match(section.slice(0, 1500), /Dispatcharr mode/);
+});
