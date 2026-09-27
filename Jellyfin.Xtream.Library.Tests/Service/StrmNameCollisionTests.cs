@@ -654,6 +654,51 @@ public class StrmNameCollisionTests : IDisposable
         MovieFolders().Should().Equal("La bella addormentata nel bosco (1959) [tmdbid-10882]");
     }
 
+    [Fact]
+    public async Task TitleSearch_IsGivenTheProvidersReleaseYearAndOriginalTitle()
+    {
+        _client.Setup(c => c.GetVodInfoAsync(It.IsAny<ConnectionInfo>(), 501, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new VodInfoResponse { Info = new VodInfoDetails { ReleaseDate = "2001-10-26", OriginalName = "Thirteen Ghosts" } });
+        TitleSearchFinds(9378);
+
+        await RunMovieSyncAsync(new StreamInfo { StreamId = 501, Name = "13 Geister (2025)", ContainerExtension = "mp4" }).ConfigureAwait(true);
+
+        _lookup.Verify(l => l.LookupMovieTmdbIdAsync("13 Geister", 2025, 2001, "Thirteen Ghosts", It.IsAny<CancellationToken>()), Times.Once());
+    }
+
+    // A movie that failed to match before is on disk without an id. A match found now must not
+    // move it to a new folder: Jellyfin would treat it as a new item and drop its watched state.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AMovieAlreadyOnDiskWithoutAnId_KeepsItsFolderWhenTheLookupNowMatches(bool useShippedDefaults)
+    {
+        var existing = Path.Combine(_libraryPath, "Movies", "13 Geister (2025)");
+        Directory.CreateDirectory(existing);
+        File.WriteAllText(Path.Combine(existing, "13 Geister (2025).strm"), "http://old");
+        _client.Setup(c => c.GetVodInfoAsync(It.IsAny<ConnectionInfo>(), 501, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new VodInfoResponse { Info = new VodInfoDetails { ReleaseDate = "2001-10-26", OriginalName = "Thirteen Ghosts" } });
+        TitleSearchFinds(9378);
+
+        await RunMovieSyncAsync(
+            new[] { new StreamInfo { StreamId = 501, Name = "13 Geister (2025)", ContainerExtension = "mp4" } },
+            useShippedDefaults).ConfigureAwait(true);
+
+        MovieFolders().Select(Path.GetFileName).Should().Equal("13 Geister (2025)");
+    }
+
+    [Fact]
+    public async Task ANewMovie_GetsTheIdTheLookupFound()
+    {
+        _client.Setup(c => c.GetVodInfoAsync(It.IsAny<ConnectionInfo>(), 501, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new VodInfoResponse { Info = new VodInfoDetails { ReleaseDate = "2001-10-26" } });
+        TitleSearchFinds(9378);
+
+        await RunMovieSyncAsync(new StreamInfo { StreamId = 501, Name = "13 Geister (2025)", ContainerExtension = "mp4" }).ConfigureAwait(true);
+
+        MovieFolders().Select(Path.GetFileName).Should().ContainSingle().Which.Should().Contain("tmdbid-9378");
+    }
+
     private string[] MovieFolders()
         => Directory.GetDirectories(Path.Combine(_libraryPath, "Movies")).Select(d => Path.GetFileName(d)!).OrderBy(n => n, StringComparer.Ordinal).ToArray();
 
@@ -664,7 +709,7 @@ public class StrmNameCollisionTests : IDisposable
     private void TitleSearchFinds(int tmdbId)
     {
         _metadataLookup = true;
-        _lookup.Setup(l => l.LookupMovieTmdbIdAsync(It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+        _lookup.Setup(l => l.LookupMovieTmdbIdAsync(It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(tmdbId);
     }
 
