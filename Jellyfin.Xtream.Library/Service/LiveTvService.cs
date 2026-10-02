@@ -1318,7 +1318,8 @@ public class LiveTvService : IDisposable
     /// All other programme child elements (category, rating, credits, icon, etc.) are
     /// preserved verbatim.
     /// </summary>
-    /// <returns>Number of programmes written.</returns>
+    /// <returns>Number of programmes written; zero, with nothing appended, when the document
+    /// could not be read to the end.</returns>
     private int AppendUpstreamProgrammes(
         StringBuilder sb,
         string upstreamXml,
@@ -1327,6 +1328,7 @@ public class LiveTvService : IDisposable
         CancellationToken cancellationToken)
     {
         var written = 0;
+        var startLength = sb.Length;
         var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         // Keep programs that ended up to 1 hour ago to be resilient to timezone/clock skews
         var pastGraceUnix = nowUnix - 3600;
@@ -1382,7 +1384,7 @@ public class LiveTvService : IDisposable
                 {
                     element = (XElement)XNode.ReadFrom(reader);
                 }
-                catch (XmlException ex)
+                catch (XmlException ex) when (reader.ReadState != ReadState.Error)
                 {
                     _logger.LogDebug(ex, "Skipping malformed <programme> in upstream XMLTV");
                     continue;
@@ -1395,7 +1397,12 @@ public class LiveTvService : IDisposable
         }
         catch (XmlException ex)
         {
+            // A reader that hit broken markup is in its error state for good: it does not move on
+            // to the next element, so skipping one programme and carrying on would read the same
+            // spot forever. The whole document goes to the fallback instead, and what was already
+            // appended comes out again, or the fallback would list those programmes twice.
             _logger.LogWarning(ex, "Failed to parse upstream XMLTV; falling back to JSON EPG");
+            sb.Length = startLength;
             return 0;
         }
 
