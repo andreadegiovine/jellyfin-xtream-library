@@ -188,11 +188,11 @@ Once enabled, go to **Dashboard → Live TV** in Jellyfin — the Xtream Library
 /config/xtream-library/
 ├── Movies/
 │   ├── The Matrix (1999) [tmdbid-603]/
-│   │   ├── The Matrix (1999) [tmdbid-603].strm
+│   │   ├── The Matrix (1999) [tmdbid-603] - 12345.strm
 │   │   └── The Matrix (1999) [tmdbid-603].nfo
 │   ├── Kids/                              # Custom subfolder
 │   │   └── Finding Nemo (2003) [tmdbid-12]/
-│   │       └── Finding Nemo (2003) [tmdbid-12].strm
+│   │       └── Finding Nemo (2003) [tmdbid-12] - 6789.strm
 │   └── ...
 └── Series/
     ├── Breaking Bad (2008) [tvdbid-81189]/

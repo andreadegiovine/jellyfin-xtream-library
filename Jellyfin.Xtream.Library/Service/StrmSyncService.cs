@@ -408,7 +408,11 @@ public partial class StrmSyncService
         string folderName = year.HasValue ? $"{movieName} ({year})" : movieName;
         string? versionLabel = ExtractVersionLabel(item.Name);
         string movieFolder = Path.Combine(moviesPath, folderName);
-        string strmFileName = BuildMovieStrmFileName(folderName, versionLabel, provider.RegexRemovalPatterns);
+
+        // Every movie file carries its stream id, same as in the main sync.
+        string strmFileName = AppendStreamIdSuffix(
+            BuildMovieStrmFileName(folderName, versionLabel, provider.RegexRemovalPatterns),
+            item.ItemId);
         string strmPath = Path.Combine(movieFolder, strmFileName);
 
         // Build stream URL using stored item ID (assume mp4 as default extension)
@@ -2155,11 +2159,10 @@ public partial class StrmSyncService
                     int? autoLookupTmdbId = null;
                     string folderName;
 
-                    // True when this stream is a guest in a folder another title named. Its files
-                    // then carry the stream id, so which of the two gets renamed does not depend on
+                    // Every movie file carries its stream id (see AppendStreamIdSuffix), so which
+                    // of several streams sharing a folder gets which file name never depends on
                     // the order the parallel loop happened to run them in, and does not swap over
-                    // between syncs (GitHub #88).
-                    bool joinedGroupFolder = false;
+                    // between syncs (GitHub #88, #142).
                     int? groupOwnerStreamId = null;
 
                     if (existingFolderName != null)
@@ -2226,7 +2229,6 @@ public partial class StrmSyncService
                                 && groupFolders.TryGetValue(existingGroupId.Value, out var recordedGroup)
                                 && string.Equals(recordedGroup.FolderName, folderName, StringComparison.OrdinalIgnoreCase))
                             {
-                                joinedGroupFolder = recordedGroup.OwnerStreamId != stream.StreamId;
                                 groupOwnerStreamId = recordedGroup.OwnerStreamId;
                             }
                         }
@@ -2346,7 +2348,6 @@ public partial class StrmSyncService
                         if (groupByTmdb && groupableTmdbId.HasValue && IsUsableMetadataId(groupableTmdbId.Value))
                         {
                             var group = groupFolders.GetOrAdd(groupableTmdbId.Value, (stream.StreamId, folderName));
-                            joinedGroupFolder = group.OwnerStreamId != stream.StreamId;
                             groupOwnerStreamId = group.OwnerStreamId;
                             folderName = group.FolderName;
                         }
@@ -2403,24 +2404,39 @@ public partial class StrmSyncService
 
                         foreach (var (streamUrl, strmFileName) in strmEntries)
                         {
-                        string strmPath = Path.Combine(movieFolder, strmFileName);
+                        // Every movie file carries its stream id, whether or not the title has a
+                        // TMDB id and whether or not it shares a folder with another stream. Two
+                        // streams with the same title can then never claim the same file name, and
+                        // Jellyfin shows them as versions of one movie (GitHub #142). The owner of a
+                        // group used to keep the plain name; it now has the suffix like everyone else.
+                        string legacyStrmPath = Path.Combine(movieFolder, strmFileName);
+                        string strmPath = Path.Combine(movieFolder, AppendStreamIdSuffix(strmFileName, stream.StreamId));
+
+                        // A library written by an earlier version has this stream's file under the
+                        // plain name. Rename it instead of writing a second copy: the copy would be
+                        // a duplicate version in Jellyfin, and the old file would count as an orphan
+                        // against the safety threshold. Only a file whose URL points at this very
+                        // stream is taken, so a same-titled stream's file is never moved by mistake.
+                        if (!File.Exists(strmPath)
+                            && File.Exists(legacyStrmPath)
+                            && StrmUrlBelongsToSameStream(ReadStrmUrl(legacyStrmPath), streamUrl))
+                        {
+                            try
+                            {
+                                File.Move(legacyStrmPath, strmPath);
+                                syncedFiles.TryAdd(legacyStrmPath, 0);
+                                _logger.LogInformation("Renamed legacy movie STRM {Old} -> {New}", legacyStrmPath, strmPath);
+                            }
+                            catch (IOException)
+                            {
+                                // Another thread/process got there first, carry on with the normal path.
+                            }
+                        }
 
                         // TryAdd fails when another stream in this run already wrote this exact
-                        // path. The name is built from the folder name and the version label only,
-                        // so two streams sharing a title and a quality tag produce the same one.
-                        // Writing anyway would silently replace the other stream's file: the
-                        // File.Exists branch below compares content against a URL that embeds the
-                        // stream id, so it can never match across two streams and always falls
-                        // through to the overwrite. Refuse instead, and count it.
-                        // A guest in someone else's folder takes its file name from that folder, so
-                        // it would collide with the title that named it. That is the feature working,
-                        // not a provider quirk: keep both and tell them apart by stream id. The
-                        // owner keeps the plain name, so neither file is renamed on a later sync.
-                        if (joinedGroupFolder)
-                        {
-                            string groupedName = $"{Path.GetFileNameWithoutExtension(strmFileName)} - {stream.StreamId}{Path.GetExtension(strmFileName)}";
-                            strmPath = Path.Combine(movieFolder, groupedName);
-                        }
+                        // path. With the stream id in the name this can only happen when the same
+                        // stream is written twice. Writing anyway would silently replace the other
+                        // file, so refuse and count it.
 
                         // Only now, once the final name is known. Protecting the pre-rename path
                         // would mark the folder owner's file as still wanted by a guest, so a
@@ -3948,6 +3964,67 @@ public partial class StrmSyncService
         }
 
         return labels.Count > 0 ? string.Join(" ", labels) : null;
+    }
+
+    /// <summary>
+    /// Adds the stream id to a movie STRM file name: <c>Name (2024).strm</c> becomes
+    /// <c>Name (2024) - 123.strm</c>. The suffix is kept intact when the name has to be shortened
+    /// to fit the file system limit.
+    /// </summary>
+    /// <param name="strmFileName">File name with the .strm extension.</param>
+    /// <param name="streamId">The provider stream id.</param>
+    /// <returns>The file name with the stream id suffix.</returns>
+    internal static string AppendStreamIdSuffix(string strmFileName, int streamId)
+    {
+        string extension = Path.GetExtension(strmFileName);
+        string stem = Path.GetFileNameWithoutExtension(strmFileName);
+        string suffix = $" - {streamId.ToString(CultureInfo.InvariantCulture)}";
+
+        int stemBudget = MaxFileNameBytes - Encoding.UTF8.GetByteCount(extension) - Encoding.UTF8.GetByteCount(suffix);
+        if (stemBudget > 0 && Encoding.UTF8.GetByteCount(stem) > stemBudget)
+        {
+            string shortened = TruncateToUtf8Bytes(stem, stemBudget).TrimEnd(' ', '-', '_', '.');
+            stem = shortened.Length > 0 ? shortened : TruncateToUtf8Bytes(stem, stemBudget);
+        }
+
+        return stem + suffix + extension;
+    }
+
+    /// <summary>
+    /// Whether an existing STRM file's URL points at the same provider stream as the URL about to
+    /// be written. Compares the stream id, not the whole URL, so a changed host, credential or
+    /// container extension does not stop a legacy file from being recognised.
+    /// </summary>
+    /// <param name="existingUrl">URL read from the existing file, or null.</param>
+    /// <param name="expectedUrl">URL this run would write.</param>
+    /// <returns>True when both reference the same stream id.</returns>
+    internal static bool StrmUrlBelongsToSameStream(string? existingUrl, string expectedUrl)
+    {
+        if (string.IsNullOrEmpty(existingUrl))
+        {
+            return false;
+        }
+
+        if (string.Equals(existingUrl, expectedUrl, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        int? existingId = ExtractStreamIdFromStrmUrl(existingUrl);
+        return existingId.HasValue && existingId == ExtractStreamIdFromStrmUrl(expectedUrl);
+    }
+
+    private static int? ExtractStreamIdFromStrmUrl(string url)
+    {
+        var match = Regex.Match(
+            url,
+            @"(?:[?&]stream_id=(?<id>\d+)(?:&|$))|(?:/(?<id>\d+)(?:\.[A-Za-z0-9]+)?(?:\?.*)?$)",
+            RegexOptions.CultureInvariant | RegexOptions.ExplicitCapture,
+            TimeSpan.FromSeconds(1));
+
+        return match.Success && int.TryParse(match.Groups["id"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int id)
+            ? id
+            : null;
     }
 
     internal static string BuildMovieStrmFileName(string folderName, string? versionLabel, string? regexRemovalPatterns = null)

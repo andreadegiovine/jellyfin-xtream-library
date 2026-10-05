@@ -124,7 +124,11 @@ public class SnapshotService : IDisposable
             string.Join(",", provider.ExcludedSeriesIds?.OrderBy(id => id) ?? Enumerable.Empty<int>()),
             enableMetadataLookup.ToString(CultureInfo.InvariantCulture),
             provider.TmdbFolderIdOverrides ?? string.Empty,
-            provider.TvdbFolderIdOverrides ?? string.Empty);
+            provider.TvdbFolderIdOverrides ?? string.Empty,
+
+            // Bump when the on-disk file naming scheme changes, so one full sync renames what the
+            // previous scheme wrote. v2: every movie STRM carries "- stream_id" (GitHub #142).
+            "movie-strm-naming-v2");
 
         return ComputeMd5(data);
     }

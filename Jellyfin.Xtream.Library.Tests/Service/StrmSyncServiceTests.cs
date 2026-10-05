@@ -1241,6 +1241,41 @@ public class StrmSyncServiceTests
 
     #endregion
 
+    #region Stream id suffix (GitHub #142)
+
+    [Fact]
+    public void AppendStreamIdSuffix_AddsTheIdBeforeTheExtension()
+    {
+        StrmSyncService.AppendStreamIdSuffix("Movie (2024).strm", 123).Should().Be("Movie (2024) - 123.strm");
+        StrmSyncService.AppendStreamIdSuffix("Movie (2024) - FHD.strm", 123).Should().Be("Movie (2024) - FHD - 123.strm");
+    }
+
+    [Fact]
+    public void AppendStreamIdSuffix_ShortensTheNameNotTheSuffix()
+    {
+        var longName = new string('a', 300) + ".strm";
+
+        var result = StrmSyncService.AppendStreamIdSuffix(longName, 987654);
+
+        result.Should().EndWith(" - 987654.strm");
+        System.Text.Encoding.UTF8.GetByteCount(result).Should().BeLessThanOrEqualTo(StrmSyncService.MaxFileNameBytes);
+    }
+
+    [Theory]
+    [InlineData("http://a.test/movie/u/p/100.mp4", "http://b.test/movie/x/y/100.mkv", true)]
+    [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test/movie/u/p/100.mp4", true)]
+    [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test/movie/u/p/200.mp4", false)]
+    [InlineData("http://d.test/proxy/vod/movie/abc?stream_id=7", "http://d.test/proxy/vod/movie/abc?stream_id=7", true)]
+    [InlineData("http://d.test/proxy/vod/movie/abc?stream_id=7", "http://d.test/proxy/vod/movie/abc?stream_id=8", false)]
+    [InlineData(null, "http://a.test/movie/u/p/100.mp4", false)]
+    [InlineData("", "http://a.test/movie/u/p/100.mp4", false)]
+    public void StrmUrlBelongsToSameStream_ComparesTheStreamId(string? existing, string expected, bool match)
+    {
+        StrmSyncService.StrmUrlBelongsToSameStream(existing, expected).Should().Be(match);
+    }
+
+    #endregion
+
     #region BuildMovieStrmFileName Tests
 
     [Fact]
