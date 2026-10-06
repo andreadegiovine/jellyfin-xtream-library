@@ -1243,6 +1243,7 @@ public class StrmSyncServiceTests
 
     #region Stream id suffix (GitHub #142)
 
+    /// <summary>The stream id is added before the .strm extension.</summary>
     [Fact]
     public void AppendStreamIdSuffix_AddsTheIdBeforeTheExtension()
     {
@@ -1250,6 +1251,7 @@ public class StrmSyncServiceTests
         StrmSyncService.AppendStreamIdSuffix("Movie (2024) - FHD.strm", 123).Should().Be("Movie (2024) - FHD - 123.strm");
     }
 
+    /// <summary>When the name is too long, the title is shortened and the stream id suffix stays intact.</summary>
     [Fact]
     public void AppendStreamIdSuffix_ShortensTheNameNotTheSuffix()
     {
@@ -1261,6 +1263,7 @@ public class StrmSyncServiceTests
         System.Text.Encoding.UTF8.GetByteCount(result).Should().BeLessThanOrEqualTo(StrmSyncService.MaxFileNameBytes);
     }
 
+    /// <summary>Two STRM URLs belong to the same stream when they carry the same stream id, whatever the host, credentials or extension.</summary>
     [Theory]
     [InlineData("http://a.test/movie/u/p/100.mp4", "http://b.test/movie/x/y/100.mkv", true)]
     [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test/movie/u/p/100.mp4", true)]

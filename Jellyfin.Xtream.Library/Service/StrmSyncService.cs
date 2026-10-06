@@ -2362,7 +2362,10 @@ public partial class StrmSyncService
                         autoLookupTmdbId) with { GroupOwnerStreamId = groupOwnerStreamId };
 
                     // Build STRM URLs and filenames — Dispatcharr multi-stream or standard single-stream
-                    var strmEntries = new List<(string StreamUrl, string StrmFileName)>();
+                    // StreamId is the id the URL points at: the provider's own in Dispatcharr mode, where one
+                    // catalogue entry can fan out to several provider streams, the catalogue's otherwise.
+                    // The file name suffix must name that stream, not the catalogue entry.
+                    var strmEntries = new List<(string StreamUrl, string StrmFileName, int StreamId)>();
                     if (enableDispatcharrMode &&
                         dispatcharrCache.TryGetValue(stream.StreamId, out var movieProviderInfo))
                     {
@@ -2375,9 +2378,10 @@ public partial class StrmSyncService
                             // different host is the entire reason that field exists (GitHub #83).
                             // This line asked one host for the uuid and pointed the STRM file at
                             // another (GitHub #113).
-                            string providerStreamUrl = $"{provider.EffectiveDispatcharrBaseUrl}/proxy/vod/movie/{uuid}?stream_id={providers[i].StreamId}";
+                            int providerStreamId = providers[i].StreamId;
+                            string providerStreamUrl = $"{provider.EffectiveDispatcharrBaseUrl}/proxy/vod/movie/{uuid}?stream_id={providerStreamId}";
                             string strmFileName = BuildMovieStrmFileName(folderName, i == 0 ? null : $"Version {i + 1}", provider.RegexRemovalPatterns);
-                            strmEntries.Add((providerStreamUrl, strmFileName));
+                            strmEntries.Add((providerStreamUrl, strmFileName, providerStreamId));
                         }
                     }
                     else
@@ -2385,7 +2389,7 @@ public partial class StrmSyncService
                         string extension = string.IsNullOrEmpty(stream.ContainerExtension) ? "mp4" : stream.ContainerExtension;
                         string streamUrl = $"{connectionInfo.BaseUrl}/movie/{connectionInfo.UserName}/{connectionInfo.Password}/{stream.StreamId}.{extension}";
                         string strmFileName = BuildMovieStrmFileName(folderName, versionLabel, provider.RegexRemovalPatterns);
-                        strmEntries.Add((streamUrl, strmFileName));
+                        strmEntries.Add((streamUrl, strmFileName, stream.StreamId));
                     }
 
                     bool anyCreated = false;
@@ -2402,7 +2406,7 @@ public partial class StrmSyncService
                             : Path.Combine(moviesPath, targetFolder);
                         string movieFolder = Path.Combine(movieBasePath, folderName);
 
-                        foreach (var (streamUrl, strmFileName) in strmEntries)
+                        foreach (var (streamUrl, strmFileName, entryStreamId) in strmEntries)
                         {
                         // Every movie file carries its stream id, whether or not the title has a
                         // TMDB id and whether or not it shares a folder with another stream. Two
@@ -2410,7 +2414,7 @@ public partial class StrmSyncService
                         // Jellyfin shows them as versions of one movie (GitHub #142). The owner of a
                         // group used to keep the plain name; it now has the suffix like everyone else.
                         string legacyStrmPath = Path.Combine(movieFolder, strmFileName);
-                        string strmPath = Path.Combine(movieFolder, AppendStreamIdSuffix(strmFileName, stream.StreamId));
+                        string strmPath = Path.Combine(movieFolder, AppendStreamIdSuffix(strmFileName, entryStreamId));
 
                         // A library written by an earlier version has this stream's file under the
                         // plain name. Rename it instead of writing a second copy: the copy would be
@@ -2450,7 +2454,7 @@ public partial class StrmSyncService
                                 "STRM name collision for movie {MovieName}: {Path} was already claimed by another stream in this run; refusing to overwrite it with stream {StreamId}",
                                 baseName,
                                 strmPath,
-                                stream.StreamId);
+                                entryStreamId);
                             continue;
                         }
 
@@ -4014,6 +4018,12 @@ public partial class StrmSyncService
         return existingId.HasValue && existingId == ExtractStreamIdFromStrmUrl(expectedUrl);
     }
 
+    /// <summary>
+    /// Reads the provider stream id out of a STRM URL, from either the Xtream form
+    /// (<c>.../movie/user/pass/123.mp4</c>) or the Dispatcharr form (<c>...?stream_id=123</c>).
+    /// </summary>
+    /// <param name="url">The URL stored in, or about to be written to, a STRM file.</param>
+    /// <returns>The stream id, or null when the URL has none.</returns>
     private static int? ExtractStreamIdFromStrmUrl(string url)
     {
         var match = Regex.Match(

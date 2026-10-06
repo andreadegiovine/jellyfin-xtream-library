@@ -82,6 +82,7 @@ public class StrmNameCollisionTests : IDisposable
         GC.SuppressFinalize(this);
     }
 
+    /// <summary>Two streams with the same title and quality tag are both written, each file carrying its own stream id.</summary>
     [Fact]
     public async Task TwoStreamsSharingTitleAndQualityTag_BothAreKeptWithTheirStreamId()
     {
@@ -109,6 +110,7 @@ public class StrmNameCollisionTests : IDisposable
     }
 
     // GitHub #142, the reporter's case: same title, no TMDB id from the provider.
+    /// <summary>Two same-named streams without a TMDB id are both kept (GitHub #142).</summary>
     [Fact]
     public async Task TwoStreamsWithTheSameNameAndNoTmdbId_BothAreKept()
     {
@@ -126,6 +128,7 @@ public class StrmNameCollisionTests : IDisposable
     }
 
     // A lone movie gets the suffix as well: the name must not depend on whether a twin exists.
+    /// <summary>A movie with no same-titled twin still gets the stream id suffix, so the name never depends on whether a twin exists.</summary>
     [Fact]
     public async Task ASingleMovie_AlsoCarriesItsStreamId()
     {
@@ -138,6 +141,7 @@ public class StrmNameCollisionTests : IDisposable
     }
 
     // A library written by an earlier version has the plain name. It is renamed, not duplicated.
+    /// <summary>A plain-named file written by an earlier version is renamed to the stream id name instead of being duplicated.</summary>
     [Fact]
     public async Task APlainNamedFileFromAnEarlierVersion_IsRenamedToTheStreamIdName()
     {
@@ -159,6 +163,7 @@ public class StrmNameCollisionTests : IDisposable
 
     // The plain name belonged to whichever same-titled stream got there first. Only that stream
     // may take it; another one writes its own file and leaves it alone.
+    /// <summary>A plain-named file whose URL points at another stream is left alone.</summary>
     [Fact]
     public async Task APlainNamedFileOfAnotherStream_IsNotTaken()
     {
@@ -191,6 +196,7 @@ public class StrmNameCollisionTests : IDisposable
         result.MoviesCreated.Should().Be(2);
     }
 
+    /// <summary>Two streams sharing a V1/V2 version tag no longer collide, because the stream id keeps their names apart.</summary>
     [Fact]
     public async Task TwoStreamsSharingAVersionTag_BothAreKept()
     {
@@ -310,6 +316,7 @@ public class StrmNameCollisionTests : IDisposable
 
     // Titles differing only in case used to collide on a case-insensitive file system. The stream
     // id keeps the two file names apart on every platform.
+    /// <summary>Titles differing only in letter case are both kept on every file system.</summary>
     [Fact]
     public async Task TitlesDifferingOnlyInCase_AreBothKept()
     {
