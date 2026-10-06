@@ -12,9 +12,11 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 using FluentAssertions;
 using Jellyfin.Xtream.Library.Client;
 using Jellyfin.Xtream.Library.Client.Models;
@@ -115,5 +117,106 @@ public sealed class XmltvPassthroughTests : IDisposable
         finished.Should().BeTrue("a broken document must not keep the EPG lock forever");
         var xml = await build;
         Regex.Matches(xml, "On now").Should().HaveCount(1, "what the broken pass appended is taken out again before the fallback adds its own");
+    }
+
+    [Fact]
+    public async Task TwoProvidersReusingTheSameEpgChannelIdDoNotCrossOverTheProgramme()
+    {
+        var config = Plugin.Instance.Configuration;
+        var providerA = config.Providers[0];
+        var providerB = TestDataBuilder.CreateProviderConfig(baseUrl: "http://other.example.com");
+        config.Providers.Add(providerB);
+
+        var now = DateTimeOffset.UtcNow;
+        var baseUrlA = providerA.BaseUrl;
+        var baseUrlB = providerB.BaseUrl;
+
+        _client
+            .Setup(c => c.GetAllLiveStreamsAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlA), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo> { new() { StreamId = 1, Num = 1, Name = "A", EpgChannelId = "shared" } });
+        _client
+            .Setup(c => c.GetAllLiveStreamsAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlB), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo> { new() { StreamId = 1, Num = 1, Name = "B", EpgChannelId = "shared" } });
+
+        _client
+            .Setup(c => c.GetXmltvAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlA), It.IsAny<CancellationToken>()))
+            .ReturnsAsync("<tv>"
+                + $"<programme start=\"{XmltvTime(now.AddMinutes(-30))}\" stop=\"{XmltvTime(now.AddMinutes(30))}\" channel=\"shared\"><title>From A</title></programme>"
+                + "</tv>");
+        _client
+            .Setup(c => c.GetXmltvAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlB), It.IsAny<CancellationToken>()))
+            .ReturnsAsync("<tv>"
+                + $"<programme start=\"{XmltvTime(now.AddMinutes(-30))}\" stop=\"{XmltvTime(now.AddMinutes(30))}\" channel=\"shared\"><title>From B</title></programme>"
+                + "</tv>");
+
+        var xml = await _liveTvService.GetXmltvEpgAsync(CancellationToken.None);
+
+        xml.Should().Contain("From A").And.Contain("From B", "each provider's own programme must reach its own channel");
+        Regex.Matches(xml, "<programme").Should().HaveCount(2, "neither provider's programme is dropped or duplicated onto the other's channel");
+
+        var programmes = XDocument.Parse(xml).Descendants("programme");
+        programmes.Single(p => p.Element("title")?.Value == "From A")
+            .Attribute("channel")!.Value.Should().Be(XtreamTunerHost.BuildChannelId(0, 1), "provider A's programme must be rewritten to provider A's channel, not provider B's");
+        programmes.Single(p => p.Element("title")?.Value == "From B")
+            .Attribute("channel")!.Value.Should().Be(XtreamTunerHost.BuildChannelId(1, 1), "provider B's programme must be rewritten to provider B's channel, not provider A's");
+    }
+
+    [Fact]
+    public async Task AProviderWithABrokenXmltvStillGetsTheJsonFallbackWhileAnotherProvidersGuideIsUnaffected()
+    {
+        // One provider's aggregate written count must not mask another provider's parse failure:
+        // provider A's successful programmes padding out the total used to suppress the JSON
+        // fallback that provider B's broken XMLTV still needed.
+        var config = Plugin.Instance.Configuration;
+        var providerA = config.Providers[0];
+        var providerB = TestDataBuilder.CreateProviderConfig(baseUrl: "http://other.example.com");
+        config.Providers.Add(providerB);
+
+        var now = DateTimeOffset.UtcNow;
+        var baseUrlA = providerA.BaseUrl;
+        var baseUrlB = providerB.BaseUrl;
+
+        _client
+            .Setup(c => c.GetAllLiveStreamsAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlA), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo> { new() { StreamId = 1, Num = 1, Name = "A", EpgChannelId = "a" } });
+        _client
+            .Setup(c => c.GetAllLiveStreamsAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlB), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo> { new() { StreamId = 1, Num = 1, Name = "B", EpgChannelId = "b" } });
+
+        _client
+            .Setup(c => c.GetXmltvAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlA), It.IsAny<CancellationToken>()))
+            .ReturnsAsync("<tv>"
+                + $"<programme start=\"{XmltvTime(now.AddMinutes(-30))}\" stop=\"{XmltvTime(now.AddMinutes(30))}\" channel=\"a\"><title>From A</title></programme>"
+                + "</tv>");
+        _client
+            .Setup(c => c.GetXmltvAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlB), It.IsAny<CancellationToken>()))
+            .ReturnsAsync("<tv>"
+                + $"<programme start=\"{XmltvTime(now.AddMinutes(-30))}\" stop=\"{XmltvTime(now.AddMinutes(30))}\" channel=\"b\"><title>Never reached</title></programme>"
+                + "<programme start=");
+        _client
+            .Setup(c => c.GetSimpleDataTableAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlB), 1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new EpgListings
+            {
+                Listings = new List<EpgProgram>
+                {
+                    new()
+                    {
+                        StartTimestamp = now.AddMinutes(-30).ToUnixTimeSeconds(),
+                        StopTimestamp = now.AddMinutes(30).ToUnixTimeSeconds(),
+                        Title = "RnJvbSBKU09O",
+                        Description = string.Empty,
+                    },
+                },
+            });
+
+        var xml = await _liveTvService.GetXmltvEpgAsync(CancellationToken.None);
+
+        xml.Should().Contain("From A", "provider A's successful XMLTV pass-through must be unaffected by provider B's broken document");
+        xml.Should().NotContain("Never reached", "the broken fragment's partial output must be discarded, not left dangling");
+        xml.Should().Contain("From JSON", "provider B must still fall back to its JSON EPG even though provider A's programmes made the aggregate passthrough count non-zero");
+        _client.Verify(
+            c => c.GetSimpleDataTableAsync(It.Is<ConnectionInfo>(conn => conn.BaseUrl == baseUrlA), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never,
+            "provider A's XMLTV already succeeded, so it must not also be re-fetched through the JSON fallback");
     }
 }

@@ -1261,33 +1261,66 @@ public class LiveTvService : IDisposable
         // Fetch EPG data if enabled
         if (config.EnableEpg)
         {
-            // Build map: upstream epg_channel_id -> our xtream_ id
-            var idMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            // Build map: (provider, upstream epg_channel_id) -> our xtream_ id. Two providers can
+            // reuse the same epg_channel_id for two different channels, so the provider has to be
+            // part of the key: a plain EpgChannelId map would let the second provider's entry
+            // silently overwrite the first, or hand one provider's programmes to the other's channel.
+            var idMap = new Dictionary<(int ProviderIndex, string EpgChannelId), string>();
             foreach (var ch in channels)
             {
                 if (!string.IsNullOrEmpty(ch.EpgChannelId))
                 {
-                    idMap[ch.EpgChannelId] = XtreamTunerHost.BuildChannelId(ch.ProviderIndex, ch.StreamId);
+                    idMap[(ch.ProviderIndex, ch.EpgChannelId.ToUpperInvariant())] = XtreamTunerHost.BuildChannelId(ch.ProviderIndex, ch.StreamId);
                 }
             }
 
             // Prefer upstream XMLTV (preserves category, rating, credits, icon, etc.).
             // Fall back to JSON-based fetch only if the upstream file is unavailable.
+            // Fetched and parsed one provider at a time, so a <programme> can be matched against
+            // idMap with the provider it actually came from, not just its bare channel id. The
+            // fallback decision is tracked per provider too: one provider's XMLTV being broken or
+            // empty must not be masked by another provider's programmes padding out the total, or
+            // that provider's channels would go without a guide instead of falling back.
             var passthroughCount = 0;
+            var fallbackProviders = new HashSet<int>();
             if (idMap.Count > 0)
             {
-                var upstreamXml = await GetMergedXmltvAsync(channels, cancellationToken).ConfigureAwait(false);
-                if (!string.IsNullOrEmpty(upstreamXml))
+                var fragments = await GetProviderXmltvFragmentsAsync(channels, cancellationToken).ConfigureAwait(false);
+                var providersWithXml = new HashSet<int>();
+                foreach (var (providerIndex, upstreamXml) in fragments)
                 {
-                    passthroughCount = AppendUpstreamProgrammes(sb, upstreamXml, idMap, config, cancellationToken);
+                    providersWithXml.Add(providerIndex);
+                    var written = AppendUpstreamProgrammes(sb, upstreamXml, idMap, providerIndex, config, cancellationToken);
+                    passthroughCount += written;
+                    if (written == 0)
+                    {
+                        fallbackProviders.Add(providerIndex);
+                    }
+                }
+
+                foreach (var providerIndex in channels.Select(c => c.ProviderIndex).Distinct())
+                {
+                    if (!providersWithXml.Contains(providerIndex))
+                    {
+                        fallbackProviders.Add(providerIndex);
+                    }
+                }
+
+                if (fragments.Count > 0)
+                {
                     _logger.LogInformation("Passed through {Count} programmes from upstream XMLTV", passthroughCount);
                 }
             }
-
-            if (passthroughCount == 0)
+            else
             {
-                _logger.LogInformation("Upstream XMLTV unavailable or empty; falling back to per-channel JSON EPG");
-                var epgData = await FetchEpgDataAsync(channels, config, cancellationToken).ConfigureAwait(false);
+                fallbackProviders.UnionWith(channels.Select(c => c.ProviderIndex));
+            }
+
+            if (fallbackProviders.Count > 0)
+            {
+                _logger.LogInformation("Upstream XMLTV unavailable or empty for one or more providers; falling back to per-channel JSON EPG for those providers' channels");
+                var fallbackChannels = channels.Where(c => fallbackProviders.Contains(c.ProviderIndex)).ToList();
+                var epgData = await FetchEpgDataAsync(fallbackChannels, config, cancellationToken).ConfigureAwait(false);
 
                 foreach (var program in epgData.OrderBy(p => p.StartTimestamp))
                 {
@@ -1313,17 +1346,18 @@ public class LiveTvService : IDisposable
     }
 
     /// <summary>
-    /// Streams the upstream XMLTV document and appends each &lt;programme&gt; whose channel
-    /// is in <paramref name="idMap"/>, rewriting its channel attribute to our xtream_ id.
-    /// All other programme child elements (category, rating, credits, icon, etc.) are
-    /// preserved verbatim.
+    /// Streams one provider's upstream XMLTV document and appends each &lt;programme&gt; whose
+    /// (provider, channel) is in <paramref name="idMap"/>, rewriting its channel attribute to
+    /// our xtream_ id. All other programme child elements (category, rating, credits, icon,
+    /// etc.) are preserved verbatim.
     /// </summary>
     /// <returns>Number of programmes written; zero, with nothing appended, when the document
     /// could not be read to the end.</returns>
     private int AppendUpstreamProgrammes(
         StringBuilder sb,
         string upstreamXml,
-        Dictionary<string, string> idMap,
+        Dictionary<(int ProviderIndex, string EpgChannelId), string> idMap,
+        int providerIndex,
         PluginConfiguration config,
         CancellationToken cancellationToken)
     {
@@ -1358,7 +1392,7 @@ public class LiveTvService : IDisposable
                 }
 
                 var upstreamCh = reader.GetAttribute("channel");
-                if (string.IsNullOrEmpty(upstreamCh) || !idMap.TryGetValue(upstreamCh, out var ourId))
+                if (string.IsNullOrEmpty(upstreamCh) || !idMap.TryGetValue((providerIndex, upstreamCh.ToUpperInvariant()), out var ourId))
                 {
                     reader.Skip();
                     continue;
@@ -1452,20 +1486,25 @@ public class LiveTvService : IDisposable
         return true;
     }
 
-    private async Task<string?> GetMergedXmltvAsync(List<LiveStreamInfo> channels, CancellationToken cancellationToken)
+    /// <summary>
+    /// Fetches each configured provider's upstream XMLTV, keeping them apart so a caller can
+    /// still tell which provider a &lt;programme&gt; came from (needed so two providers that reuse
+    /// the same EPG channel id do not get matched against each other's channels).
+    /// </summary>
+    private async Task<List<(int ProviderIndex, string Xml)>> GetProviderXmltvFragmentsAsync(List<LiveStreamInfo> channels, CancellationToken cancellationToken)
     {
-        var fragments = new List<string>();
+        var fragments = new List<(int ProviderIndex, string Xml)>();
         foreach (var providerIndex in channels.Select(c => c.ProviderIndex).Distinct())
         {
             var connectionInfo = Plugin.Instance.GetCreds(providerIndex);
             var xml = await _client.GetXmltvAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
             if (!string.IsNullOrEmpty(xml))
             {
-                fragments.Add(xml);
+                fragments.Add((providerIndex, xml));
             }
         }
 
-        return fragments.Count == 0 ? null : string.Join('\n', fragments);
+        return fragments;
     }
 
     private async Task<List<EpgProgram>> FetchEpgDataAsync(
