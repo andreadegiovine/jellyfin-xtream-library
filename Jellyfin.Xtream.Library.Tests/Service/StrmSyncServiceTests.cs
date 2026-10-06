@@ -1279,6 +1279,99 @@ public class StrmSyncServiceTests
 
     #endregion
 
+    #region ProtectGuestStrmIn Tests (GitHub #142)
+
+    /// <summary>
+    /// Creates a shared folder holding empty STRM files with the given names.
+    /// </summary>
+    private static string CreateFolderWithStrmFiles(params string[] fileNames)
+    {
+        var folder = Path.Combine(Path.GetTempPath(), $"xtream_guest_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(folder);
+        foreach (var name in fileNames)
+        {
+            File.WriteAllText(Path.Combine(folder, name), "http://test/stream");
+        }
+
+        return folder;
+    }
+
+    /// <summary>In Dispatcharr mode the guest's files carry the provider ids, so those are the ones protected.</summary>
+    [Fact]
+    public void ProtectGuestStrmIn_ProviderIds_ProtectsEveryFileTheGuestOwns()
+    {
+        var folder = CreateFolderWithStrmFiles(
+            "Movie (2024) - 700.strm",
+            "Movie (2024) - Version 2 - 701.strm",
+            "Movie (2024) - 100.strm");
+        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
+
+        try
+        {
+            StrmSyncService.ProtectGuestStrmIn(folder, new List<int> { 700, 701 }, synced);
+
+            synced.Keys.Select(Path.GetFileName).Should().BeEquivalentTo(
+                "Movie (2024) - 700.strm",
+                "Movie (2024) - Version 2 - 701.strm");
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
+    }
+
+    /// <summary>The catalogue id alone no longer finds a Dispatcharr guest's files, which is the bug the provider ids fix.</summary>
+    [Fact]
+    public void ProtectGuestStrmIn_CatalogueIdOnly_DoesNotFindProviderNamedFiles()
+    {
+        var folder = CreateFolderWithStrmFiles("Movie (2024) - 700.strm");
+        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
+
+        try
+        {
+            StrmSyncService.ProtectGuestStrmIn(folder, new List<int> { 100 }, synced);
+
+            synced.Should().BeEmpty();
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
+    }
+
+    /// <summary>A plain Xtream guest is still protected by its own stream id, and its folder-mates are left alone.</summary>
+    [Fact]
+    public void ProtectGuestStrmIn_SingleId_ProtectsOnlyThatStreamsFile()
+    {
+        var folder = CreateFolderWithStrmFiles("Movie (2024) - 100.strm", "Movie (2024) - 1100.strm", "Movie (2024) - 200.strm");
+        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
+
+        try
+        {
+            StrmSyncService.ProtectGuestStrmIn(folder, new List<int> { 100 }, synced);
+
+            // " - 100.strm" must not match " - 1100.strm".
+            synced.Keys.Select(Path.GetFileName).Should().BeEquivalentTo("Movie (2024) - 100.strm");
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
+    }
+
+    /// <summary>A folder that no longer exists is ignored.</summary>
+    [Fact]
+    public void ProtectGuestStrmIn_MissingFolder_DoesNothing()
+    {
+        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
+
+        StrmSyncService.ProtectGuestStrmIn(Path.Combine(Path.GetTempPath(), $"xtream_missing_{Guid.NewGuid():N}"), new List<int> { 1 }, synced);
+
+        synced.Should().BeEmpty();
+    }
+
+    #endregion
+
     #region BuildMovieStrmFileName Tests
 
     [Fact]

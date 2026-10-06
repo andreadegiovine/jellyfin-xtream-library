@@ -1920,7 +1920,10 @@ public partial class StrmSyncService
                             && groupingHint.Movies.TryGetValue(m.Stream.StreamId, out var recordedMovie)
                             && !string.IsNullOrEmpty(recordedMovie.FolderName))
                         {
-                            ProtectGuestStrmIn(Path.Combine(movieBasePath, recordedMovie.FolderName), m.Stream.StreamId, syncedFiles);
+                            ProtectGuestStrmIn(
+                                Path.Combine(movieBasePath, recordedMovie.FolderName),
+                                recordedMovie.StrmStreamIds is { Count: > 0 } ? recordedMovie.StrmStreamIds : new List<int> { m.Stream.StreamId },
+                                syncedFiles);
                         }
                     }
                 }
@@ -2391,6 +2394,13 @@ public partial class StrmSyncService
                         string strmFileName = BuildMovieStrmFileName(folderName, versionLabel, provider.RegexRemovalPatterns);
                         strmEntries.Add((streamUrl, strmFileName, stream.StreamId));
                     }
+
+                    // Remember which ids the files carry, so an incremental run can protect an
+                    // unchanged grouped guest's files by the same names it wrote them under.
+                    movieIdentities[stream.StreamId] = movieIdentities[stream.StreamId] with
+                    {
+                        StrmStreamIds = strmEntries.Select(e => e.StreamId).Distinct().ToList(),
+                    };
 
                     bool anyCreated = false;
                     bool anyUpdated = false;
@@ -4458,19 +4468,22 @@ public partial class StrmSyncService
     /// files its folder-mates own are deliberately left to answer for themselves.
     /// </summary>
     /// <param name="folder">Shared folder to look in. Missing folders are ignored.</param>
-    /// <param name="streamId">The stream whose file should survive cleanup.</param>
+    /// <param name="streamIds">The stream ids the guest's files carry. In Dispatcharr mode these are the provider stream ids, not the catalogue id.</param>
     /// <param name="syncedFiles">The run's set of files that must survive cleanup.</param>
-    private static void ProtectGuestStrmIn(string folder, int streamId, ConcurrentDictionary<string, byte> syncedFiles)
+    internal static void ProtectGuestStrmIn(string folder, IReadOnlyCollection<int> streamIds, ConcurrentDictionary<string, byte> syncedFiles)
     {
         if (!Directory.Exists(folder))
         {
             return;
         }
 
-        string suffix = $" - {streamId}.strm";
+        var suffixes = streamIds
+            .Select(id => $" - {id.ToString(CultureInfo.InvariantCulture)}.strm")
+            .ToList();
         foreach (var strmFile in Directory.GetFiles(folder, "*.strm"))
         {
-            if (Path.GetFileName(strmFile).EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            string fileName = Path.GetFileName(strmFile);
+            if (suffixes.Any(suffix => fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)))
             {
                 syncedFiles.TryAdd(strmFile, 0);
             }
@@ -5081,7 +5094,14 @@ public partial class StrmSyncService
                         FolderName = movieIdentity.FolderName,
                         TmdbId = movieIdentity.TmdbId,
                         TmdbIdSource = movieIdentity.Source,
-                        GroupOwnerStreamId = movieIdentity.GroupOwnerStreamId
+                        GroupOwnerStreamId = movieIdentity.GroupOwnerStreamId,
+
+                        // Same carry-forward rule as the identity above.
+                        StrmStreamIds = movieIdentities.TryGetValue(movie.StreamId, out var handled)
+                            ? handled.StrmStreamIds?.ToList()
+                            : carryForwardFrom != null && carryForwardFrom.Movies.TryGetValue(movie.StreamId, out var recorded)
+                                ? recorded.StrmStreamIds
+                                : null
                     };
                 }
             }
