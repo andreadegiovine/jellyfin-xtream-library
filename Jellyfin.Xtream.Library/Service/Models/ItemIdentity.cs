@@ -13,8 +13,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-using System.Collections.Generic;
-
 namespace Jellyfin.Xtream.Library.Service.Models;
 
 /// <summary>
@@ -52,5 +50,4 @@ public enum ItemIdSource
 /// <param name="TvdbId">Resolved TVDB id, if any. Series only.</param>
 /// <param name="Source">Where <paramref name="TmdbId"/> or <paramref name="TvdbId"/> came from.</param>
 /// <param name="GroupOwnerStreamId">Stream whose title named the shared folder, when grouped.</param>
-/// <param name="StrmStreamIds">Stream ids the movie's STRM file names carry. Differs from the catalogue id in Dispatcharr mode, where one entry fans out to several provider streams. Movies only.</param>
-public sealed record ItemIdentity(string FolderName, int? TmdbId, int? TvdbId, ItemIdSource Source, int? GroupOwnerStreamId = null, IReadOnlyList<int>? StrmStreamIds = null);
+public sealed record ItemIdentity(string FolderName, int? TmdbId, int? TvdbId, ItemIdSource Source, int? GroupOwnerStreamId = null);

@@ -114,13 +114,6 @@ public class MovieSnapshot
     /// </para>
     /// </summary>
     public int? GroupOwnerStreamId { get; set; }
-
-    /// <summary>
-    /// Gets or sets the stream ids the STRM file names of this movie carry. Differs from
-    /// <see cref="StreamId"/> in Dispatcharr mode, where one catalogue entry fans out to several
-    /// provider streams. Null in a snapshot written before this was recorded.
-    /// </summary>
-    public List<int>? StrmStreamIds { get; set; }
 }
 
 /// <summary>

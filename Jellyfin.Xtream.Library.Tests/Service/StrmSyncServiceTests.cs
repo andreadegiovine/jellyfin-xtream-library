@@ -771,6 +771,65 @@ public class StrmSyncServiceTests
 
     #endregion
 
+    #region Stream id suffix Tests (GitHub #142)
+
+    [Theory]
+    [InlineData(new[] { 200, 100 }, true, null, new[] { 100, 200 }, 100)] // both new: lowest id
+    [InlineData(new[] { 100 }, false, 200, new[] { 100, 200 }, null)] // established 200, skipped: keeps it
+    [InlineData(new[] { 100, 200 }, false, 200, new[] { 100, 200 }, 200)] // established 200 in this run: keeps it
+    [InlineData(new[] { 300 }, false, 100, new[] { 300 }, 300)] // 100 gone: re-import, overwrite in place
+    [InlineData(new[] { 100 }, false, null, new[] { 100 }, null)] // claimed by another provider: leave it
+    public void DecideVersionKeeper_FollowsTheRules(int[] wanting, bool writtenThisRun, int? diskOwner, int[] catalogue, int? expected)
+    {
+        StrmSyncService.DecideVersionKeeper(wanting, writtenThisRun, diskOwner, catalogue.ToHashSet())
+            .Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(true, 100)] // Dispatcharr mode, both new in this run: lowest provider stream id
+    [InlineData(false, null)] // Dispatcharr mode, claimed elsewhere: leave the file alone
+    public void DecideVersionKeeper_InDispatcharrMode_OnlyDecidesWithinTheRun(bool writtenThisRun, int? expected)
+    {
+        // No catalogue: Dispatcharr file URLs name provider stream ids, which it cannot check.
+        StrmSyncService.DecideVersionKeeper(new[] { 200, 100 }, writtenThisRun, null, null)
+            .Should().Be(expected);
+    }
+
+    [Fact]
+    public void AppendStreamIdSuffix_AddsTheIdBeforeTheExtension()
+    {
+        StrmSyncService.AppendStreamIdSuffix("Movie (2024).strm", 123).Should().Be("Movie (2024) - 123.strm");
+        StrmSyncService.AppendStreamIdSuffix("Movie (2024) - FHD.strm", 123).Should().Be("Movie (2024) - FHD - 123.strm");
+    }
+
+    /// <summary>When the name is too long, the title is shortened and the stream id suffix stays intact.</summary>
+    [Fact]
+    public void AppendStreamIdSuffix_ShortensTheNameNotTheSuffix()
+    {
+        var longName = new string('a', 300) + ".strm";
+
+        var result = StrmSyncService.AppendStreamIdSuffix(longName, 987654);
+
+        result.Should().EndWith(" - 987654.strm");
+        System.Text.Encoding.UTF8.GetByteCount(result).Should().BeLessThanOrEqualTo(StrmSyncService.MaxFileNameBytes);
+    }
+
+    /// <summary>Two STRM URLs belong to the same stream when they carry the same stream id, whatever the host, credentials or extension.</summary>
+    [Theory]
+    [InlineData("http://a.test/movie/u/p/100.mp4", "http://b.test/movie/x/y/100.mkv", true)]
+    [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test/movie/u/p/100.mp4", true)]
+    [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test/movie/u/p/200.mp4", false)]
+    [InlineData("http://d.test/proxy/vod/movie/abc?stream_id=7", "http://d.test/proxy/vod/movie/abc?stream_id=7", true)]
+    [InlineData("http://d.test/proxy/vod/movie/abc?stream_id=7", "http://d.test/proxy/vod/movie/abc?stream_id=8", false)]
+    [InlineData(null, "http://a.test/movie/u/p/100.mp4", false)]
+    [InlineData("", "http://a.test/movie/u/p/100.mp4", false)]
+    public void StrmUrlBelongsToSameStream_ComparesTheStreamId(string? existing, string expected, bool match)
+    {
+        StrmSyncService.StrmUrlBelongsToSameStream(existing, expected).Should().Be(match);
+    }
+
+    #endregion
+
     #region CleanupEmptyDirectories Tests
 
     /// <summary>
@@ -1237,137 +1296,6 @@ public class StrmSyncServiceTests
         var result = StrmSyncService.ExtractVersionLabel("Movie REMUX");
 
         result.Should().Be("REMUX");
-    }
-
-    #endregion
-
-    #region Stream id suffix (GitHub #142)
-
-    /// <summary>The stream id is added before the .strm extension.</summary>
-    [Fact]
-    public void AppendStreamIdSuffix_AddsTheIdBeforeTheExtension()
-    {
-        StrmSyncService.AppendStreamIdSuffix("Movie (2024).strm", 123).Should().Be("Movie (2024) - 123.strm");
-        StrmSyncService.AppendStreamIdSuffix("Movie (2024) - FHD.strm", 123).Should().Be("Movie (2024) - FHD - 123.strm");
-    }
-
-    /// <summary>When the name is too long, the title is shortened and the stream id suffix stays intact.</summary>
-    [Fact]
-    public void AppendStreamIdSuffix_ShortensTheNameNotTheSuffix()
-    {
-        var longName = new string('a', 300) + ".strm";
-
-        var result = StrmSyncService.AppendStreamIdSuffix(longName, 987654);
-
-        result.Should().EndWith(" - 987654.strm");
-        System.Text.Encoding.UTF8.GetByteCount(result).Should().BeLessThanOrEqualTo(StrmSyncService.MaxFileNameBytes);
-    }
-
-    /// <summary>Two STRM URLs belong to the same stream when they carry the same stream id, whatever the host, credentials or extension.</summary>
-    [Theory]
-    [InlineData("http://a.test/movie/u/p/100.mp4", "http://b.test/movie/x/y/100.mkv", true)]
-    [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test/movie/u/p/100.mp4", true)]
-    [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test/movie/u/p/200.mp4", false)]
-    [InlineData("http://d.test/proxy/vod/movie/abc?stream_id=7", "http://d.test/proxy/vod/movie/abc?stream_id=7", true)]
-    [InlineData("http://d.test/proxy/vod/movie/abc?stream_id=7", "http://d.test/proxy/vod/movie/abc?stream_id=8", false)]
-    [InlineData(null, "http://a.test/movie/u/p/100.mp4", false)]
-    [InlineData("", "http://a.test/movie/u/p/100.mp4", false)]
-    public void StrmUrlBelongsToSameStream_ComparesTheStreamId(string? existing, string expected, bool match)
-    {
-        StrmSyncService.StrmUrlBelongsToSameStream(existing, expected).Should().Be(match);
-    }
-
-    #endregion
-
-    #region ProtectGuestStrmIn Tests (GitHub #142)
-
-    /// <summary>
-    /// Creates a shared folder holding empty STRM files with the given names.
-    /// </summary>
-    private static string CreateFolderWithStrmFiles(params string[] fileNames)
-    {
-        var folder = Path.Combine(Path.GetTempPath(), $"xtream_guest_{Guid.NewGuid():N}");
-        Directory.CreateDirectory(folder);
-        foreach (var name in fileNames)
-        {
-            File.WriteAllText(Path.Combine(folder, name), "http://test/stream");
-        }
-
-        return folder;
-    }
-
-    /// <summary>In Dispatcharr mode the guest's files carry the provider ids, so those are the ones protected.</summary>
-    [Fact]
-    public void ProtectGuestStrmIn_ProviderIds_ProtectsEveryFileTheGuestOwns()
-    {
-        var folder = CreateFolderWithStrmFiles(
-            "Movie (2024) - 700.strm",
-            "Movie (2024) - Version 2 - 701.strm",
-            "Movie (2024) - 100.strm");
-        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
-
-        try
-        {
-            StrmSyncService.ProtectGuestStrmIn(folder, new List<int> { 700, 701 }, synced);
-
-            synced.Keys.Select(Path.GetFileName).Should().BeEquivalentTo(
-                "Movie (2024) - 700.strm",
-                "Movie (2024) - Version 2 - 701.strm");
-        }
-        finally
-        {
-            Directory.Delete(folder, true);
-        }
-    }
-
-    /// <summary>The catalogue id alone no longer finds a Dispatcharr guest's files, which is the bug the provider ids fix.</summary>
-    [Fact]
-    public void ProtectGuestStrmIn_CatalogueIdOnly_DoesNotFindProviderNamedFiles()
-    {
-        var folder = CreateFolderWithStrmFiles("Movie (2024) - 700.strm");
-        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
-
-        try
-        {
-            StrmSyncService.ProtectGuestStrmIn(folder, new List<int> { 100 }, synced);
-
-            synced.Should().BeEmpty();
-        }
-        finally
-        {
-            Directory.Delete(folder, true);
-        }
-    }
-
-    /// <summary>A plain Xtream guest is still protected by its own stream id, and its folder-mates are left alone.</summary>
-    [Fact]
-    public void ProtectGuestStrmIn_SingleId_ProtectsOnlyThatStreamsFile()
-    {
-        var folder = CreateFolderWithStrmFiles("Movie (2024) - 100.strm", "Movie (2024) - 1100.strm", "Movie (2024) - 200.strm");
-        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
-
-        try
-        {
-            StrmSyncService.ProtectGuestStrmIn(folder, new List<int> { 100 }, synced);
-
-            // " - 100.strm" must not match " - 1100.strm".
-            synced.Keys.Select(Path.GetFileName).Should().BeEquivalentTo("Movie (2024) - 100.strm");
-        }
-        finally
-        {
-            Directory.Delete(folder, true);
-        }
-    }
-
-    /// <summary>A folder that no longer exists is ignored.</summary>
-    [Fact]
-    public void ProtectGuestStrmIn_MissingFolder_DoesNothing()
-    {
-        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
-
-        StrmSyncService.ProtectGuestStrmIn(Path.Combine(Path.GetTempPath(), $"xtream_missing_{Guid.NewGuid():N}"), new List<int> { 1 }, synced);
-
-        synced.Should().BeEmpty();
     }
 
     #endregion
