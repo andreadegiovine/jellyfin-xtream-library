@@ -1196,6 +1196,11 @@ public partial class StrmSyncService
     {
         var connectionInfo = new ConnectionInfo(provider.BaseUrl, provider.Username, provider.Password);
         var globalConfig = Plugin.Instance.Configuration;
+
+        // Stream ids repeat across providers, so on a library path that several providers write
+        // to, a file only counts as ours when its URL also points at our server.
+        bool sharedLibraryPath = globalConfig.Providers.Count(configured => string.Equals(configured.LibraryPath, provider.LibraryPath, StringComparison.OrdinalIgnoreCase)) > 1;
+        var owners = new StrmOwnerResolver(connectionInfo.BaseUrl, sharedLibraryPath);
         var categories = await _client.GetVodCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
         var processedStreamIds = new ConcurrentDictionary<int, bool>();
 
@@ -1527,7 +1532,7 @@ public partial class StrmSyncService
                         if (existingMovieFolders.TryGetValue(targetFolder, out var folderCache) &&
                             folderCache.TryGetValue(baseName, out var existingFolderName))
                         {
-                            ProtectOwnStrmIn(Path.Combine(movieBasePath, existingFolderName), m.Stream.StreamId, syncedFiles, alternativeStrms, keepUnattributed: true);
+                            ProtectOwnStrmIn(Path.Combine(movieBasePath, existingFolderName), m.Stream.StreamId, syncedFiles, alternativeStrms, owners, keepUnattributed: true);
                         }
 
                         // A grouped guest sits in the folder its owner named, which is not keyed by
@@ -1540,7 +1545,7 @@ public partial class StrmSyncService
                             && groupingHint.Movies.TryGetValue(m.Stream.StreamId, out var recordedMovie)
                             && !string.IsNullOrEmpty(recordedMovie.FolderName))
                         {
-                            ProtectOwnStrmIn(Path.Combine(movieBasePath, recordedMovie.FolderName), m.Stream.StreamId, syncedFiles, alternativeStrms, keepUnattributed: false);
+                            ProtectOwnStrmIn(Path.Combine(movieBasePath, recordedMovie.FolderName), m.Stream.StreamId, syncedFiles, alternativeStrms, owners, keepUnattributed: false);
                         }
                     }
                 }
@@ -2040,7 +2045,7 @@ public partial class StrmSyncService
                             // A primary left on disk by an earlier run stays with its stream, whatever
                             // order the parallel loop reaches them in. Otherwise the first stream to
                             // claim the name takes it and the rest become alternatives.
-                            if (PrimaryStrmBelongsToOtherStream(primaryPath, stream.StreamId))
+                            if (PrimaryStrmBelongsToOtherStream(primaryPath, stream.StreamId, owners))
                             {
                                 asAlternative = true;
                             }
@@ -4085,19 +4090,21 @@ public partial class StrmSyncService
     /// <summary>
     /// Marks one stream's own STRM files in a folder as still wanted, so orphan cleanup leaves
     /// them alone while the files of its folder-mates answer for themselves. A file belongs to the
-    /// stream its URL names; one whose URL cannot be read that way (Dispatcharr) is judged by its
-    /// name. Files carrying the stream's own " - id" suffix are recorded as alternatives.
+    /// stream and provider its URL names; one whose URL cannot be read that way (Dispatcharr) is
+    /// judged by its name. Files carrying the stream's own " - id" suffix are recorded as alternatives.
     /// </summary>
     /// <param name="folder">Folder to look in. Missing folders are ignored.</param>
     /// <param name="streamId">The stream whose files should survive cleanup.</param>
     /// <param name="syncedFiles">The run's set of files that must survive cleanup.</param>
     /// <param name="alternatives">Receives the stream's alternative files.</param>
+    /// <param name="owners">Tells whose stream a file's URL names.</param>
     /// <param name="keepUnattributed">Whether a file that cannot be attributed to any stream is kept.</param>
     private static void ProtectOwnStrmIn(
         string folder,
         int streamId,
         ConcurrentDictionary<string, byte> syncedFiles,
         ConcurrentDictionary<string, ConcurrentDictionary<int, string>> alternatives,
+        StrmOwnerResolver owners,
         bool keepUnattributed)
     {
         if (!Directory.Exists(folder))
@@ -4110,7 +4117,7 @@ public partial class StrmSyncService
         {
             string fileName = Path.GetFileName(strmFile);
             bool ownSuffix = fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase);
-            int? owner = ParseMovieStreamId(ReadStrmUrl(strmFile));
+            int? owner = owners.OwnerOf(ReadStrmUrl(strmFile));
             bool protect = owner.HasValue ? owner.Value == streamId : (ownSuffix || keepUnattributed);
             if (!protect)
             {
@@ -4170,10 +4177,11 @@ public partial class StrmSyncService
     /// </summary>
     /// <param name="primaryPath">Path of the primary file.</param>
     /// <param name="streamId">The stream asking.</param>
-    /// <returns>True when the file's URL names a different stream.</returns>
-    private static bool PrimaryStrmBelongsToOtherStream(string primaryPath, int streamId)
+    /// <param name="owners">Tells whose stream a file's URL names.</param>
+    /// <returns>True when the file's URL names a different stream, or another provider's.</returns>
+    private static bool PrimaryStrmBelongsToOtherStream(string primaryPath, int streamId, StrmOwnerResolver owners)
         => File.Exists(primaryPath)
-           && ParseMovieStreamId(ReadStrmUrl(primaryPath)) is int owner
+           && owners.OwnerOf(ReadStrmUrl(primaryPath)) is int owner
            && owner != streamId;
 
     private static void RegisterAlternative(

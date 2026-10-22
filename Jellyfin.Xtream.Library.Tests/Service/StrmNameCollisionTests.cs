@@ -468,6 +468,49 @@ public class StrmNameCollisionTests : IDisposable
             .Should().Equal("Shared Movie (2024) - 100.strm", "Shared Movie (2024).strm");
     }
 
+    // Stream ids are only unique within a provider. Provider 0 and provider 1 both list a stream 100
+    // for the same title; whichever leaves, the other one's file must neither be kept as if it were
+    // its own nor left without a primary. Only the staying provider cleans up, so the outcome is
+    // decided by who each file belongs to and not by one provider wiping the shared path.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task WhenOneProvidersStreamLeaves_TheOtherProvidersSameNumberedStreamIsNotTakenForIt(int leaving)
+    {
+        int staying = 1 - leaving;
+        StreamInfo SharedMovie() => new() { StreamId = 100, Name = "Shared Movie (2024)", ContainerExtension = "mp4" };
+        SetProviderCatalogue(0, SharedMovie());
+        SetProviderCatalogue(1, SharedMovie());
+
+        await RunSyncAsync(syncMovies: true, syncSeries: false, useShippedDefaults: true, providerCount: 2).ConfigureAwait(true);
+
+        var folder = Path.Combine(_libraryPath, "Movies", "Shared Movie (2024)");
+        Directory.GetFiles(folder, "*.strm").Should().HaveCount(2, "the second provider's copy is an alternative");
+
+        SetProviderCatalogue(leaving, new StreamInfo { StreamId = 999, Name = "Other Movie (2023)", ContainerExtension = "mp4" });
+        SetProviderCatalogue(staying, SharedMovie());
+        _configure = p => p.CleanupOrphans = p.Name == $"test{staying}";
+
+        await RunSyncAsync(syncMovies: true, syncSeries: false, useShippedDefaults: true, providerCount: 2).ConfigureAwait(true);
+
+        var remaining = Directory.GetFiles(folder, "*.strm");
+        remaining.Select(Path.GetFileName).Should().Equal("Shared Movie (2024).strm");
+        (await File.ReadAllTextAsync(remaining[0]).ConfigureAwait(true))
+            .Should().StartWith($"http://provider{staying}.test/movie/", "the leaving provider's file is gone and the other one is the primary");
+    }
+
+    [Theory]
+    [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test", true, 100)]
+    [InlineData("http://a.test/movie/u/p/100.mp4", "http://a.test/", true, 100)]
+    [InlineData("HTTP://A.TEST/movie/u/p/100.mp4", "http://a.test", true, 100)]
+    [InlineData("http://b.test/movie/u/p/100.mp4", "http://a.test", true, StrmOwnerResolver.OtherProvider)]
+    [InlineData("http://a.test:8080/movie/u/p/100.mp4", "http://a.test", true, StrmOwnerResolver.OtherProvider)]
+    [InlineData("http://b.test/movie/u/p/100.mp4", "http://a.test", false, 100)]
+    [InlineData("http://d.test/proxy/vod/movie/abc?stream_id=5", "http://a.test", true, null)]
+    [InlineData(null, "http://a.test", true, null)]
+    public void StrmOwnerResolver_NamesTheProviderOnlyWhenPathsAreShared(string? url, string baseUrl, bool scoped, int? expected)
+        => new StrmOwnerResolver(baseUrl, scoped).OwnerOf(url).Should().Be(expected);
+
     // GitHub #90. Every version of a title (V1/V2/V3) resolves to one folder and therefore to one
     // "<folder>.nfo", while the STRM files keep their version label and stay distinct. So the STRM
     // claim never fires here and the NFO write was unguarded: whichever version finished last won,
@@ -992,6 +1035,15 @@ public class StrmNameCollisionTests : IDisposable
 
         StrmFiles("Series").Should().HaveCount(12).And.NotContain(f => f.StartsWith("Kids", StringComparison.Ordinal));
         result.OrphanCleanupBlockedByThreshold.Should().BeFalse();
+    }
+
+    private void SetProviderCatalogue(int providerIndex, params StreamInfo[] streams)
+    {
+        string baseUrl = $"http://provider{providerIndex}.test";
+        _client.Setup(c => c.GetVodCategoryAsync(It.Is<ConnectionInfo>(i => i.BaseUrl == baseUrl), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Category> { new() { CategoryId = 1, CategoryName = "Movies" } });
+        _client.Setup(c => c.GetVodStreamsByCategoryAsync(It.Is<ConnectionInfo>(i => i.BaseUrl == baseUrl), 1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<StreamInfo>(streams));
     }
 
     private string[] MovieFolders()
