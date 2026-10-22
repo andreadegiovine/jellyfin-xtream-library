@@ -510,16 +510,4 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
             return null;
         }
     }
-
-    /// <summary>
-    /// Raised inside <see cref="GetStringWithRetryAsync"/> when the provider answers with an empty
-    /// JSON list, so the retry loop can treat it like any other transient failure.
-    /// </summary>
-    public sealed class EmptyResponseException : Exception
-    {
-        public EmptyResponseException()
-            : base("Empty JSON array response.")
-        {
-        }
-    }
 }
