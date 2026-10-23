@@ -33,7 +33,13 @@ namespace Jellyfin.Xtream.Library.Service;
 /// library path ("p2", "p3", ...). Null for the first provider of the path and for paths nobody
 /// shares, whose names carry the stream id alone.
 /// </param>
-internal readonly record struct StrmOwnerResolver(string BaseUrl, bool ScopeToProvider, string? AlternativeTag = null)
+/// <param name="Username">
+/// Account of the provider doing the sync. Two providers can sit on the same host with different
+/// accounts, and the account is the segment after <c>/movie/</c> in the URL, so a URL on this host
+/// still belongs to another provider when it names another account. Null or empty skips the
+/// comparison. The password is left out on purpose: changing it does not make the files foreign.
+/// </param>
+internal readonly record struct StrmOwnerResolver(string BaseUrl, bool ScopeToProvider, string? AlternativeTag = null, string? Username = null)
 {
     /// <summary>
     /// The owner reported for a URL that belongs to a different provider. It is not a valid stream
@@ -58,6 +64,25 @@ internal readonly record struct StrmOwnerResolver(string BaseUrl, bool ScopeToPr
         }
 
         string prefix = BaseUrl.TrimEnd('/') + "/movie/";
-        return url!.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ? id : OtherProvider;
+        if (!url!.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return OtherProvider;
+        }
+
+        // ".../movie/<user>/<password>/<id>.<ext>": the account is the segment right after the
+        // prefix. A URL with no further slash carries no account, so there is nothing to compare
+        // and it stays with the host.
+        if (string.IsNullOrEmpty(Username))
+        {
+            return id;
+        }
+
+        int accountEnd = url.IndexOf('/', prefix.Length);
+        if (accountEnd < 0)
+        {
+            return id;
+        }
+
+        return url.AsSpan(prefix.Length, accountEnd - prefix.Length).Equals(Username, StringComparison.Ordinal) ? id : OtherProvider;
     }
 }
