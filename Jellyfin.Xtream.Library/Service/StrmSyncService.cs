@@ -2086,8 +2086,17 @@ public partial class StrmSyncService
                                 // The name is taken by a file whose URL belongs to another stream or
                                 // provider, for instance a tag inherited from a provider that was
                                 // removed. Leave it alone: it is neither registered nor protected
-                                // here, so cleanup judges it by its own owner.
+                                // here, so cleanup judges it by its own owner. Recorded as failed so
+                                // the snapshot leaves the stream out and the next incremental sync
+                                // treats it as new, once the blocking file has been cleaned up.
                                 Interlocked.Increment(ref nameCollisions);
+                                failedItems.Add(new FailedItem
+                                {
+                                    ItemType = "Movie",
+                                    ItemId = stream.StreamId,
+                                    Name = stream.Name,
+                                    ErrorMessage = $"STRM name collision: {Path.GetFileName(plainPath)} has an alternative held by another stream or provider. Not written, so the next sync retries it",
+                                });
                                 _logger.LogWarning(
                                     "STRM name collision for movie {MovieName}: the alternative file of stream {StreamId} is held by another stream or provider; refusing to overwrite it",
                                     baseName,

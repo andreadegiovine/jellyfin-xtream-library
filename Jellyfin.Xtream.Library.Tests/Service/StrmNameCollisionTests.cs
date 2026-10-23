@@ -685,6 +685,7 @@ public class StrmNameCollisionTests : IDisposable
 
         (await File.ReadAllTextAsync(tagged).ConfigureAwait(true)).Should().Be("http://gone.test/movie/u/p/100.mp4");
         result.MovieNameCollisions.Should().Be(1, "the refused overwrite is counted");
+        result.FailedItems.Should().ContainSingle(f => f.ItemType == "Movie" && f.ItemId == 100, "the snapshot must leave it out so the next sync retries it");
         Directory.GetFiles(folder, "*.strm").Should().HaveCount(2);
     }
 
