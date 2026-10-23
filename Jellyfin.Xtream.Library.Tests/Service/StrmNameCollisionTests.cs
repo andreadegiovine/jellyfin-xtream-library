@@ -465,7 +465,7 @@ public class StrmNameCollisionTests : IDisposable
         result.MovieNameCollisions.Should().Be(0);
         Directory.GetFiles(Path.Combine(_libraryPath, "Movies", "Shared Movie (2024)"), "*.strm")
             .Select(Path.GetFileName).OrderBy(f => f, StringComparer.Ordinal)
-            .Should().Equal("Shared Movie (2024) - 100.strm", "Shared Movie (2024).strm");
+            .Should().Equal("Shared Movie (2024) - 100 - p2.strm", "Shared Movie (2024).strm");
     }
 
     // Stream ids are only unique within a provider. Provider 0 and provider 1 both list a stream 100
@@ -497,6 +497,101 @@ public class StrmNameCollisionTests : IDisposable
         remaining.Select(Path.GetFileName).Should().Equal("Shared Movie (2024).strm");
         (await File.ReadAllTextAsync(remaining[0]).ConfigureAwait(true))
             .Should().StartWith($"http://provider{staying}.test/movie/", "the leaving provider's file is gone and the other one is the primary");
+    }
+
+    // Both providers list a stream 100 and the first one also lists a second stream with the same
+    // title. Everything is kept: the primary, the first provider's alternative with its bare id,
+    // and the second provider's stream 100 under its own tag instead of a refused collision.
+    [Fact]
+    public async Task SameStreamIdOnTwoProviders_BothAlternativesAreWritten()
+    {
+        StreamInfo Movie(int id) => new() { StreamId = id, Name = "Shared Movie (2024)", ContainerExtension = "mp4" };
+        SetProviderCatalogue(0, Movie(100), Movie(200));
+        SetProviderCatalogue(1, Movie(100));
+
+        var result = await RunSyncAsync(syncMovies: true, syncSeries: false, useShippedDefaults: false, providerCount: 2).ConfigureAwait(true);
+
+        var files = Directory.GetFiles(Path.Combine(_libraryPath, "Movies", "Shared Movie (2024)"), "*.strm")
+            .Select(Path.GetFileName).ToArray();
+        result.MovieNameCollisions.Should().Be(0);
+        files.Should().HaveCount(3);
+        files.Should().Contain("Shared Movie (2024) - 100 - p2.strm");
+        files.Should().Contain("Shared Movie (2024).strm");
+    }
+
+    // A file the second provider wrote before tags existed keeps its name: renaming it would make
+    // Jellyfin see a new item and lose its watched state.
+    [Fact]
+    public async Task AnUntaggedFileOfTheSecondProvider_KeepsItsName()
+    {
+        var folder = Path.Combine(_libraryPath, "Movies", "Shared Movie (2024)");
+        Directory.CreateDirectory(folder);
+        await File.WriteAllTextAsync(Path.Combine(folder, "Shared Movie (2024).strm"), "http://provider0.test/movie/u/p/100.mp4").ConfigureAwait(true);
+        await File.WriteAllTextAsync(Path.Combine(folder, "Shared Movie (2024) - 100.strm"), "http://provider1.test/movie/u/p/100.mp4").ConfigureAwait(true);
+        StreamInfo Movie() => new() { StreamId = 100, Name = "Shared Movie (2024)", ContainerExtension = "mp4" };
+        SetProviderCatalogue(0, Movie());
+        SetProviderCatalogue(1, Movie());
+
+        await RunSyncAsync(syncMovies: true, syncSeries: false, useShippedDefaults: false, providerCount: 2).ConfigureAwait(true);
+
+        Directory.GetFiles(folder, "*.strm").Select(Path.GetFileName).OrderBy(f => f, StringComparer.Ordinal)
+            .Should().Equal("Shared Movie (2024) - 100.strm", "Shared Movie (2024).strm");
+    }
+
+    // The same file name belongs to the first provider when the URL says so, so it is not taken for
+    // the second provider's legacy file.
+    [Fact]
+    public async Task AnUntaggedFileOfTheFirstProvider_IsNotTakenForTheSecondProvidersOwn()
+    {
+        var folder = Path.Combine(_libraryPath, "Movies", "Shared Movie (2024)");
+        Directory.CreateDirectory(folder);
+        await File.WriteAllTextAsync(Path.Combine(folder, "Shared Movie (2024).strm"), "http://provider0.test/movie/u/p/200.mp4").ConfigureAwait(true);
+        await File.WriteAllTextAsync(Path.Combine(folder, "Shared Movie (2024) - 100.strm"), "http://provider0.test/movie/u/p/100.mp4").ConfigureAwait(true);
+        StreamInfo Movie(int id) => new() { StreamId = id, Name = "Shared Movie (2024)", ContainerExtension = "mp4" };
+        SetProviderCatalogue(0, Movie(200), Movie(100));
+        SetProviderCatalogue(1, Movie(100));
+
+        await RunSyncAsync(syncMovies: true, syncSeries: false, useShippedDefaults: false, providerCount: 2).ConfigureAwait(true);
+
+        var files = Directory.GetFiles(folder, "*.strm").Select(Path.GetFileName).ToArray();
+        files.Should().HaveCount(3);
+        files.Should().Contain("Shared Movie (2024) - 100 - p2.strm");
+        (await File.ReadAllTextAsync(Path.Combine(folder, "Shared Movie (2024) - 100.strm")).ConfigureAwait(true))
+            .Should().StartWith("http://provider0.test/");
+    }
+
+    [Theory]
+    [InlineData(null, "Movie - 100.strm")]
+    [InlineData("p2", "Movie - 100 - p2.strm")]
+    public void AlternativeFileName_AddsTheProviderTagOnlyWhenThereIsOne(string? tag, string expected)
+        => StrmSyncService.AlternativeFileName("Movie.strm", 100, tag).Should().Be(expected);
+
+    [Fact]
+    public void AlternativeTag_TagsEveryProviderOfASharedPathButTheFirst()
+    {
+        var first = new ProviderConfig { BaseUrl = "http://a", Username = "u", LibraryPath = "/media" };
+        var other = new ProviderConfig { BaseUrl = "http://o", Username = "u", LibraryPath = "/other" };
+        var second = new ProviderConfig { BaseUrl = "http://b", Username = "u", LibraryPath = "/media/" };
+        var third = new ProviderConfig { BaseUrl = "http://c", Username = "u", LibraryPath = " /MEDIA " };
+        var providers = new[] { first, other, second, third };
+
+        StrmSyncService.AlternativeTag(providers, first).Should().BeNull();
+        StrmSyncService.AlternativeTag(providers, other).Should().BeNull("it is alone on its path");
+        StrmSyncService.AlternativeTag(providers, second).Should().Be("p2");
+        StrmSyncService.AlternativeTag(providers, third).Should().Be("p3");
+
+        second.IsEnabled = false;
+        StrmSyncService.AlternativeTag(providers, third).Should().Be("p3", "switching a provider off renames nothing");
+    }
+
+    [Fact]
+    public void AlternativeTag_FindsAProviderThatIsACopyOfAConfiguredOne()
+    {
+        var first = new ProviderConfig { BaseUrl = "http://a", Username = "u", LibraryPath = "/media" };
+        var second = new ProviderConfig { BaseUrl = "http://b", Username = "u", LibraryPath = "/media" };
+        var copy = new ProviderConfig { BaseUrl = "http://b", Username = "u", LibraryPath = "/media" };
+
+        StrmSyncService.AlternativeTag(new[] { first, second }, copy).Should().Be("p2");
     }
 
     [Theory]

@@ -28,7 +28,12 @@ namespace Jellyfin.Xtream.Library.Service;
 /// Only set when providers share a library path: with a single provider a different host just means
 /// the provider moved, and its files are still its own.
 /// </param>
-internal readonly record struct StrmOwnerResolver(string BaseUrl, bool ScopeToProvider)
+/// <param name="AlternativeTag">
+/// Tag that keeps this provider's alternative file names apart from the other providers' on a shared
+/// library path ("p2", "p3", ...). Null for the first provider of the path and for paths nobody
+/// shares, whose names carry the stream id alone.
+/// </param>
+internal readonly record struct StrmOwnerResolver(string BaseUrl, bool ScopeToProvider, string? AlternativeTag = null)
 {
     /// <summary>
     /// The owner reported for a URL that belongs to a different provider. It is not a valid stream

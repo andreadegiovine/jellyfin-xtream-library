@@ -335,8 +335,8 @@ public partial class StrmSyncService
 
         // Warn if any two enabled providers share the same LibraryPath
         var duplicatePaths = config.Providers
-            .Where(p => p.IsEnabled && !string.IsNullOrEmpty(p.LibraryPath))
-            .GroupBy(p => p.LibraryPath, StringComparer.OrdinalIgnoreCase)
+            .Where(p => p.IsEnabled && !string.IsNullOrEmpty(p.EffectiveLibraryPath))
+            .GroupBy(p => p.EffectiveLibraryPath, StringComparer.OrdinalIgnoreCase)
             .Where(g => g.Count() > 1)
             .Select(g => g.Key)
             .ToList();
@@ -1199,8 +1199,10 @@ public partial class StrmSyncService
 
         // Stream ids repeat across providers, so on a library path that several providers write
         // to, a file only counts as ours when its URL also points at our server.
-        bool sharedLibraryPath = globalConfig.Providers.Count(configured => string.Equals(configured.LibraryPath, provider.LibraryPath, StringComparison.OrdinalIgnoreCase)) > 1;
-        var owners = new StrmOwnerResolver(connectionInfo.BaseUrl, sharedLibraryPath);
+        var owners = new StrmOwnerResolver(
+            connectionInfo.BaseUrl,
+            SharingProviders(globalConfig.Providers, provider).Count > 1,
+            AlternativeTag(globalConfig.Providers, provider));
         var categories = await _client.GetVodCategoryAsync(connectionInfo, cancellationToken).ConfigureAwait(false);
         var processedStreamIds = new ConcurrentDictionary<int, bool>();
 
@@ -2077,7 +2079,7 @@ public partial class StrmSyncService
                         if (asAlternative)
                         {
                             string plainPath = strmPath;
-                            strmPath = Path.Combine(movieFolder, AlternativeFileName(strmFileName, stream.StreamId));
+                            strmPath = AlternativePath(movieFolder, strmFileName, stream.StreamId, owners);
                             RegisterAlternative(alternativeStrms, plainPath, stream.StreamId, strmPath);
                         }
 
@@ -4112,11 +4114,15 @@ public partial class StrmSyncService
             return;
         }
 
-        string suffix = $" - {streamId}.strm";
+        string legacySuffix = $" - {streamId}.strm";
+        string? taggedSuffix = owners.AlternativeTag is null ? null : $" - {streamId} - {owners.AlternativeTag}.strm";
         foreach (var strmFile in Directory.GetFiles(folder, "*.strm"))
         {
             string fileName = Path.GetFileName(strmFile);
-            bool ownSuffix = fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase);
+            string? suffix = taggedSuffix is not null && fileName.EndsWith(taggedSuffix, StringComparison.OrdinalIgnoreCase)
+                ? taggedSuffix
+                : (fileName.EndsWith(legacySuffix, StringComparison.OrdinalIgnoreCase) ? legacySuffix : null);
+            bool ownSuffix = suffix is not null;
             int? owner = owners.OwnerOf(ReadStrmUrl(strmFile));
             bool protect = owner.HasValue ? owner.Value == streamId : (ownSuffix || keepUnattributed);
             if (!protect)
@@ -4125,7 +4131,7 @@ public partial class StrmSyncService
             }
 
             syncedFiles.TryAdd(strmFile, 0);
-            if (ownSuffix)
+            if (suffix is not null)
             {
                 RegisterAlternative(alternatives, Path.Combine(folder, fileName[..^suffix.Length] + ".strm"), streamId, strmFile);
             }
@@ -4134,13 +4140,73 @@ public partial class StrmSyncService
 
     /// <summary>
     /// The file name a stream uses when another stream holds the primary: the primary's name with
-    /// the stream id before the extension.
+    /// the stream id before the extension, followed by the provider tag when there is one.
     /// </summary>
     /// <param name="primaryFileName">The name the primary file has or would have.</param>
     /// <param name="streamId">The stream the alternative belongs to.</param>
+    /// <param name="providerTag">Tag of a provider that shares its library path, or null.</param>
     /// <returns>The alternative's file name.</returns>
-    internal static string AlternativeFileName(string primaryFileName, int streamId)
-        => $"{Path.GetFileNameWithoutExtension(primaryFileName)} - {streamId}{Path.GetExtension(primaryFileName)}";
+    internal static string AlternativeFileName(string primaryFileName, int streamId, string? providerTag = null)
+        => $"{Path.GetFileNameWithoutExtension(primaryFileName)} - {streamId}{(providerTag is null ? string.Empty : $" - {providerTag}")}{Path.GetExtension(primaryFileName)}";
+
+    /// <summary>
+    /// Where a stream's alternative file goes. A provider that shares its library path tags its
+    /// names, but an untagged file this provider's stream already wrote there (named before tags
+    /// existed) is kept as it is, so the file is not renamed and Jellyfin does not see a new item.
+    /// </summary>
+    /// <param name="movieFolder">The movie's folder.</param>
+    /// <param name="primaryFileName">The name the primary file has or would have.</param>
+    /// <param name="streamId">The stream the alternative belongs to.</param>
+    /// <param name="owners">Tells whose stream a file's URL names and which tag the provider uses.</param>
+    /// <returns>The path of the alternative file.</returns>
+    private static string AlternativePath(string movieFolder, string primaryFileName, int streamId, StrmOwnerResolver owners)
+    {
+        string tagged = Path.Combine(movieFolder, AlternativeFileName(primaryFileName, streamId, owners.AlternativeTag));
+        if (owners.AlternativeTag is null || File.Exists(tagged))
+        {
+            return tagged;
+        }
+
+        string legacy = Path.Combine(movieFolder, AlternativeFileName(primaryFileName, streamId));
+        return File.Exists(legacy) && owners.OwnerOf(ReadStrmUrl(legacy)) == streamId ? legacy : tagged;
+    }
+
+    /// <summary>
+    /// The configured providers that write to the same library folder as this one, in
+    /// configuration order. Enabled or not, so switching a provider off renames nothing.
+    /// </summary>
+    /// <param name="providers">All configured providers.</param>
+    /// <param name="provider">The provider asking.</param>
+    /// <returns>The providers sharing its folder, itself included; empty for a blank path.</returns>
+    internal static List<ProviderConfig> SharingProviders(IEnumerable<ProviderConfig> providers, ProviderConfig provider)
+    {
+        string path = provider.EffectiveLibraryPath;
+        return path.Length == 0
+            ? new List<ProviderConfig>()
+            : providers.Where(p => string.Equals(p.EffectiveLibraryPath, path, StringComparison.OrdinalIgnoreCase)).ToList();
+    }
+
+    /// <summary>
+    /// The tag a provider puts in its alternative file names so they cannot meet another
+    /// provider's on a shared library path: "p2" for the second provider of the path, "p3" for the
+    /// third. The first provider and providers alone on their path get none, so their names are the
+    /// ones every earlier version wrote.
+    /// </summary>
+    /// <param name="providers">All configured providers.</param>
+    /// <param name="provider">The provider asking.</param>
+    /// <returns>The tag, or null.</returns>
+    internal static string? AlternativeTag(IEnumerable<ProviderConfig> providers, ProviderConfig provider)
+    {
+        var sharing = SharingProviders(providers, provider);
+        int position = sharing.FindIndex(p => ReferenceEquals(p, provider));
+        if (position < 0)
+        {
+            position = sharing.FindIndex(p => string.Equals(p.BaseUrl, provider.BaseUrl, StringComparison.Ordinal)
+                && string.Equals(p.Username, provider.Username, StringComparison.Ordinal));
+        }
+
+        return sharing.Count > 1 && position > 0 ? $"p{position + 1}" : null;
+    }
 
     /// <summary>
     /// The stream id an Xtream movie URL (<c>.../movie/user/pass/123.mp4</c>) points at. Null for
