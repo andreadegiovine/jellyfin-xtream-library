@@ -242,38 +242,320 @@ public class StrmNameCollisionTests : IDisposable
     public void AlternativeFileName_PutsTheStreamIdBeforeTheExtension()
         => StrmSyncService.AlternativeFileName("Movie (2024) - 4K.strm", 77).Should().Be("Movie (2024) - 4K - 77.strm");
 
-    [Fact]
-    public void PromoteAlternatives_PicksTheLowestStreamIdAndLeavesAWantedPrimaryAlone()
-    {
-        var wantedPrimary = Path.Combine(_libraryPath, "Wanted.strm");
-        File.WriteAllText(wantedPrimary, "http://h/movie/u/p/1.mp4");
-        var wantedAlt = Path.Combine(_libraryPath, "Wanted - 2.strm");
-        File.WriteAllText(wantedAlt, "http://h/movie/u/p/2.mp4");
-        var goneAlt3 = Path.Combine(_libraryPath, "Gone - 3.strm");
-        var goneAlt9 = Path.Combine(_libraryPath, "Gone - 9.strm");
-        File.WriteAllText(goneAlt3, "http://h/movie/u/p/3.mp4");
-        File.WriteAllText(goneAlt9, "http://h/movie/u/p/9.mp4");
+    private static MovieRoleLedger NewLedger()
+        => new(
+            path => File.Exists(path) ? StrmSyncService.ParseMovieStreamId(File.ReadAllText(path)) : null,
+            (folder, plainName, streamId) => Path.Combine(folder, StrmSyncService.AlternativeFileName(plainName, streamId)));
 
-        var synced = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
-        foreach (var f in new[] { wantedPrimary, wantedAlt, goneAlt3, goneAlt9 })
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, byte> FileSet(params string[] files)
+    {
+        var set = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        foreach (var f in files)
         {
-            synced[f] = 0;
+            set[f] = 0;
         }
 
-        var alternatives = new System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<int, string>>();
-        alternatives[wantedPrimary] = new() { [2] = wantedAlt };
-        var gonePrimary = Path.Combine(_libraryPath, "Gone.strm");
-        alternatives[gonePrimary] = new() { [9] = goneAlt9, [3] = goneAlt3 };
+        return set;
+    }
 
-        var promoted = StrmSyncService.PromoteAlternatives(alternatives, synced);
+    private static string WriteMainStrm(string path, int streamId)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, $"http://provider0.test/movie/u/p/{streamId}.mp4");
+        return path;
+    }
 
-        promoted.Should().ContainSingle().Which.StreamId.Should().Be(3);
-        File.Exists(gonePrimary).Should().BeTrue();
-        File.Exists(goneAlt3).Should().BeFalse();
-        File.Exists(goneAlt9).Should().BeTrue("only one alternative becomes the primary");
-        File.Exists(wantedAlt).Should().BeTrue();
-        synced.ContainsKey(gonePrimary).Should().BeTrue();
-        synced.ContainsKey(goneAlt3).Should().BeFalse();
+    [Fact]
+    public void Promote_OnlyReplacesAPrimaryCleanupDeletedWhoseStreamIsGone()
+    {
+        var folder = Path.Combine(_libraryPath, "Twin (2024)");
+        var primary = Path.Combine(folder, "Twin (2024).strm");
+        var alt9 = WriteMainStrm(Path.Combine(folder, "Twin (2024) - 9.strm"), 9);
+        var alt3 = WriteMainStrm(Path.Combine(folder, "Twin (2024) - 3.strm"), 3);
+        var deleted = new Dictionary<string, int?> { [primary] = 1 };
+
+        MovieRoleLedger Ledger(int[] listed)
+        {
+            var ledger = NewLedger();
+            ledger.SetCatalogue(listed, complete: true);
+            ledger.RegisterAlternative(primary, 9, alt9, 1, false, true);
+            ledger.RegisterAlternative(primary, 3, alt3, 1, false, true);
+            return ledger;
+        }
+
+        // The primary's stream is still listed, or nothing was deleted: nothing moves.
+        Ledger([1, 3, 9]).Promote(deleted, FileSet(alt9, alt3), FileSet(alt9, alt3)).Should().BeEmpty();
+        Ledger([3, 9]).Promote(new Dictionary<string, int?>(), FileSet(alt9, alt3), FileSet(alt9, alt3)).Should().BeEmpty();
+        Ledger([3, 9]).Promote(new Dictionary<string, int?> { [primary] = null }, FileSet(alt9, alt3), FileSet(alt9, alt3)).Should().BeEmpty();
+        File.Exists(primary).Should().BeFalse();
+
+        var synced = FileSet(alt9, alt3);
+        var promoted = Ledger([3, 9]).Promote(deleted, synced, FileSet(alt9, alt3));
+
+        promoted.Should().ContainSingle().Which.StreamId.Should().Be(3, "the lowest stream id takes the name");
+        File.Exists(primary).Should().BeTrue();
+        File.Exists(alt3).Should().BeFalse();
+        File.Exists(alt9).Should().BeTrue();
+        synced.ContainsKey(primary).Should().BeTrue();
+        synced.ContainsKey(alt3).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Promote_WaitsOnTheOwnersRealPrimaryNotOnTheGuestsOwnName()
+    {
+        var folder = Path.Combine(_libraryPath, "Alpha (2024) [tmdbid-42]");
+        var ownerPrimary = WriteMainStrm(Path.Combine(folder, "Alpha (2024) [tmdbid-42] - FHD.strm"), 100);
+        var guestPlain = Path.Combine(folder, "Alpha (2024) [tmdbid-42].strm");
+        var guestAlt = WriteMainStrm(Path.Combine(folder, "Alpha (2024) [tmdbid-42] - 101.strm"), 101);
+        var ledger = NewLedger();
+        ledger.SetCatalogue([100, 101], complete: true);
+        ledger.RegisterAlternative(guestPlain, 101, guestAlt, 100, true, true);
+
+        ledger.SettleNewStreams(FileSet(ownerPrimary, guestAlt), FileSet(ownerPrimary, guestAlt)).Should().BeEmpty();
+        ledger.Promote(new Dictionary<string, int?>(), FileSet(ownerPrimary, guestAlt), FileSet(ownerPrimary, guestAlt)).Should().BeEmpty();
+        File.Exists(guestPlain).Should().BeFalse("the owner is listed, so the guest never moves to a name of its own");
+
+        File.Delete(ownerPrimary);
+        var later = NewLedger();
+        later.SetCatalogue([101], complete: true);
+        later.RegisterAlternative(guestPlain, 101, guestAlt, 100, true, true);
+        later.Promote(new Dictionary<string, int?> { [ownerPrimary] = 100 }, FileSet(guestAlt), FileSet(guestAlt)).Should().ContainSingle();
+        File.Exists(ownerPrimary).Should().BeTrue();
+        File.Exists(guestAlt).Should().BeFalse();
+    }
+
+    [Fact]
+    public void Settle_DecidesNothingFromAnIncompleteCatalogue()
+    {
+        var folder = Path.Combine(_libraryPath, "Gamma (2024)");
+        var primary = WriteMainStrm(Path.Combine(folder, "Gamma (2024).strm"), 5);
+        var alt = WriteMainStrm(Path.Combine(folder, "Gamma (2024) - 500.strm"), 500);
+        var ledger = NewLedger();
+        ledger.SetCatalogue([500], complete: false);
+        ledger.NoteCreated(alt);
+        ledger.RegisterAlternative(primary, 500, alt, 5, false, true);
+
+        ledger.SettleNewStreams(FileSet(alt), FileSet(alt)).Should().BeEmpty();
+        ledger.Promote(new Dictionary<string, int?> { [primary] = 5 }, FileSet(alt), FileSet(alt)).Should().BeEmpty();
+        StrmSyncService.ParseMovieStreamId(File.ReadAllText(primary)).Should().Be(5);
+    }
+
+    [Fact]
+    public void Settle_TakesAGonePrimaryOverInPlaceOnlyForAStreamThatIsNew()
+    {
+        var folder = Path.Combine(_libraryPath, "Gamma (2024)");
+        var primary = WriteMainStrm(Path.Combine(folder, "Gamma (2024).strm"), 5);
+        var established = WriteMainStrm(Path.Combine(folder, "Gamma (2024) - 500.strm"), 500);
+        var ledger = NewLedger();
+        ledger.SetCatalogue([500], complete: true);
+        ledger.RegisterAlternative(primary, 500, established, 5, false, true);
+        ledger.SettleNewStreams(FileSet(established), FileSet(established)).Should().BeEmpty("an alternative from an earlier run waits for cleanup instead");
+
+        var added = WriteMainStrm(Path.Combine(folder, "Gamma (2024) - 600.strm"), 600);
+        var fresh = NewLedger();
+        fresh.SetCatalogue([500, 600], complete: true);
+        fresh.NoteCreated(added);
+        fresh.RegisterAlternative(primary, 600, added, 5, false, true);
+        var synced = FileSet(established, added);
+        fresh.SettleNewStreams(synced, FileSet(established, added)).Should().ContainSingle().Which.StreamId.Should().Be(600);
+
+        StrmSyncService.ParseMovieStreamId(File.ReadAllText(primary)).Should().Be(600);
+        File.Exists(added).Should().BeFalse();
+        synced.ContainsKey(primary).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Settle_GivesAFolderWrittenThisRunToItsLowestStreamId_ButNotAnEstablishedPrimary()
+    {
+        var folder = Path.Combine(_libraryPath, "Twin (2024)");
+        var primary = WriteMainStrm(Path.Combine(folder, "Twin (2024).strm"), 200);
+        var alt = WriteMainStrm(Path.Combine(folder, "Twin (2024) - 100.strm"), 100);
+        var kept = NewLedger();
+        kept.SetCatalogue([100, 200], complete: true);
+        kept.NoteCreated(alt);
+        kept.RegisterPrimary(primary, 200, established: true);
+        kept.RegisterAlternative(primary, 100, alt, 200, false, true);
+        kept.SettleNewStreams(FileSet(primary, alt), FileSet(primary, alt)).Should().BeEmpty();
+
+        var ledger = NewLedger();
+        ledger.SetCatalogue([100, 200], complete: true);
+        ledger.NoteCreated(primary);
+        ledger.NoteCreated(alt);
+        ledger.RegisterPrimary(primary, 200, established: false);
+        ledger.RegisterAlternative(primary, 100, alt, 200, false, true);
+
+        ledger.SettleNewStreams(FileSet(primary, alt), FileSet(primary, alt)).Should().ContainSingle();
+
+        StrmSyncService.ParseMovieStreamId(File.ReadAllText(primary)).Should().Be(100);
+        StrmSyncService.ParseMovieStreamId(File.ReadAllText(Path.Combine(folder, "Twin (2024) - 200.strm"))).Should().Be(200);
+        File.Exists(alt).Should().BeFalse();
+    }
+
+    // The maintainer's first case. The guest of a TMDB group carries another label than the owner, so
+    // the file named like the folder never existed. Waiting on that name moved the guest onto it while
+    // the owner was still listed, on the first sync after the upgrade and, with cleanup on, on every
+    // full sync after it.
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task AGroupWithDifferentLabels_IsLeftAloneWhileItsOwnerIsListed(bool upgradeFromMain, bool cleanup)
+    {
+        VodInfoWithTmdbId(100, "42");
+        VodInfoWithTmdbId(101, "42");
+        var folder = Path.Combine(_libraryPath, "Movies", "Alpha (2024) [tmdbid-42]");
+        var ownerFile = Path.Combine(folder, "Alpha (2024) [tmdbid-42] - FHD.strm");
+        var guestFile = Path.Combine(folder, "Alpha (2024) [tmdbid-42] - 101.strm");
+        if (upgradeFromMain)
+        {
+            WriteMainStrm(ownerFile, 100);
+            WriteMainStrm(guestFile, 101);
+        }
+
+        StreamInfo[] Streams() =>
+        [
+            new StreamInfo { StreamId = 100, Name = "Alpha (2024) - [FHD]", ContainerExtension = "mp4" },
+            new StreamInfo { StreamId = 101, Name = "Beta (2024)", ContainerExtension = "mp4" },
+        ];
+
+        foreach (bool shipped in new[] { false, true, false, true })
+        {
+            var result = await RunMovieSyncAsync(Streams(), useShippedDefaults: shipped, groupByTmdbId: true, cleanupOrphans: cleanup).ConfigureAwait(true);
+
+            Directory.GetFiles(folder, "*.strm").Select(Path.GetFileName).OrderBy(f => f, StringComparer.Ordinal)
+                .Should().Equal(Path.GetFileName(ownerFile), Path.GetFileName(guestFile));
+            (await StreamIdOfAsync(ownerFile).ConfigureAwait(true)).Should().Be(100);
+            (await StreamIdOfAsync(guestFile).ConfigureAwait(true)).Should().Be(101);
+            result.MoviesDeleted.Should().Be(0);
+        }
+    }
+
+    // The same group once the owner is really gone: with cleanup on its file goes and the guest takes
+    // that file's place; with cleanup off nothing moves.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AGroupWithDifferentLabels_WhenTheOwnerLeaves_OnlyCleanupHandsOverItsFile(bool cleanup)
+    {
+        VodInfoWithTmdbId(100, "42");
+        VodInfoWithTmdbId(101, "42");
+        var folder = Path.Combine(_libraryPath, "Movies", "Alpha (2024) [tmdbid-42]");
+        await RunMovieSyncAsync(
+            [
+                new StreamInfo { StreamId = 100, Name = "Alpha (2024) - [FHD]", ContainerExtension = "mp4" },
+                new StreamInfo { StreamId = 101, Name = "Beta (2024)", ContainerExtension = "mp4" },
+            ],
+            useShippedDefaults: false,
+            groupByTmdbId: true).ConfigureAwait(true);
+
+        foreach (bool shipped in new[] { false, true, false })
+        {
+            await RunMovieSyncAsync(
+                [new StreamInfo { StreamId = 101, Name = "Beta (2024)", ContainerExtension = "mp4" }],
+                useShippedDefaults: shipped,
+                groupByTmdbId: true,
+                cleanupOrphans: cleanup).ConfigureAwait(true);
+
+            var files = Directory.GetFiles(folder, "*.strm");
+            files.Should().HaveCount(cleanup ? 1 : 2);
+            if (cleanup)
+            {
+                (await StreamIdOfAsync(files[0]).ConfigureAwait(true)).Should().Be(101);
+            }
+        }
+    }
+
+    // The maintainer's second case. A provider that renumbers every id leaves each primary naming a
+    // stream that no longer exists. Each new stream rewrites it in place, as before alternatives, so
+    // no movie gets a second file and cleanup has nothing to block on.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AProviderRenumberingItsIds_RewritesEveryPrimaryInPlace(bool cleanup)
+    {
+        const int Count = 12;
+        for (int i = 1; i <= Count; i++)
+        {
+            WriteMainStrm(Path.Combine(_libraryPath, "Movies", $"Movie {i:00} (2024)", $"Movie {i:00} (2024).strm"), i);
+        }
+
+        StreamInfo[] Renumbered() => Enumerable.Range(1, Count)
+            .Select(i => new StreamInfo { StreamId = 1000 + i, Name = $"Movie {i:00} (2024)", ContainerExtension = "mp4" })
+            .ToArray();
+
+        foreach (bool shipped in new[] { false, true, false })
+        {
+            var result = await RunMovieSyncAsync(Renumbered(), useShippedDefaults: shipped, cleanupOrphans: cleanup).ConfigureAwait(true);
+
+            for (int i = 1; i <= Count; i++)
+            {
+                var folder = Path.Combine(_libraryPath, "Movies", $"Movie {i:00} (2024)");
+                var files = Directory.GetFiles(folder, "*.strm");
+                files.Select(Path.GetFileName).Should().Equal($"Movie {i:00} (2024).strm");
+                (await StreamIdOfAsync(files[0]).ConfigureAwait(true)).Should().Be(1000 + i);
+            }
+
+            result.OrphanCleanupBlockedByThreshold.Should().BeFalse();
+            result.MoviesDeleted.Should().Be(0);
+        }
+    }
+
+    // Movies arrive in category batches. The stream that owns the primary on disk is only in the second
+    // batch, so when the first batch's stream meets that file it cannot yet tell the owner is listed.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task APrimaryOnDisk_StaysWithItsStream_WhenThatStreamIsListedInALaterBatch(bool cleanup)
+    {
+        var folder = Path.Combine(_libraryPath, "Movies", "Gamma (2024)");
+        WriteMainStrm(Path.Combine(folder, "Gamma (2024).strm"), 5);
+        SetTwoCategories(
+            new StreamInfo { StreamId = 500, Name = "Gamma (2024)", ContainerExtension = "mp4", CategoryId = 1 },
+            new StreamInfo { StreamId = 5, Name = "Gamma (2024)", ContainerExtension = "mp4", CategoryId = 2 });
+        _configure = p => p.CategoryBatchSize = 1;
+
+        foreach (bool shipped in new[] { false, true, false })
+        {
+            await RunSyncAsync(syncMovies: true, syncSeries: false, shipped, providerCount: 1, proactiveMediaInfo: false, groupByTmdbId: false, cleanup).ConfigureAwait(true);
+
+            (await StreamIdOfAsync(Path.Combine(folder, "Gamma (2024).strm")).ConfigureAwait(true)).Should().Be(5);
+            (await StreamIdOfAsync(Path.Combine(folder, "Gamma (2024) - 500.strm")).ConfigureAwait(true)).Should().Be(500);
+            Directory.GetFiles(folder, "*.strm").Should().HaveCount(2);
+        }
+    }
+
+    // A new folder gives the plain name to the lowest stream id, not to whichever stream the sync reached
+    // first, also when the two come in different category batches.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TheLowestStreamIdGetsThePlainName_EvenWhenItsCategoryComesLater(bool cleanup)
+    {
+        var folder = Path.Combine(_libraryPath, "Movies", "Twin Movie (2024)");
+        SetTwoCategories(
+            new StreamInfo { StreamId = 200, Name = "Twin Movie (2024)", ContainerExtension = "mp4", CategoryId = 1 },
+            new StreamInfo { StreamId = 100, Name = "Twin Movie (2024)", ContainerExtension = "mp4", CategoryId = 2 });
+        _configure = p => p.CategoryBatchSize = 1;
+
+        foreach (bool shipped in new[] { false, true, false })
+        {
+            await RunSyncAsync(syncMovies: true, syncSeries: false, shipped, providerCount: 1, proactiveMediaInfo: false, groupByTmdbId: false, cleanup).ConfigureAwait(true);
+
+            (await StreamIdOfAsync(Path.Combine(folder, "Twin Movie (2024).strm")).ConfigureAwait(true)).Should().Be(100);
+            (await StreamIdOfAsync(Path.Combine(folder, "Twin Movie (2024) - 200.strm")).ConfigureAwait(true)).Should().Be(200);
+            Directory.GetFiles(folder, "*.strm").Should().HaveCount(2);
+        }
+    }
+
+    private void SetTwoCategories(StreamInfo first, StreamInfo second)
+    {
+        _client.Setup(c => c.GetVodCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Category> { new() { CategoryId = 1, CategoryName = "One" }, new() { CategoryId = 2, CategoryName = "Two" } });
+        _client.Setup(c => c.GetVodStreamsByCategoryAsync(It.IsAny<ConnectionInfo>(), 1, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<StreamInfo> { first });
+        _client.Setup(c => c.GetVodStreamsByCategoryAsync(It.IsAny<ConnectionInfo>(), 2, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<StreamInfo> { second });
     }
 
     [Fact]
