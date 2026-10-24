@@ -424,7 +424,7 @@ public class StrmNameCollisionTests : IDisposable
             var result = await RunMovieSyncAsync(Streams(), useShippedDefaults: shipped, groupByTmdbId: true, cleanupOrphans: cleanup).ConfigureAwait(true);
 
             Directory.GetFiles(folder, "*.strm").Select(Path.GetFileName).OrderBy(f => f, StringComparer.Ordinal)
-                .Should().Equal(Path.GetFileName(ownerFile), Path.GetFileName(guestFile));
+                .Should().Equal(Path.GetFileName(guestFile), Path.GetFileName(ownerFile));
             (await StreamIdOfAsync(ownerFile).ConfigureAwait(true)).Should().Be(100);
             (await StreamIdOfAsync(guestFile).ConfigureAwait(true)).Should().Be(101);
             result.MoviesDeleted.Should().Be(0);
