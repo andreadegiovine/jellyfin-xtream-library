@@ -55,6 +55,12 @@ public partial class StrmSyncService
     private const int MovieItemPathDepth = 2;
     private const int EpisodeItemPathDepth = 3;
 
+    /// <summary>Time allowed to open a connection to an artwork host.</summary>
+    internal static readonly TimeSpan ArtworkConnectTimeout = TimeSpan.FromSeconds(3);
+
+    /// <summary>Time allowed for one whole artwork download.</summary>
+    internal static readonly TimeSpan ArtworkTotalTimeout = TimeSpan.FromSeconds(15);
+
     // Static HttpClient is intentional for connection pooling and efficient socket usage.
     // For image downloads, we don't need per-request configuration, and a shared client
     // improves performance by reusing TCP connections. A default User-Agent is set below.
@@ -81,6 +87,9 @@ public partial class StrmSyncService
     private CancellationTokenSource? _currentSyncCts;
     private volatile bool _syncSuppressed;
     private int _syncActive;
+
+    // One per sync, so a host skipped for failing is tried again on the next run.
+    private ArtworkHostBreaker _artworkBreaker = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="StrmSyncService"/> class.
@@ -285,6 +294,7 @@ public partial class StrmSyncService
         var config = Plugin.Instance.Configuration;
         config.Validate();
         var globalResult = new SyncResult { StartTime = DateTime.UtcNow };
+        _artworkBreaker = new ArtworkHostBreaker();
 
         // STRM paths written during this run, shared across every provider. Providers are allowed
         // to share a LibraryPath (PluginConfiguration only records HasDuplicateLibraryPaths, it
@@ -4488,7 +4498,28 @@ public partial class StrmSyncService
     /// <param name="destinationPath">The local path to save the image.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>True if download was successful, false otherwise.</returns>
-    private async Task<bool> DownloadImageAsync(string? imageUrl, string destinationPath, CancellationToken cancellationToken)
+    private Task<bool> DownloadImageAsync(string? imageUrl, string destinationPath, CancellationToken cancellationToken)
+        => DownloadImageCoreAsync(ImageHttpClient, _artworkBreaker, imageUrl, destinationPath, _logger, cancellationToken);
+
+    /// <summary>
+    /// Downloads one artwork file. Skips a file that already exists and a host the breaker has
+    /// given up on; writes to a temporary file first, so a failed or cut-off download never
+    /// leaves half an image behind; and refuses anything over <see cref="MaxImageBytes"/>.
+    /// </summary>
+    /// <param name="client">The HTTP client for images.</param>
+    /// <param name="breaker">The per-sync host breaker.</param>
+    /// <param name="imageUrl">The image URL.</param>
+    /// <param name="destinationPath">Where the image goes.</param>
+    /// <param name="logger">The logger.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>True when the image is on disk afterwards.</returns>
+    internal static async Task<bool> DownloadImageCoreAsync(
+        HttpClient client,
+        ArtworkHostBreaker breaker,
+        string? imageUrl,
+        string destinationPath,
+        ILogger logger,
+        CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(imageUrl))
         {
@@ -4501,40 +4532,118 @@ public partial class StrmSyncService
             return true;
         }
 
+        if (!Uri.TryCreate(imageUrl, UriKind.Absolute, out var uri))
+        {
+            return false;
+        }
+
+        var host = uri.Authority;
+        if (breaker.IsSkipped(host))
+        {
+            return false;
+        }
+
+        string? temporaryPath = null;
+
+        // HttpClient.Timeout stops counting once the headers are in (ResponseHeadersRead), so a
+        // server that stalls halfway through the image would hold the sync. One deadline covers
+        // the request and every read of the body.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (client.Timeout != Timeout.InfiniteTimeSpan)
+        {
+            deadline.CancelAfter(client.Timeout);
+        }
+
+        var token = deadline.Token;
         try
         {
-            // One deadline for headers and body: the client's own timeout ends once the headers are
-            // in, and a host that then sends a byte now and then would hold a download slot forever.
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            deadline.CancelAfter(TimeSpan.FromSeconds(30));
-            using var response = await ImageHttpClient.GetAsync(imageUrl, HttpCompletionOption.ResponseHeadersRead, deadline.Token).ConfigureAwait(false);
+            using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            if ((int)response.StatusCode >= 500)
+            {
+                NoteFailure(breaker, host, logger);
+                return false;
+            }
+
             if (!response.IsSuccessStatusCode)
             {
+                // A 404 or other refusal is a complete answer: the host is up.
+                breaker.RecordAnswer(host);
                 return false;
             }
 
-            var imageBytes = await ReadImageResponseAsync(response, deadline.Token).ConfigureAwait(false);
+            // The host only counts as answering once the image has arrived in full; one that
+            // sends headers and then stalls must still add up to being skipped.
+            var imageBytes = await ReadImageResponseAsync(response, token).ConfigureAwait(false);
+            breaker.RecordAnswer(host);
             if (imageBytes is null)
             {
-                _logger.LogDebug("Skipped image from {Url}: not an image, or larger than {Max} bytes", StreamUrlRedactor.Redact(imageUrl), MaxImageBytes);
+                logger.LogDebug("Skipped image from {Url}: not an image, or larger than {Max} bytes", StreamUrlRedactor.Redact(imageUrl), MaxImageBytes);
                 return false;
             }
 
-            // Ensure directory exists
             var directory = Path.GetDirectoryName(destinationPath);
             if (!string.IsNullOrEmpty(directory))
             {
                 Directory.CreateDirectory(directory);
             }
 
-            await File.WriteAllBytesAsync(destinationPath, imageBytes, cancellationToken).ConfigureAwait(false);
+            temporaryPath = destinationPath + ".part-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+            await File.WriteAllBytesAsync(temporaryPath, imageBytes, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                File.Move(temporaryPath, destinationPath, overwrite: false);
+            }
+            catch (IOException) when (File.Exists(destinationPath))
+            {
+                // Another download for the same file finished first. Its copy is complete, so
+                // keep it.
+            }
 
             return true;
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The sync is being stopped; that says nothing about the host.
+            return false;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or HttpIOException or OperationCanceledException)
+        {
+            // Connection refused, DNS failure, the connection dropping halfway through the image
+            // (HttpIOException), or the deadline. The caller's own cancellation is
+            // handled above, so a cancellation here is the timeout.
+            logger.LogDebug(ex, "Failed to download image from {Url}", StreamUrlRedactor.Redact(imageUrl));
+            NoteFailure(breaker, host, logger);
+            return false;
+        }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Failed to download image from {Url}", StreamUrlRedactor.Redact(imageUrl));
+            logger.LogDebug(ex, "Failed to download image from {Url}", StreamUrlRedactor.Redact(imageUrl));
             return false;
+        }
+        finally
+        {
+            if (temporaryPath != null)
+            {
+                try
+                {
+                    File.Delete(temporaryPath);
+                }
+                catch (IOException)
+                {
+                    // Best effort; a leftover .part file is replaced by the next attempt's own.
+                }
+            }
+        }
+    }
+
+    private static void NoteFailure(ArtworkHostBreaker breaker, string host, ILogger logger)
+    {
+        if (breaker.RecordFailure(host))
+        {
+            logger.LogWarning(
+                "Artwork host {Host} failed {Count} times in a row; skipping its images for the rest of this sync",
+                host,
+                ArtworkHostBreaker.FailureThreshold);
         }
     }
 
@@ -4809,9 +4918,15 @@ public partial class StrmSyncService
         }
     }
 
-    private static HttpClient CreateImageHttpClient()
+    /// <summary>
+    /// Builds the image client. Short timeouts: a host that does not answer used to hold each
+    /// image for 30 seconds, and the API calls keep their own, longer timeout.
+    /// </summary>
+    /// <returns>The client.</returns>
+    internal static HttpClient CreateImageHttpClient()
     {
-        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        var handler = new SocketsHttpHandler { ConnectTimeout = ArtworkConnectTimeout };
+        var client = new HttpClient(handler) { Timeout = ArtworkTotalTimeout };
         client.DefaultRequestHeaders.Add("User-Agent", "Jellyfin-Xtream-Library/1.0");
         return client;
     }
