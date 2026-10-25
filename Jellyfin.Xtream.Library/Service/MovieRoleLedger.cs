@@ -192,9 +192,10 @@ internal sealed class MovieRoleLedger
     }
 
     /// <summary>
-    /// Gives a primary file to an alternative when cleanup deleted it. Only a primary this run's
-    /// cleanup deleted counts, and only when the stream it belonged to is no longer listed, so a
-    /// primary that is still wanted, still on disk, or never existed is left alone.
+    /// Gives a primary file to an alternative when cleanup deleted the primary it waited on. Only a
+    /// primary this run's cleanup deleted counts, and only when the stream it belonged to is no longer
+    /// listed in this provider's catalogue, so a primary that is still wanted, belongs to another
+    /// provider, or never existed is left alone. The alternative takes its own primary name.
     /// </summary>
     /// <param name="deletedPrimaries">
     /// The movie files orphan cleanup deleted this run, with the stream each URL named before it
@@ -216,24 +217,28 @@ internal sealed class MovieRoleLedger
                 return changes;
             }
 
+            // Slots by folder, so each deleted path looks only at its own folder instead of every slot.
+            var slotsByFolder = _slots.Values
+                .GroupBy(s => Path.GetDirectoryName(s.PrimaryPath)!, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.OrdinalIgnoreCase);
+
             foreach (var deleted in deletedPrimaries.OrderBy(d => d.Key, StringComparer.Ordinal))
             {
                 string path = deleted.Key;
-                // Null: the URL named no stream, so nothing says it is gone. A file of another provider
-                // (StrmOwnerResolver.OtherProvider) is not in this provider's catalogue by definition, and
-                // cleanup has already taken it away.
+
+                // Null: the URL named no stream, so nothing says it is gone. Negative: the file belonged to
+                // another provider (StrmOwnerResolver.OtherProvider), which this provider's catalogue says
+                // nothing about, so it is not gone either.
                 if (deleted.Value is not int gone
+                    || gone < 0
                     || _catalogue.Contains(gone)
                     || IsAlternativeNameOf(Path.GetFileName(path), gone)
-                    || syncedFiles.ContainsKey(path)
-                    || File.Exists(path))
+                    || !slotsByFolder.TryGetValue(Path.GetDirectoryName(path)!, out var folderSlots))
                 {
                     continue;
                 }
 
-                string folder = Path.GetDirectoryName(path)!;
-                var candidate = _slots.Values
-                    .Where(s => string.Equals(Path.GetDirectoryName(s.PrimaryPath), folder, StringComparison.OrdinalIgnoreCase))
+                var candidate = folderSlots
                     .SelectMany(s => s.Alternatives.Values.Select(a => (Slot: s, Alternative: a)))
                     .Where(c => (string.Equals(c.Slot.PrimaryPath, path, StringComparison.OrdinalIgnoreCase)
                                  || (c.Alternative.GroupGuest && c.Alternative.WaitsOn == gone))
@@ -242,18 +247,27 @@ internal sealed class MovieRoleLedger
                     .OrderBy(c => c.Alternative.StreamId)
                     .Select(c => new { c.Slot, c.Alternative })
                     .FirstOrDefault();
-                if (candidate is null || !TryMove(candidate.Alternative.Path, path))
+                if (candidate is null)
                 {
                     continue;
                 }
 
+                // The promoted stream takes the name it would have as a primary: the deleted file's own name
+                // for a stream that waited on it, or its own label's name for a guest of a TMDB group whose
+                // owner carried another label. One rename now, and none on the next sync.
+                string target = candidate.Slot.PrimaryPath;
                 var moved = candidate.Alternative;
+                if (syncedFiles.ContainsKey(target) || File.Exists(target) || !TryMove(moved.Path, target))
+                {
+                    continue;
+                }
+
                 syncedFiles.TryRemove(moved.Path, out _);
-                syncedFiles.TryAdd(path, 0);
+                syncedFiles.TryAdd(target, 0);
                 claimedPaths.TryRemove(moved.Path, out _);
-                claimedPaths.TryAdd(path, 0);
+                claimedPaths.TryAdd(target, 0);
                 candidate.Slot.Alternatives.Remove(moved.StreamId);
-                changes.Add(new RoleChange("promotion", moved.StreamId, path, moved.Path));
+                changes.Add(new RoleChange("promotion", moved.StreamId, target, moved.Path));
             }
         }
 

@@ -2406,6 +2406,14 @@ public partial class StrmSyncService
                 Path.GetFileName(change.PrimaryPath),
                 Path.GetFileName(change.PreviousPath));
             ReassignGroupOwner(change.StreamId, allCollectedMovies, movieIdentities, groupingHint);
+
+            // The alternative this stream wrote was counted as a new movie, but the takeover only rewrote
+            // an existing primary in place, which is an update.
+            if (change.Kind == "takeover" && moviesCreated > 0)
+            {
+                moviesCreated--;
+                moviesUpdated++;
+            }
         }
 
         // Update result with thread-safe counters
