@@ -237,6 +237,40 @@ public class LiveTvServiceTests
         channels.Should().HaveCount(2);
     }
 
+    [Theory]
+    [InlineData(false, "api", "")]
+    [InlineData(true, "", "")]
+    [InlineData(true, "api", "086aab97-3c36-41f0-a417-b97f39a69f0f")]
+    public void ApplyRenderTimeFilters_KeepsADispatcharrUuidOnlyWhileTheModeIsOn(bool mode, string apiUser, string expected)
+    {
+        // BUG-038: the snapshot keeps the uuid; with Dispatcharr Mode off it kept proxy URLs in the
+        // playlist until the snapshot file was deleted by hand.
+        var config = new PluginConfiguration { IncludeAdultChannels = true, LiveChannelMode = LiveChannelSelectionMode.IncludeAll };
+        config.Providers.Add(new ProviderConfig { BaseUrl = "http://xtream.example.com", EnableDispatcharrMode = mode, DispatcharrApiUser = apiUser });
+        var channels = new List<LiveStreamInfo> { new() { StreamId = 1, ProviderIndex = 0, DispatcharrUuid = "086aab97-3c36-41f0-a417-b97f39a69f0f" } };
+
+        var result = LiveTvService.ApplyRenderTimeFilters(channels, config);
+
+        result[0].DispatcharrUuid.Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(false, "")]
+    [InlineData(true, "http://dispatcharr.example.com:9191")]
+    public void ResolveDispatcharrBaseUrl_IsEmptyWhileTheModeIsOff(bool mode, string expected)
+    {
+        var config = new PluginConfiguration();
+        config.Providers.Add(new ProviderConfig
+        {
+            BaseUrl = "http://xtream.example.com",
+            DispatcharrBaseUrl = "http://dispatcharr.example.com:9191",
+            EnableDispatcharrMode = mode,
+            DispatcharrApiUser = "api",
+        });
+
+        LiveTvService.ResolveDispatcharrBaseUrl(config, 0).Should().Be(expected);
+    }
+
     [Fact]
     public void ApplyRenderTimeFilters_ExcludedCategoriesReappliedOnSnapshotRestore()
     {

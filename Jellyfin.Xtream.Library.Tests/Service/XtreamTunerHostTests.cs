@@ -937,7 +937,7 @@ public class XtreamTunerHostTests : IDisposable
         // Clients such as Moonfin open the media source Path themselves for live channels, so it
         // must not carry the provider login (homelab-ops #550).
         var config = new PluginConfiguration();
-        config.Providers.Add(new ProviderConfig { BaseUrl = "http://xtream.example.com:9191/", Username = "user-a", IsEnabled = true });
+        config.Providers.Add(new ProviderConfig { BaseUrl = "http://xtream.example.com:9191/", Username = "user-a", IsEnabled = true, EnableDispatcharrMode = true, DispatcharrApiUser = "api" });
         var channel = new LiveStreamInfo { StreamId = 100, DispatcharrUuid = "086aab97-3c36-41f0-a417-b97f39a69f0f" };
 
         var url = XtreamTunerHost.BuildProxyStreamUrl(config, channel);
@@ -955,6 +955,8 @@ public class XtreamTunerHostTests : IDisposable
             BaseUrl = "http://xtream.example.com",
             DispatcharrBaseUrl = "http://dispatcharr.example.com:9191",
             IsEnabled = true,
+            EnableDispatcharrMode = true,
+            DispatcharrApiUser = "api",
         });
         var channel = new LiveStreamInfo { StreamId = 100, DispatcharrUuid = "abc" };
 
@@ -971,6 +973,8 @@ public class XtreamTunerHostTests : IDisposable
         config.EnableLiveTv = true;
         config.EnableNativeTuner = true;
         config.Providers[0].DispatcharrBaseUrl = "http://old-dispatcharr:9191";
+        config.Providers[0].EnableDispatcharrMode = true;
+        config.Providers[0].DispatcharrApiUser = "api";
         _mockClient
             .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new List<LiveStreamInfo> { new() { StreamId = 100, Name = "Test Channel", Num = 1, DispatcharrUuid = "abc" } });
@@ -980,6 +984,27 @@ public class XtreamTunerHostTests : IDisposable
         var result = await _tunerHost.GetChannelStreamMediaSources("xtream_100", CancellationToken.None);
 
         result[0].Path.Should().Be("http://new-dispatcharr:9191/proxy/ts/stream/abc");
+    }
+
+    [Fact]
+    public async Task GetChannelStreamMediaSources_DispatcharrModeSwitchedOff_PlaysTheXtreamUrl()
+    {
+        // BUG-038: a uuid cached while the mode was on must not keep the proxy URL after it is off.
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.Providers[0].EnableDispatcharrMode = true;
+        config.Providers[0].DispatcharrApiUser = "api";
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo> { new() { StreamId = 100, Name = "Test Channel", Num = 1, DispatcharrUuid = "086aab97-3c36-41f0-a417-b97f39a69f0f" } });
+        await _tunerHost.GetChannels(false, CancellationToken.None);
+
+        config.Providers[0].EnableDispatcharrMode = false;
+        var result = await _tunerHost.GetChannelStreamMediaSources("xtream_100", CancellationToken.None);
+
+        result[0].Path.Should().NotContain("/proxy/ts/stream/");
+        result[0].Path.Should().Contain("/live/");
     }
 
     [Fact]
