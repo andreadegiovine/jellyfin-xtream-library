@@ -14,9 +14,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.Linq;
+using System.Net;
 using System.Threading.Tasks;
 using FluentAssertions;
 using Jellyfin.Xtream.Library.Service;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Model.LiveTv;
@@ -36,11 +39,13 @@ public class NativeTunerRegistrationTests
     private readonly Mock<ITunerHostManager> _tunerHosts = new();
     private readonly Mock<ITaskManager> _tasks = new();
     private readonly Mock<IServerConfigurationManager> _serverConfig = new();
-    private readonly LiveTvOptions _liveTv = new() { TunerHosts = [] };
+    private readonly Mock<IServerApplicationHost> _appHost = new();
+    private readonly LiveTvOptions _liveTv = new() { TunerHosts = [], ListingProviders = [] };
 
     public NativeTunerRegistrationTests()
     {
         _serverConfig.Setup(c => c.GetConfiguration("livetv")).Returns(() => _liveTv);
+        _appHost.Setup(h => h.GetApiUrlForLocalAccess(It.IsAny<IPAddress>(), It.IsAny<bool>())).Returns("http://127.0.0.1:8096");
         _tunerHosts.Setup(t => t.SaveTunerHost(It.IsAny<TunerHostInfo>(), It.IsAny<bool>()))
             .ReturnsAsync((TunerHostInfo info, bool _) => info);
     }
@@ -191,11 +196,108 @@ public class NativeTunerRegistrationTests
     }
 
     private NativeTunerRegistration NewRegistration()
-        => new(_tunerHosts.Object, _tasks.Object, _serverConfig.Object, NullLogger<NativeTunerRegistration>.Instance);
+        => new(_tunerHosts.Object, _tasks.Object, _serverConfig.Object, _appHost.Object, NullLogger<NativeTunerRegistration>.Instance);
 
-    private async Task<bool> SyncAsync(bool liveTv, bool nativeTuner, bool atStartup = false)
+    private async Task<bool> SyncAsync(bool liveTv, bool nativeTuner, bool atStartup = false, bool epg = false)
     {
         using var registration = NewRegistration();
-        return await registration.SyncAsync(new PluginConfiguration { EnableLiveTv = liveTv, EnableNativeTuner = nativeTuner }, atStartup);
+        return await registration.SyncAsync(new PluginConfiguration { EnableLiveTv = liveTv, EnableNativeTuner = nativeTuner, EnableEpg = epg }, atStartup);
+    }
+
+    // GitHub #165: the native tuner brings channels, the guide comes from an XMLTV source.
+
+    [Fact]
+    public async Task NativeTunerAndEpgOn_NoGuideSource_AddsTheEpgXmlOnLoopback()
+    {
+        await SyncAsync(liveTv: true, nativeTuner: true, epg: true);
+
+        var source = _liveTv.ListingProviders.Should().ContainSingle().Subject;
+        source.Type.Should().Be("xmltv");
+        source.Path.Should().Be("http://127.0.0.1:8096/XtreamLibrary/Epg.xml?" + NativeTunerRegistration.GuideSourceMarker);
+        source.EnableAllTuners.Should().BeTrue();
+        source.Id.Should().NotBeNullOrEmpty();
+        _serverConfig.Verify(c => c.SaveConfiguration("livetv", _liveTv), Times.Once);
+    }
+
+    [Fact]
+    public async Task NativeTunerAndEpgOn_EpgXmlAddedByHand_AddsNothing()
+    {
+        // Everyone who set the guide up before this has one, often on localhost instead of 127.0.0.1.
+        _liveTv.ListingProviders = [new ListingsProviderInfo { Id = "manual", Type = "xmltv", Path = "http://localhost:8096/XtreamLibrary/Epg.xml" }];
+
+        await SyncAsync(liveTv: true, nativeTuner: true, epg: true);
+
+        _liveTv.ListingProviders.Select(p => p.Id).Should().Equal("manual");
+        _serverConfig.Verify(c => c.SaveConfiguration("livetv", It.IsAny<object>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task NativeTunerAndEpgOn_OnlyAnotherXmltvSource_StillAddsOurs()
+    {
+        _liveTv.ListingProviders = [new ListingsProviderInfo { Id = "other", Type = "xmltv", Path = "https://epg.example/guide.xml" }];
+
+        await SyncAsync(liveTv: true, nativeTuner: true, epg: true);
+
+        _liveTv.ListingProviders.Should().HaveCount(2);
+        _liveTv.ListingProviders[0].Id.Should().Be("other");
+    }
+
+    [Theory]
+    [InlineData(true, true, false)]
+    [InlineData(true, false, true)]
+    [InlineData(false, true, true)]
+    public async Task GuideNotWanted_RemovesOnlyTheSourceThePluginAdded(bool liveTv, bool nativeTuner, bool epg)
+    {
+        _liveTv.ListingProviders =
+        [
+            new ListingsProviderInfo { Id = "ours", Type = "xmltv", Path = "http://127.0.0.1:8096/XtreamLibrary/Epg.xml?" + NativeTunerRegistration.GuideSourceMarker },
+            new ListingsProviderInfo { Id = "manual", Type = "xmltv", Path = "http://localhost:8096/XtreamLibrary/Epg.xml" },
+            new ListingsProviderInfo { Id = "other", Type = "xmltv", Path = "https://epg.example/guide.xml" },
+        ];
+
+        await SyncAsync(liveTv, nativeTuner, epg: epg);
+
+        _liveTv.ListingProviders.Select(p => p.Id).Should().Equal("manual", "other");
+    }
+
+    [Fact]
+    public async Task EpgOff_NoGuideSource_SavesNothing()
+    {
+        await SyncAsync(liveTv: true, nativeTuner: true, epg: false);
+
+        _liveTv.ListingProviders.Should().BeEmpty();
+        _serverConfig.Verify(c => c.SaveConfiguration("livetv", It.IsAny<object>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ChangingOnlyTheGuideSource_RefreshesTheGuideOnce(bool epgOn)
+    {
+        // With the tuner already listed nothing else asks for a refresh, so the programmes would
+        // only appear, or go, after the daily run.
+        _liveTv.TunerHosts = [new TunerHostInfo { Id = "manual", Type = XtreamTunerHost.TunerType, FriendlyName = "Xtream Library" }];
+        if (!epgOn)
+        {
+            _liveTv.ListingProviders = [new ListingsProviderInfo { Id = "ours", Type = "xmltv", Path = "http://127.0.0.1:8096/XtreamLibrary/Epg.xml?" + NativeTunerRegistration.GuideSourceMarker }];
+        }
+
+        var refresh = SetUpRefreshGuideTask();
+
+        await SyncAsync(liveTv: true, nativeTuner: true, epg: epgOn);
+
+        _tasks.Verify(t => t.QueueScheduledTask(refresh, It.IsAny<TaskOptions>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task AddingOnlyTheGuideSource_StillReportsAnAddition()
+    {
+        // The tuner is already listed; the caller then queues the guide refresh at startup.
+        _liveTv.TunerHosts = [new TunerHostInfo { Id = "manual", Type = XtreamTunerHost.TunerType, FriendlyName = "Xtream Library" }];
+
+        var added = await SyncAsync(liveTv: true, nativeTuner: true, atStartup: true, epg: true);
+
+        added.Should().BeTrue();
+        _liveTv.ListingProviders.Should().ContainSingle();
     }
 }

@@ -15,9 +15,11 @@
 
 using System;
 using System.Linq;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using MediaBrowser.Common.Configuration;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Model.LiveTv;
@@ -41,13 +43,28 @@ namespace Jellyfin.Xtream.Library.Service;
 /// The entry this class adds carries <see cref="FriendlyName"/>, so it can tell its own entry
 /// from one a user added by hand. Switching the native tuner off removes only its own.
 /// </para>
+/// <para>
+/// With EPG on as well, it also adds the plugin's Epg.xml as an XMLTV source under TV Guide Data
+/// Providers (GitHub #165), since the tuner brings channels but no programmes. That entry is
+/// marked by <see cref="GuideSourceMarker"/> in its address, and the same rules apply: an XMLTV
+/// source already pointing at Epg.xml, added by hand, is reused and never removed.
+/// </para>
 /// </summary>
 public sealed class NativeTunerRegistration : IHostedService, IDisposable
 {
     /// <summary>The name shown under Tuner Devices for the entry this class adds.</summary>
     internal const string FriendlyName = "Xtream Library (added by the plugin)";
 
+    /// <summary>Query string on the Epg.xml address of the guide source this class adds. Epg.xml
+    /// ignores it; it is only there to tell that entry from one added by hand.</summary>
+    internal const string GuideSourceMarker = "added-by=xtream-library";
+
     private const string LiveTvConfigKey = "livetv";
+
+    // XmlTvListingsProvider.Type in Jellyfin.LiveTv, which plugins cannot reference.
+    private const string XmlTvType = "xmltv";
+
+    private const string EpgPath = "/XtreamLibrary/Epg.xml";
 
     // RefreshGuideScheduledTask.Key in Jellyfin.LiveTv, which plugins cannot reference.
     private const string RefreshGuideTaskKey = "RefreshGuide";
@@ -55,6 +72,7 @@ public sealed class NativeTunerRegistration : IHostedService, IDisposable
     private readonly ITunerHostManager _tunerHostManager;
     private readonly ITaskManager _taskManager;
     private readonly IServerConfigurationManager _serverConfig;
+    private readonly IServerApplicationHost _appHost;
     private readonly ILogger<NativeTunerRegistration> _logger;
     private readonly SemaphoreSlim _sync = new(1, 1);
     private EventHandler<BasePluginConfiguration>? _subscribedHandler;
@@ -66,16 +84,19 @@ public sealed class NativeTunerRegistration : IHostedService, IDisposable
     /// <param name="tunerHostManager">Jellyfin's tuner host manager.</param>
     /// <param name="taskManager">Jellyfin's scheduled task manager.</param>
     /// <param name="serverConfig">The Jellyfin server configuration manager.</param>
+    /// <param name="appHost">The Jellyfin server, for the address it reaches itself on.</param>
     /// <param name="logger">The logger.</param>
     public NativeTunerRegistration(
         ITunerHostManager tunerHostManager,
         ITaskManager taskManager,
         IServerConfigurationManager serverConfig,
+        IServerApplicationHost appHost,
         ILogger<NativeTunerRegistration> logger)
     {
         _tunerHostManager = tunerHostManager ?? throw new ArgumentNullException(nameof(tunerHostManager));
         _taskManager = taskManager ?? throw new ArgumentNullException(nameof(taskManager));
         _serverConfig = serverConfig ?? throw new ArgumentNullException(nameof(serverConfig));
+        _appHost = appHost ?? throw new ArgumentNullException(nameof(appHost));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -128,58 +149,143 @@ public sealed class NativeTunerRegistration : IHostedService, IDisposable
                 return false;
             }
 
-            var tuners = _serverConfig.GetConfiguration<LiveTvOptions>(LiveTvConfigKey).TunerHosts ?? Array.Empty<TunerHostInfo>();
-            bool wanted = config.EnableLiveTv && config.EnableNativeTuner;
+            // The guide source first, so the refresh that adding the tuner starts already reads it.
+            var (guideAdded, guideRemoved) = SyncGuideSource(config);
+            var (tunerAdded, tunerSwitched) = await SyncTunerAsync(config, atStartup).ConfigureAwait(false);
 
-            // Switching the native tuner on or off changes which channels it reports, but a
-            // settings save does not refresh the guide by itself. Adding an entry does that
-            // through SaveTunerHost; otherwise ask for it here. Not at startup: the tasks are not
-            // loaded yet, and nothing has changed since the last run.
-            bool switched = !atStartup && _lastWanted.HasValue && _lastWanted.Value != wanted;
-            _lastWanted = wanted;
-
-            if (wanted)
-            {
-                // Any entry of this type will do, including one added by hand before this existed.
-                if (!tuners.Any(t => string.Equals(t.Type, XtreamTunerHost.TunerType, StringComparison.OrdinalIgnoreCase)))
-                {
-                    await _tunerHostManager.SaveTunerHost(
-                        new TunerHostInfo
-                        {
-                            Type = XtreamTunerHost.TunerType,
-                            FriendlyName = FriendlyName,
-                        },
-                        dataSourceChanged: !atStartup).ConfigureAwait(false);
-                    _logger.LogInformation("Added the Xtream Library native tuner under Live TV Tuner Devices");
-                    return true;
-                }
-
-                if (switched)
-                {
-                    await QueueGuideRefreshWhenReadyAsync(TimeSpan.Zero, TimeSpan.Zero).ConfigureAwait(false);
-                }
-
-                return false;
-            }
-
-            foreach (var entry in tuners.Where(IsOwnEntry).ToList())
-            {
-                _tunerHostManager.DeleteTunerHost(entry.Id);
-                _logger.LogInformation("Removed the Xtream Library native tuner from Live TV Tuner Devices, since Native Tuner is off");
-            }
-
-            if (switched)
+            // Switching the native tuner on or off changes which channels it reports, and a new
+            // guide source brings programmes, but a settings save does not refresh the guide by
+            // itself. Adding the tuner already asks for one through SaveTunerHost, and at startup
+            // the caller queues it once the tasks are loaded. One refresh covers both.
+            if ((tunerSwitched || guideAdded || guideRemoved) && !tunerAdded && !atStartup)
             {
                 await QueueGuideRefreshWhenReadyAsync(TimeSpan.Zero, TimeSpan.Zero).ConfigureAwait(false);
             }
 
-            return false;
+            return tunerAdded || guideAdded;
         }
         finally
         {
             _sync.Release();
         }
     }
+
+    private async Task<(bool Added, bool Switched)> SyncTunerAsync(PluginConfiguration config, bool atStartup)
+    {
+        var tuners = _serverConfig.GetConfiguration<LiveTvOptions>(LiveTvConfigKey).TunerHosts ?? Array.Empty<TunerHostInfo>();
+        bool wanted = config.EnableLiveTv && config.EnableNativeTuner;
+
+        // Not at startup: nothing has changed since the last run.
+        bool switched = !atStartup && _lastWanted.HasValue && _lastWanted.Value != wanted;
+        _lastWanted = wanted;
+
+        if (wanted)
+        {
+            // Any entry of this type will do, including one added by hand before this existed.
+            if (!tuners.Any(t => string.Equals(t.Type, XtreamTunerHost.TunerType, StringComparison.OrdinalIgnoreCase)))
+            {
+                await _tunerHostManager.SaveTunerHost(
+                    new TunerHostInfo
+                    {
+                        Type = XtreamTunerHost.TunerType,
+                        FriendlyName = FriendlyName,
+                    },
+                    dataSourceChanged: !atStartup).ConfigureAwait(false);
+                _logger.LogInformation("Added the Xtream Library native tuner under Live TV Tuner Devices");
+                return (true, switched);
+            }
+
+            return (false, switched);
+        }
+
+        foreach (var entry in tuners.Where(IsOwnEntry).ToList())
+        {
+            _tunerHostManager.DeleteTunerHost(entry.Id);
+            _logger.LogInformation("Removed the Xtream Library native tuner from Live TV Tuner Devices, since Native Tuner is off");
+        }
+
+        return (false, switched);
+    }
+
+    /// <summary>
+    /// Adds or removes the plugin's own XMLTV guide source to match the plugin settings.
+    /// </summary>
+    /// <param name="config">The plugin configuration.</param>
+    /// <returns>Whether a source was added, and whether one was removed.</returns>
+    private (bool Added, bool Removed) SyncGuideSource(PluginConfiguration config)
+    {
+        var options = _serverConfig.GetConfiguration<LiveTvOptions>(LiveTvConfigKey);
+        var sources = options.ListingProviders ?? Array.Empty<ListingsProviderInfo>();
+        bool wanted = config.EnableLiveTv && config.EnableNativeTuner && config.EnableEpg;
+
+        if (wanted)
+        {
+            // Any XMLTV source on Epg.xml will do, including one added by hand before this existed.
+            if (sources.Any(IsPluginGuideSource))
+            {
+                return (false, false);
+            }
+
+            string baseUrl;
+            try
+            {
+                baseUrl = _appHost.GetApiUrlForLocalAccess(IPAddress.Loopback, false) ?? string.Empty;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not work out the address Jellyfin reaches itself on; add the EPG URL under TV Guide Data Providers by hand");
+                return (false, false);
+            }
+
+            if (string.IsNullOrEmpty(baseUrl))
+            {
+                return (false, false);
+            }
+
+            options.ListingProviders =
+            [
+                .. sources,
+                new ListingsProviderInfo
+                {
+                    Id = Guid.NewGuid().ToString("N", System.Globalization.CultureInfo.InvariantCulture),
+                    Type = XmlTvType,
+                    Path = baseUrl.TrimEnd('/') + EpgPath + "?" + GuideSourceMarker,
+                    EnableAllTuners = true,
+                },
+            ];
+            _serverConfig.SaveConfiguration(LiveTvConfigKey, options);
+            _logger.LogInformation("Added the plugin's Epg.xml under Live TV TV Guide Data Providers");
+
+            // Jellyfin fetches the guide from its own loopback address. An allow-list without it
+            // would answer that fetch with 404 and leave the guide empty.
+            if (IpAllowListParser.HasEntries(config.LiveTvEndpointAllowedIps)
+                && !IpAllowListParser.IsAllowed(IPAddress.Loopback, IpAllowListParser.Parse(config.LiveTvEndpointAllowedIps)))
+            {
+                _logger.LogWarning("The Live TV allow-list does not include 127.0.0.1, so Jellyfin cannot read the guide it was given; add 127.0.0.1 to it");
+            }
+
+            return (true, false);
+        }
+
+        var own = sources.Where(IsOwnGuideSource).ToList();
+        if (own.Count > 0)
+        {
+            options.ListingProviders = sources.Except(own).ToArray();
+            _serverConfig.SaveConfiguration(LiveTvConfigKey, options);
+            _logger.LogInformation("Removed the plugin's Epg.xml from Live TV TV Guide Data Providers, since the native tuner or EPG is off");
+            return (false, true);
+        }
+
+        return (false, false);
+    }
+
+    private static bool IsPluginGuideSource(ListingsProviderInfo info)
+        => string.Equals(info.Type, XmlTvType, StringComparison.OrdinalIgnoreCase)
+            && info.Path is not null
+            && info.Path.Contains(EpgPath, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsOwnGuideSource(ListingsProviderInfo info)
+        => IsPluginGuideSource(info) && info.Path!.Contains(GuideSourceMarker, StringComparison.Ordinal);
 
     /// <inheritdoc />
     public void Dispose() => _sync.Dispose();
