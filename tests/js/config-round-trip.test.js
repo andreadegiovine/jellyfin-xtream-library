@@ -326,6 +326,42 @@ test('the delete question names the saved provider and folder, and what is lost'
     assert.match(message, /not saved/);
 });
 
+test('the duplicate tuner warning shows only with the native tuner chosen', async () => {
+    const { cfg, page } = await roundTrip(fixture());
+    cfg.m3uTunerOnPluginPlaylist = true;
+    cfg.updateTunerHint();
+    assert.strictEqual(page.elements.duplicateTunerWarning.style.display, '');
+
+    cfg.chooseTuner('m3u');
+    assert.strictEqual(page.elements.duplicateTunerWarning.style.display, 'none');
+
+    cfg.chooseTuner('native');
+    cfg.m3uTunerOnPluginPlaylist = false;
+    cfg.updateTunerHint();
+    assert.strictEqual(page.elements.duplicateTunerWarning.style.display, 'none');
+});
+
+test('a failed tuner check clears an earlier duplicate tuner warning', async () => {
+    // The dashboard keeps the config object across visits; a stale "true" must not survive a
+    // check that fails.
+    const { cfg, page } = await roundTrip(fixture());
+    cfg.m3uTunerOnPluginPlaylist = true;
+    const previousFetch = global.fetch;
+    const previousApiClient = global.ApiClient;
+    global.fetch = () => Promise.reject(new Error('offline'));
+    global.ApiClient = Object.assign({}, previousApiClient, { getUrl: (u) => u, accessToken: () => 't' });
+    try {
+        cfg.checkDuplicateTuner();
+        await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+        global.fetch = previousFetch;
+        global.ApiClient = previousApiClient;
+    }
+
+    assert.strictEqual(cfg.m3uTunerOnPluginPlaylist, false);
+    assert.strictEqual(page.elements.duplicateTunerWarning.style.display, 'none');
+});
+
 test('the native tuner hint says when the playlists are still published', async () => {
     const { cfg, page } = await roundTrip(Object.assign(fixture(), { EnableNativeTuner: true, PublishLiveTvPlaylists: true }));
     assert.match(page.elements.tunerChoiceHint.innerHTML, /still on/);

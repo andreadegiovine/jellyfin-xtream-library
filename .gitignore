@@ -76,3 +76,6 @@ docs/superpowers/
 
 # Claude Code per-user settings; holds permission rules that can carry credentials
 .claude/settings.local.json
+
+# Live TV performance notes, measured on the homelab server; kept local
+docs/performance/

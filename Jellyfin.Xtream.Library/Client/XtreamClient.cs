@@ -281,6 +281,19 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
         }
     }
 
+    private static bool IsEmptyJsonArray(string body)
+    {
+        // A blank body is deliberately not matched: GetStringWithRetryAsync also serves XMLTV,
+        // and only a literal empty JSON list is the symptom handled here.
+        ReadOnlySpan<char> span = body.AsSpan().Trim();
+        if (span.Length < 2 || span[0] != '[' || span[^1] != ']')
+        {
+            return false;
+        }
+
+        return span[1..^1].IsWhiteSpace(); // "[]" or "[  ]"
+    }
+
     private async Task<string> GetStringWithRetryAsync(Uri uri, CancellationToken cancellationToken)
     {
         EnsureUserAgent();
@@ -305,7 +318,16 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
                 using var response = await client.GetAsync(uri, timeoutCts.Token).ConfigureAwait(false);
                 response.EnsureSuccessStatusCode();
 
-                return await response.Content.ReadAsStringAsync(timeoutCts.Token).ConfigureAwait(false);
+                string body = await response.Content.ReadAsStringAsync(timeoutCts.Token).ConfigureAwait(false);
+
+                // Some providers answer an otherwise valid request with an empty list when they are
+                // overloaded; treat it like a transient failure and let the retry loop handle it.
+                if (IsEmptyJsonArray(body))
+                {
+                    throw new EmptyResponseException();
+                }
+
+                return body;
             }
             catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests ||
                 (ex.StatusCode.HasValue && (int)ex.StatusCode.Value >= 500))
@@ -320,6 +342,30 @@ public class XtreamClient(HttpClient client, ILogger<XtreamClient> logger) : IXt
 
                 // Every request to this host waits out the backoff, not only this one; the retry
                 // below takes its turn after it like everything else.
+                RequestGate.Pause(uri, currentDelay);
+                retryCount++;
+                currentDelay = Math.Min(currentDelay * 2, MaxRetryDelayMs); // Exponential backoff, capped
+            }
+            catch (EmptyResponseException)
+            {
+                if (retryCount >= MaxRetries)
+                {
+                    // An empty list can be a legitimate answer (empty category, account without
+                    // series), so after the last attempt hand it back instead of failing the fetch.
+                    logger.LogWarning(
+                        "Still empty after {Retries} retries for URL: {Url}, returning empty result",
+                        retryCount,
+                        StreamUrlRedactor.Redact(uri));
+                    return "[]";
+                }
+
+                logger.LogWarning(
+                    "Empty response for URL: {Url}. Retry {Retry}/{MaxRetries} after {Delay}ms",
+                    StreamUrlRedactor.Redact(uri),
+                    retryCount + 1,
+                    MaxRetries,
+                    currentDelay);
+
                 RequestGate.Pause(uri, currentDelay);
                 retryCount++;
                 currentDelay = Math.Min(currentDelay * 2, MaxRetryDelayMs); // Exponential backoff, capped
