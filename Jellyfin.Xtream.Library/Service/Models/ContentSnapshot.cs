@@ -51,6 +51,19 @@ public class ContentSnapshot
     public Dictionary<int, SeriesSnapshot> Series { get; set; } = new();
 
     /// <summary>
+    /// Gets or sets, per VOD category id, when that category was first unread: its listing failed
+    /// or came back empty while this snapshot still held movies under it. Those movies are kept on
+    /// disk and in <see cref="Movies"/> until the category answers again or has been unread longer
+    /// than the provider's full sync interval (GitHub #171). Empty in older snapshots.
+    /// </summary>
+    public Dictionary<int, DateTime> UnreadMovieCategoriesSince { get; set; } = new();
+
+    /// <summary>
+    /// Gets or sets the same as <see cref="UnreadMovieCategoriesSince"/>, for series categories.
+    /// </summary>
+    public Dictionary<int, DateTime> UnreadSeriesCategoriesSince { get; set; } = new();
+
+    /// <summary>
     /// Gets or sets metadata about this snapshot.
     /// </summary>
     public SnapshotMetadata Metadata { get; set; } = new();

@@ -1190,6 +1190,20 @@ var XtreamLibraryConfig = (function () {
             html += '</div>';
         }
 
+        // Items whose category failed to load or came back empty this run, kept instead of
+        // deleted (GitHub #171). The log names the categories.
+        var keptMovies = result.MoviesKeptForUnreadCategories || 0;
+        var keptSeries = result.SeriesKeptForUnreadCategories || 0;
+        if (keptMovies + keptSeries > 0) {
+            var keptParts = [];
+            if (keptMovies > 0) keptParts.push(keptMovies.toLocaleString() + ' movies');
+            if (keptSeries > 0) keptParts.push(keptSeries.toLocaleString() + ' series');
+            html += '<div class="sync-warning-panel">';
+            html += '<div class="sync-warning-title">Kept ' + keptParts.join(' and ') + ' from categories the provider did not list this time</div>';
+            html += '<div class="sync-warning-detail">Those categories failed to load or came back empty. Their items stay until the categories answer again, or are removed once a category has been empty for longer than the full sync interval. The server log names the categories.</div>';
+            html += '</div>';
+        }
+
         html += '<br/><br/>';
         html += '<strong>Movies</strong><br/>';
         html += '&nbsp;&nbsp;Total: ' + (result.TotalMovies || (result.MoviesCreated + result.MoviesSkipped)) + '<br/>';
