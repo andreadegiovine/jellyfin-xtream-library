@@ -792,13 +792,33 @@ public partial class StrmSyncService
             CurrentProgress.Phase = "Cleaning up orphans";
             CurrentProgress.CurrentItem = string.Empty;
 
-            // A movie file whose URL points at another provider's server is that provider's to clean up:
-            // this provider's catalogue says nothing about its stream, so it is not an orphan here.
-            // Otherwise two providers on one path delete and recreate each other's files on every sync.
+            // A movie file whose URL points at another configured provider on this path is that
+            // provider's to clean up: this provider's catalogue says nothing about its stream, so it is
+            // not an orphan here. Otherwise two providers on one path delete and recreate each other's
+            // files on every sync. A file from a server no provider uses any more is still an orphan.
+            var siblingOwners = SharingProviders(Plugin.Instance.Configuration.Providers, provider)
+                .Where(other => !ReferenceEquals(other, provider))
+                .Select(other =>
+                {
+                    var otherConnection = new ConnectionInfo(other.BaseUrl, other.Username, other.Password);
+                    return new StrmOwnerResolver(otherConnection.BaseUrl, true, null, otherConnection.UserName);
+                })
+                .ToList();
+            bool BelongsToSiblingProvider(string file)
+            {
+                if (siblingOwners.Count == 0 || !file.StartsWith(moviesPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                string? url = ReadStrmUrl(file);
+                return movieOwners.OwnerOf(url) == StrmOwnerResolver.OtherProvider
+                    && siblingOwners.Any(sibling => sibling.OwnerOf(url) is int owner && owner >= 0);
+            }
+
             var orphanedFiles = existingStrmFiles
                 .Except(syncedFiles.Keys, StringComparer.OrdinalIgnoreCase)
-                .Where(f => !(f.StartsWith(moviesPath, StringComparison.OrdinalIgnoreCase)
-                              && movieOwners.OwnerOf(ReadStrmUrl(f)) == StrmOwnerResolver.OtherProvider))
+                .Where(f => !BelongsToSiblingProvider(f))
                 .ToList();
 
             // Protection: Check if deletion would exceed safety threshold (provider glitch protection)
