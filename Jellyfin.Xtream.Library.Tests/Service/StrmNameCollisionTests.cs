@@ -774,8 +774,7 @@ public class StrmNameCollisionTests : IDisposable
 
     // Stream ids are only unique within a provider. Provider 0 and provider 1 both list a stream 100
     // for the same title; whichever leaves, the other one's file must neither be kept as if it were
-    // its own nor left without a primary. Only the staying provider cleans up, so the outcome is
-    // decided by who each file belongs to and not by one provider wiping the shared path.
+    // its own nor left without a primary. Each provider only cleans up what its own URLs wrote.
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
@@ -793,11 +792,10 @@ public class StrmNameCollisionTests : IDisposable
 
         SetProviderCatalogue(leaving, new StreamInfo { StreamId = 999, Name = "Other Movie (2023)", ContainerExtension = "mp4" });
         SetProviderCatalogue(staying, SharedMovie());
-        _configure = p => p.CleanupOrphans = p.Name == $"test{staying}";
+        _configure = p => p.CleanupOrphans = true;
 
-        // A file of the other provider is never promoted over: this provider's catalogue cannot say that
-        // its stream is gone. Cleanup removes it, and the next full sync names the staying provider's own
-        // file like the folder.
+        // The leaving provider removes its own file; the staying one never touches it, because its
+        // catalogue cannot say that stream is gone, and the next full sync names its own file like the folder.
         await RunSyncAsync(syncMovies: true, syncSeries: false, useShippedDefaults: true, providerCount: 2).ConfigureAwait(true);
         await RunSyncAsync(syncMovies: true, syncSeries: false, useShippedDefaults: false, providerCount: 2).ConfigureAwait(true);
 

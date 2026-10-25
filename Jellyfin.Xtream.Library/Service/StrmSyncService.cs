@@ -791,7 +791,15 @@ public partial class StrmSyncService
         {
             CurrentProgress.Phase = "Cleaning up orphans";
             CurrentProgress.CurrentItem = string.Empty;
-            var orphanedFiles = existingStrmFiles.Except(syncedFiles.Keys, StringComparer.OrdinalIgnoreCase).ToList();
+
+            // A movie file whose URL points at another provider's server is that provider's to clean up:
+            // this provider's catalogue says nothing about its stream, so it is not an orphan here.
+            // Otherwise two providers on one path delete and recreate each other's files on every sync.
+            var orphanedFiles = existingStrmFiles
+                .Except(syncedFiles.Keys, StringComparer.OrdinalIgnoreCase)
+                .Where(f => !(f.StartsWith(moviesPath, StringComparison.OrdinalIgnoreCase)
+                              && movieOwners.OwnerOf(ReadStrmUrl(f)) == StrmOwnerResolver.OtherProvider))
+                .ToList();
 
             // Protection: Check if deletion would exceed safety threshold (provider glitch protection)
             double safetyThreshold = provider.OrphanSafetyThreshold;
