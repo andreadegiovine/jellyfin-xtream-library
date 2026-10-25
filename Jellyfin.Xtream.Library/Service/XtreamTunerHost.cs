@@ -447,6 +447,13 @@ public class XtreamTunerHost : ITunerHost
                 RealFrameRate = stats.SourceFps.HasValue ? (float)stats.SourceFps.Value : null,
                 AverageFrameRate = stats.SourceFps.HasValue ? (float)stats.SourceFps.Value : null,
                 BitRate = stats.Bitrate.HasValue ? (int)Math.Round(stats.Bitrate.Value * 1000) : null,
+
+                // Without these Jellyfin wrote its own defaults into the HLS CODECS attribute
+                // (avc1.424029, Constrained Baseline 4.1, for a High 4.2 stream; L120 for HEVC
+                // 4.1), and skipped every profile and level check, so a stream a client said it
+                // cannot play was copied to it anyway (homelab-ops #550).
+                Profile = stats.VideoProfile,
+                Level = stats.VideoLevel,
             };
             mediaStreams.Add(videoStream);
 
@@ -459,7 +466,10 @@ public class XtreamTunerHost : ITunerHost
                 Type = MediaStreamType.Audio,
                 Index = -1,
                 Codec = audioCodec,
-                Channels = audioCodec is null ? null : stats.AudioChannels,
+
+                // Declared even when the audio is re-encoded: without it Jellyfin took the
+                // client's maximum, and a stereo channel came out as 5.1 (homelab-ops #550).
+                Channels = stats.AudioChannels,
                 SampleRate = audioCodec is null ? null : stats.AudioSampleRate,
                 BitRate = audioCodec is null || stats.AudioBitrate is null ? null : stats.AudioBitrate * 1000,
             });

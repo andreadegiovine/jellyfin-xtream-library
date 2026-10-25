@@ -280,6 +280,38 @@ public class XtreamTunerHostTests : IDisposable
     #region GetChannelStreamMediaSources
 
     [Fact]
+    public void CreateMediaSourceInfo_DeclaresProfileLevelAndAudioChannelsFromTheStats()
+    {
+        // Without them Jellyfin wrote avc1.424029 (Constrained Baseline 4.1) into the HLS CODECS
+        // for a High 4.2 stream, skipped its profile and level checks, and re-encoded stereo audio
+        // to 5.1 (homelab-ops #550).
+        var stats = Newtonsoft.Json.JsonConvert.DeserializeObject<StreamStatsInfo>(
+            """{"video_codec":"h264","resolution":"1920x1080","source_fps":50,"video_profile":"High","video_level":42,"audio_codec":"aac","audio_channels":2,"audio_sample_rate":48000}""")!;
+
+        var source = XtreamTunerHost.CreateMediaSourceInfo("xtream_1", "http://host/proxy/ts/stream/x", stats, false, new PluginConfiguration(), NullLogger.Instance);
+
+        var video = source.MediaStreams.Single(s => s.Type == MediaStreamType.Video);
+        video.Profile.Should().Be("High");
+        video.Level.Should().Be(42);
+        var audio = source.MediaStreams.Single(s => s.Type == MediaStreamType.Audio);
+        audio.Codec.Should().BeNull("the audio is still re-encoded unless LiveTvCopyAudio is on");
+        audio.Channels.Should().Be(2);
+    }
+
+    [Fact]
+    public void CreateMediaSourceInfo_LeavesProfileAndLevelOutWhenTheStatsHaveNone()
+    {
+        var stats = Newtonsoft.Json.JsonConvert.DeserializeObject<StreamStatsInfo>("""{"video_codec":"hevc","resolution":"1920x1080"}""")!;
+
+        var source = XtreamTunerHost.CreateMediaSourceInfo("xtream_1", "http://host/x", stats, false, new PluginConfiguration(), NullLogger.Instance);
+
+        var video = source.MediaStreams.Single(s => s.Type == MediaStreamType.Video);
+        video.Profile.Should().BeNull();
+        video.Level.Should().BeNull();
+        source.MediaStreams.Single(s => s.Type == MediaStreamType.Audio).Channels.Should().BeNull();
+    }
+
+    [Fact]
     public async Task GetChannelStreamMediaSources_WithoutStats_ReturnsSingleSource_WithProbingEnabled()
     {
         var config = Plugin.Instance.Configuration;

@@ -50,6 +50,14 @@ public class StreamStatsInfo
     [JsonProperty("audio_bitrate")]
     public JToken? AudioBitrateRaw { get; set; }
 
+    // Recorded by Dispatcharr's channel listing, in ffprobe's own terms ("High", "Main 10"; level
+    // 42 for H.264 4.2, 123 for HEVC 4.1), which is how Jellyfin stores a probed stream too.
+    [JsonProperty("video_profile")]
+    public JToken? VideoProfileRaw { get; set; }
+
+    [JsonProperty("video_level")]
+    public JToken? VideoLevelRaw { get; set; }
+
     [JsonIgnore]
     public int? AudioChannels => ReadInt(AudioChannelsRaw);
 
@@ -59,6 +67,16 @@ public class StreamStatsInfo
     /// <summary>Gets the audio bitrate in kbit/s.</summary>
     [JsonIgnore]
     public int? AudioBitrate => ReadInt(AudioBitrateRaw);
+
+    /// <summary>Gets the video profile, such as "High" or "Main 10", or null.</summary>
+    [JsonIgnore]
+    public string? VideoProfile => VideoProfileRaw is { Type: JTokenType.String } t && !string.IsNullOrWhiteSpace(t.Value<string>())
+        ? t.Value<string>()!.Trim()
+        : null;
+
+    /// <summary>Gets the video level as ffprobe reports it, or null.</summary>
+    [JsonIgnore]
+    public int? VideoLevel => ReadInt(VideoLevelRaw);
 
     [JsonProperty("ffmpeg_output_bitrate")]
     public double? Bitrate { get; set; }
