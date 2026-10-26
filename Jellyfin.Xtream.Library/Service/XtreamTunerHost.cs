@@ -59,6 +59,7 @@ public class XtreamTunerHost : ITunerHost
     private List<ChannelInfo>? _cachedChannels;
     private DateTime _cacheTime = DateTime.MinValue;
     private bool _cachedNumberByCategory;
+    private bool _cachedCategoryAsTag;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="XtreamTunerHost"/> class.
@@ -98,9 +99,11 @@ public class XtreamTunerHost : ITunerHost
         // Return cached channels if available and not expired
         // The numbering flag is part of the cache identity: flipping it changes every number, and
         // serving the previous list would leave the numbers and the resolver map disagreeing.
+        // The category tag flag is too: a list cached under the other setting carries the wrong tags.
         if (enableCache
             && _cachedChannels != null
             && _cachedNumberByCategory == config.LiveTvNumberByCategory
+            && _cachedCategoryAsTag == config.LiveTvCategoryAsTag
             && DateTime.UtcNow - _cacheTime < CacheDuration)
         {
             _logger.LogDebug("Returning cached channel list ({Count} channels)", _cachedChannels.Count);
@@ -111,6 +114,12 @@ public class XtreamTunerHost : ITunerHost
 
         var channels = await _liveTvService.GetFilteredChannelsAsync(cancellationToken).ConfigureAwait(false);
         var categoryNames = await _liveTvService.GetCategoryNameMapAsync(cancellationToken).ConfigureAwait(false);
+
+        if (config.LiveTvCategoryAsTag && categoryNames.Count == 0)
+        {
+            _logger.LogWarning(
+                "Tag channels with their category is on, but the category list could not be read (fetch failed, or more than one Live TV provider); channels get only their override tags this refresh");
+        }
 
         int stride = ChannelNumbering.ComputeStride(channels);
         var newMap = new Dictionary<string, string>(channels.Count);
@@ -170,7 +179,13 @@ public class XtreamTunerHost : ITunerHost
                 ChannelGroup = channel.CategoryId is int catId && categoryNames.TryGetValue(catId, out var categoryName)
                     ? categoryName
                     : null,
-                Tags = channel.Tags,
+                Tags = ResolveChannelTags(
+                    channel.Tags,
+                    channel.CategoryId is int tagCatId && categoryNames.TryGetValue(tagCatId, out var tagCategoryName)
+                        ? tagCategoryName
+                        : null,
+                    categoryNames.Count > 0,
+                    config.LiveTvCategoryAsTag),
             });
         }
 
@@ -180,6 +195,7 @@ public class XtreamTunerHost : ITunerHost
         _cachedChannels = result;
         _cacheTime = DateTime.UtcNow;
         _cachedNumberByCategory = config.LiveTvNumberByCategory;
+        _cachedCategoryAsTag = config.LiveTvCategoryAsTag;
         _logger.LogInformation(
             "Channel list cached with {Count} channels ({StatsCount} with stream stats, {ProxyCount} with a Dispatcharr URL without credentials)",
             result.Count,
@@ -355,6 +371,45 @@ public class XtreamTunerHost : ITunerHost
         var (baseUrl, username, password) = LiveTvService.ResolveLiveTvProvider(config, providerIndex);
         var extension = string.Equals(config.LiveTvOutputFormat, "ts", StringComparison.OrdinalIgnoreCase) ? "ts" : "m3u8";
         return string.Create(CultureInfo.InvariantCulture, $"{baseUrl}/live/{username}/{password}/{streamId}.{extension}");
+    }
+
+    /// <summary>
+    /// The tags the tuner hands Jellyfin for one channel (homelab-ops #550).
+    /// <para>
+    /// Jellyfin's guide refresh replaces a channel's tags whenever this is non-null and leaves them
+    /// alone when it is null, so null and an empty array mean different things:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>Override tags win, unchanged, whatever the option says.</item>
+    /// <item>Option off: the override tags or null, exactly as before.</item>
+    /// <item>The list loaded: the category name, or an empty array when the channel has no known
+    /// category, so a channel moved out of a group loses that group's tag.</item>
+    /// <item>The category list did not load (fetch failed, or more than one provider): an empty
+    /// array. Null would keep the tags from the last refresh, and a stale group tag would keep
+    /// showing a channel that has left the group. For an allowed-tags account a missing tag hides
+    /// a channel, it never shows one, so this fails closed: such an account may see nothing until
+    /// the next refresh that loads the list.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="overrideTags">Tags from the channel overrides, or null.</param>
+    /// <param name="categoryName">The channel's category name, or null when unknown.</param>
+    /// <param name="categoryMapLoaded">Whether the category list was read.</param>
+    /// <param name="categoryAsTag">The <see cref="PluginConfiguration.LiveTvCategoryAsTag"/> setting.</param>
+    /// <returns>The tags for <see cref="ChannelInfo.Tags"/>.</returns>
+    internal static string[]? ResolveChannelTags(string[]? overrideTags, string? categoryName, bool categoryMapLoaded, bool categoryAsTag)
+    {
+        if (overrideTags != null || !categoryAsTag)
+        {
+            return overrideTags;
+        }
+
+        if (!categoryMapLoaded)
+        {
+            return Array.Empty<string>();
+        }
+
+        var name = categoryName?.Trim();
+        return string.IsNullOrEmpty(name) ? Array.Empty<string>() : new[] { name };
     }
 
     internal static string BuildChannelId(int providerIndex, int streamId)

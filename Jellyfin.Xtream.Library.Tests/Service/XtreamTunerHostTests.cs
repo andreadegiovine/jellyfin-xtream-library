@@ -275,6 +275,167 @@ public class XtreamTunerHostTests : IDisposable
         result[2].ChannelGroup.Should().BeNull();      // null category id
     }
 
+    // homelab-ops #550: the category (Dispatcharr's channel group) as a tag, for allowed-tags accounts.
+    [Fact]
+    public void LiveTvCategoryAsTag_IsOffByDefault()
+    {
+        new PluginConfiguration().LiveTvCategoryAsTag.Should().BeFalse(
+            "turning it on makes Jellyfin replace every channel's tags on each guide refresh");
+    }
+
+    [Theory]
+    [InlineData(false, true, "Kinderen", null)]          // option off: unchanged (null)
+    [InlineData(true, false, "Kinderen", "")]            // categories not loaded: empty, fail closed
+    [InlineData(true, true, "Kinderen", "Kinderen")]     // the category name
+    [InlineData(true, true, "  Kinderen ", "Kinderen")]  // trimmed
+    [InlineData(true, true, null, "")]                   // loaded, no category: empty array
+    [InlineData(true, true, "  ", "")]                   // loaded, blank name: empty array
+    public void ResolveChannelTags_WithoutOverride(bool enabled, bool loaded, string? category, string? expected)
+    {
+        var tags = XtreamTunerHost.ResolveChannelTags(null, category, loaded, enabled);
+
+        if (expected == null)
+        {
+            tags.Should().BeNull("null tells Jellyfin to leave the channel's tags alone");
+        }
+        else if (expected.Length == 0)
+        {
+            tags.Should().NotBeNull().And.BeEmpty();
+        }
+        else
+        {
+            tags.Should().Equal(expected);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    public void ResolveChannelTags_OverrideTagsWin(bool enabled, bool loaded)
+    {
+        // An override is how a channel is kept out of its group's tag.
+        var tags = XtreamTunerHost.ResolveChannelTags(new[] { "adult" }, "Kinderen", loaded, enabled);
+
+        tags.Should().Equal("adult");
+    }
+
+    [Fact]
+    public async Task GetChannels_TagsChannelsWithCategory_WhenCategoryAsTagIsOn()
+    {
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.EnableChannelNameCleaning = false;
+        config.LiveTvCategoryAsTag = true;
+        config.ChannelOverrides = "300=|||adult";
+
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo>
+            {
+                new() { StreamId = 100, Name = "Kids One", Num = 1, CategoryId = 10 },
+                new() { StreamId = 200, Name = "Lost", Num = 2, CategoryId = 99 },
+                new() { StreamId = 300, Name = "Adult In Kids", Num = 3, CategoryId = 10 },
+                new() { StreamId = 400, Name = "No Category", Num = 4, CategoryId = null },
+            });
+        _mockClient
+            .Setup(c => c.GetLiveCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Category> { new() { CategoryId = 10, CategoryName = "Kinderen" } });
+
+        var result = await _tunerHost.GetChannels(false, CancellationToken.None);
+
+        result[0].Tags.Should().Equal("Kinderen");
+        result[1].Tags.Should().NotBeNull().And.BeEmpty();
+        result[2].Tags.Should().Equal("adult");
+        result[3].Tags.Should().NotBeNull().And.BeEmpty();
+    }
+
+    // PR #183 review: the cached channel list was built under one setting, so serving it after the
+    // setting flips would hand Jellyfin the old tags for up to five minutes.
+    [Fact]
+    public async Task GetChannels_RebuildsTheCachedList_WhenCategoryAsTagChanges()
+    {
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.EnableChannelNameCleaning = false;
+        config.LiveTvCategoryAsTag = false;
+
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo>
+            {
+                new() { StreamId = 100, Name = "Kids One", Num = 1, CategoryId = 10 },
+            });
+        _mockClient
+            .Setup(c => c.GetLiveCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Category> { new() { CategoryId = 10, CategoryName = "Kinderen" } });
+
+        var before = await _tunerHost.GetChannels(true, CancellationToken.None);
+        config.LiveTvCategoryAsTag = true;
+        var after = await _tunerHost.GetChannels(true, CancellationToken.None);
+
+        before[0].Tags.Should().BeNull();
+        after[0].Tags.Should().Equal("Kinderen");
+    }
+
+    [Fact]
+    public async Task GetChannels_FailsClosed_WhenCategoriesFailToLoad()
+    {
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.EnableChannelNameCleaning = false;
+        config.LiveTvCategoryAsTag = true;
+        config.ChannelOverrides = "200=|||news";
+
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo>
+            {
+                new() { StreamId = 100, Name = "Kids One", Num = 1, CategoryId = 10 },
+                new() { StreamId = 200, Name = "News", Num = 2, CategoryId = 10 },
+            });
+        _mockClient
+            .Setup(c => c.GetLiveCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new HttpRequestException("down"));
+
+        var result = await _tunerHost.GetChannels(false, CancellationToken.None);
+
+        // Null would keep last refresh's tags, so a channel that left the group stays visible to
+        // an allowed-tags account. An empty array hides it instead (homelab-ops #550, option A).
+        result[0].Tags.Should().NotBeNull().And.BeEmpty();
+        result[1].Tags.Should().Equal("news");
+    }
+
+    [Fact]
+    public async Task GetChannels_KeepsTagsUnchanged_WhenCategoryAsTagIsOff()
+    {
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.EnableChannelNameCleaning = false;
+        config.LiveTvCategoryAsTag = false;
+        config.ChannelOverrides = "200=|||news";
+
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo>
+            {
+                new() { StreamId = 100, Name = "Kids One", Num = 1, CategoryId = 10 },
+                new() { StreamId = 200, Name = "News", Num = 2, CategoryId = 10 },
+            });
+        _mockClient
+            .Setup(c => c.GetLiveCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Category> { new() { CategoryId = 10, CategoryName = "Kinderen" } });
+
+        var result = await _tunerHost.GetChannels(false, CancellationToken.None);
+
+        result[0].Tags.Should().BeNull();
+        result[1].Tags.Should().Equal("news");
+    }
+
     #endregion
 
     #region GetChannelStreamMediaSources
