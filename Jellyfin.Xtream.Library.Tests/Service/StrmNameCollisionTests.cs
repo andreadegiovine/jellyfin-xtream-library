@@ -967,6 +967,16 @@ public class StrmNameCollisionTests : IDisposable
     public void StrmOwnerResolver_NamesTheProviderOnlyWhenPathsAreShared(string? url, string baseUrl, bool scoped, int? expected)
         => new StrmOwnerResolver(baseUrl, scoped).OwnerOf(url).Should().Be(expected);
 
+    // A BaseUrl configured with a trailing slash ends up in the STRM as ".../movie/" after a double
+    // slash. That file is still this provider's (CodeRabbit).
+    [Theory]
+    [InlineData("http://a.test//movie/u/p/100.mp4", 100)]
+    [InlineData("http://a.test/movie/u/p/100.mp4", 100)]
+    [InlineData("http://b.test//movie/u/p/100.mp4", StrmOwnerResolver.OtherProvider)]
+    [InlineData("http://a.test//movie/v/p/100.mp4", StrmOwnerResolver.OtherProvider)]
+    public void StrmOwnerResolver_AcceptsABaseUrlWithATrailingSlash(string url, int expected)
+        => new StrmOwnerResolver("http://a.test/", ScopeToProvider: true, Username: "u").OwnerOf(url).Should().Be(expected);
+
     // Two accounts on one server share the host and differ only in the segment after "/movie/".
     // The password is not compared: changing it must not turn the provider's own files foreign.
     [Theory]

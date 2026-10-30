@@ -63,10 +63,16 @@ internal readonly record struct StrmOwnerResolver(string BaseUrl, bool ScopeToPr
             return id;
         }
 
+        // The movie writer puts BaseUrl in as configured, so a trailing slash there gives
+        // ".../movie/" with a double slash. Both forms are this provider's (CodeRabbit).
         string prefix = BaseUrl.TrimEnd('/') + "/movie/";
         if (!url!.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
         {
-            return OtherProvider;
+            prefix = BaseUrl + "/movie/";
+            if (!url.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return OtherProvider;
+            }
         }
 
         // ".../movie/<user>/<password>/<id>.<ext>": the account is the segment right after the
