@@ -275,9 +275,229 @@ public class XtreamTunerHostTests : IDisposable
         result[2].ChannelGroup.Should().BeNull();      // null category id
     }
 
+    // homelab-ops #550: the category (Dispatcharr's channel group) as a tag, for allowed-tags accounts.
+    [Fact]
+    public void LiveTvCategoryAsTag_IsOffByDefault()
+    {
+        new PluginConfiguration().LiveTvCategoryAsTag.Should().BeFalse(
+            "turning it on makes Jellyfin replace every channel's tags on each guide refresh");
+    }
+
+    [Theory]
+    [InlineData(false, true, "Kinderen", null)]          // option off: unchanged (null)
+    [InlineData(true, false, "Kinderen", "")]            // categories not loaded: empty, fail closed
+    [InlineData(true, true, "Kinderen", "Kinderen")]     // the category name
+    [InlineData(true, true, "  Kinderen ", "Kinderen")]  // trimmed
+    [InlineData(true, true, null, "")]                   // loaded, no category: empty array
+    [InlineData(true, true, "  ", "")]                   // loaded, blank name: empty array
+    public void ResolveChannelTags_WithoutOverride(bool enabled, bool loaded, string? category, string? expected)
+    {
+        var tags = XtreamTunerHost.ResolveChannelTags(null, category, loaded, enabled);
+
+        if (expected == null)
+        {
+            tags.Should().BeNull("null tells Jellyfin to leave the channel's tags alone");
+        }
+        else if (expected.Length == 0)
+        {
+            tags.Should().NotBeNull().And.BeEmpty();
+        }
+        else
+        {
+            tags.Should().Equal(expected);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    public void ResolveChannelTags_OverrideTagsWin(bool enabled, bool loaded)
+    {
+        // An override is how a channel is kept out of its group's tag.
+        var tags = XtreamTunerHost.ResolveChannelTags(new[] { "adult" }, "Kinderen", loaded, enabled);
+
+        tags.Should().Equal("adult");
+    }
+
+    [Fact]
+    public async Task GetChannels_TagsChannelsWithCategory_WhenCategoryAsTagIsOn()
+    {
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.EnableChannelNameCleaning = false;
+        config.LiveTvCategoryAsTag = true;
+        config.ChannelOverrides = "300=|||adult";
+
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo>
+            {
+                new() { StreamId = 100, Name = "Kids One", Num = 1, CategoryId = 10 },
+                new() { StreamId = 200, Name = "Lost", Num = 2, CategoryId = 99 },
+                new() { StreamId = 300, Name = "Adult In Kids", Num = 3, CategoryId = 10 },
+                new() { StreamId = 400, Name = "No Category", Num = 4, CategoryId = null },
+            });
+        _mockClient
+            .Setup(c => c.GetLiveCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Category> { new() { CategoryId = 10, CategoryName = "Kinderen" } });
+
+        var result = await _tunerHost.GetChannels(false, CancellationToken.None);
+
+        result[0].Tags.Should().Equal("Kinderen");
+        result[1].Tags.Should().NotBeNull().And.BeEmpty();
+        result[2].Tags.Should().Equal("adult");
+        result[3].Tags.Should().NotBeNull().And.BeEmpty();
+    }
+
+    // PR #183 review: the cached channel list was built under one setting, so serving it after the
+    // setting flips would hand Jellyfin the old tags for up to five minutes.
+    [Fact]
+    public async Task GetChannels_RebuildsTheCachedList_WhenCategoryAsTagChanges()
+    {
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.EnableChannelNameCleaning = false;
+        config.LiveTvCategoryAsTag = false;
+
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo>
+            {
+                new() { StreamId = 100, Name = "Kids One", Num = 1, CategoryId = 10 },
+            });
+        _mockClient
+            .Setup(c => c.GetLiveCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Category> { new() { CategoryId = 10, CategoryName = "Kinderen" } });
+
+        var before = await _tunerHost.GetChannels(true, CancellationToken.None);
+        config.LiveTvCategoryAsTag = true;
+        var after = await _tunerHost.GetChannels(true, CancellationToken.None);
+
+        before[0].Tags.Should().BeNull();
+        after[0].Tags.Should().Equal("Kinderen");
+    }
+
+    [Fact]
+    public async Task GetChannels_FailsClosed_WhenCategoriesFailToLoad()
+    {
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.EnableChannelNameCleaning = false;
+        config.LiveTvCategoryAsTag = true;
+        config.ChannelOverrides = "200=|||news";
+
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo>
+            {
+                new() { StreamId = 100, Name = "Kids One", Num = 1, CategoryId = 10 },
+                new() { StreamId = 200, Name = "News", Num = 2, CategoryId = 10 },
+            });
+        _mockClient
+            .Setup(c => c.GetLiveCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new HttpRequestException("down"));
+
+        var result = await _tunerHost.GetChannels(false, CancellationToken.None);
+
+        // Null would keep last refresh's tags, so a channel that left the group stays visible to
+        // an allowed-tags account. An empty array hides it instead (homelab-ops #550, option A).
+        result[0].Tags.Should().NotBeNull().And.BeEmpty();
+        result[1].Tags.Should().Equal("news");
+    }
+
+    [Fact]
+    public async Task GetChannels_KeepsTagsUnchanged_WhenCategoryAsTagIsOff()
+    {
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.EnableChannelNameCleaning = false;
+        config.LiveTvCategoryAsTag = false;
+        config.ChannelOverrides = "200=|||news";
+
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo>
+            {
+                new() { StreamId = 100, Name = "Kids One", Num = 1, CategoryId = 10 },
+                new() { StreamId = 200, Name = "News", Num = 2, CategoryId = 10 },
+            });
+        _mockClient
+            .Setup(c => c.GetLiveCategoryAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<Category> { new() { CategoryId = 10, CategoryName = "Kinderen" } });
+
+        var result = await _tunerHost.GetChannels(false, CancellationToken.None);
+
+        result[0].Tags.Should().BeNull();
+        result[1].Tags.Should().Equal("news");
+    }
+
     #endregion
 
     #region GetChannelStreamMediaSources
+
+    [Theory]
+    [InlineData(true, "http://dispatcharr:9191/proxy/ts/stream/086aab97-3c36-41f0-a417-b97f39a69f0f", true, true)]
+    [InlineData(false, "http://dispatcharr:9191/proxy/ts/stream/086aab97-3c36-41f0-a417-b97f39a69f0f", true, false)]
+    [InlineData(true, "http://provider/live/user/pass/100.ts", false, false)]
+    [InlineData(true, "http://host/proxy/ts/stream/x/live/user/pass/100.ts", false, false)]
+    public void CreateMediaSourceInfo_OffersDirectPlayOnlyForDispatcharrUrlsWhenAskedTo(bool setting, string url, bool isDispatcharrUrl, bool expected)
+    {
+        // A direct-play client opens Path itself: never with an Xtream URL, which carries the login
+        // and bypasses Jellyfin's connection handling (homelab-ops #550).
+        var stats = new StreamStatsInfo { VideoCodec = "h264", Resolution = "1920x1080" };
+        var config = new PluginConfiguration { LiveTvDirectPlayDispatcharr = setting };
+
+        var source = XtreamTunerHost.CreateMediaSourceInfo("xtream_1", url, stats, false, config, NullLogger.Instance, isDispatcharrUrl);
+
+        source.SupportsDirectPlay.Should().Be(expected);
+    }
+
+    [Fact]
+    public void CreateMediaSourceInfo_NoDirectPlayWithoutStats()
+    {
+        var config = new PluginConfiguration { LiveTvDirectPlayDispatcharr = true };
+
+        var source = XtreamTunerHost.CreateMediaSourceInfo("xtream_1", "http://d/proxy/ts/stream/x", null, false, config, NullLogger.Instance, isDispatcharrUrl: true);
+
+        source.SupportsDirectPlay.Should().BeFalse("without stats the client has nothing to decide on");
+    }
+
+    [Fact]
+    public void CreateMediaSourceInfo_DeclaresProfileLevelAndAudioChannelsFromTheStats()
+    {
+        // Without them Jellyfin wrote avc1.424029 (Constrained Baseline 4.1) into the HLS CODECS
+        // for a High 4.2 stream, skipped its profile and level checks, and re-encoded stereo audio
+        // to 5.1 (homelab-ops #550).
+        var stats = Newtonsoft.Json.JsonConvert.DeserializeObject<StreamStatsInfo>(
+            """{"video_codec":"h264","resolution":"1920x1080","source_fps":50,"video_profile":"High","video_level":42,"audio_codec":"aac","audio_channels":2,"audio_sample_rate":48000}""")!;
+
+        var source = XtreamTunerHost.CreateMediaSourceInfo("xtream_1", "http://host/proxy/ts/stream/x", stats, false, new PluginConfiguration(), NullLogger.Instance);
+
+        var video = source.MediaStreams.Single(s => s.Type == MediaStreamType.Video);
+        video.Profile.Should().Be("High");
+        video.Level.Should().Be(42);
+        var audio = source.MediaStreams.Single(s => s.Type == MediaStreamType.Audio);
+        audio.Codec.Should().BeNull("the audio is still re-encoded unless LiveTvCopyAudio is on");
+        audio.Channels.Should().Be(2);
+    }
+
+    [Fact]
+    public void CreateMediaSourceInfo_LeavesProfileAndLevelOutWhenTheStatsHaveNone()
+    {
+        var stats = Newtonsoft.Json.JsonConvert.DeserializeObject<StreamStatsInfo>("""{"video_codec":"hevc","resolution":"1920x1080"}""")!;
+
+        var source = XtreamTunerHost.CreateMediaSourceInfo("xtream_1", "http://host/x", stats, false, new PluginConfiguration(), NullLogger.Instance);
+
+        var video = source.MediaStreams.Single(s => s.Type == MediaStreamType.Video);
+        video.Profile.Should().BeNull();
+        video.Level.Should().BeNull();
+        source.MediaStreams.Single(s => s.Type == MediaStreamType.Audio).Channels.Should().BeNull();
+    }
 
     [Fact]
     public async Task GetChannelStreamMediaSources_WithoutStats_ReturnsSingleSource_WithProbingEnabled()
@@ -937,7 +1157,7 @@ public class XtreamTunerHostTests : IDisposable
         // Clients such as Moonfin open the media source Path themselves for live channels, so it
         // must not carry the provider login (homelab-ops #550).
         var config = new PluginConfiguration();
-        config.Providers.Add(new ProviderConfig { BaseUrl = "http://xtream.example.com:9191/", Username = "user-a", IsEnabled = true });
+        config.Providers.Add(new ProviderConfig { BaseUrl = "http://xtream.example.com:9191/", Username = "user-a", IsEnabled = true, EnableDispatcharrMode = true, DispatcharrApiUser = "api" });
         var channel = new LiveStreamInfo { StreamId = 100, DispatcharrUuid = "086aab97-3c36-41f0-a417-b97f39a69f0f" };
 
         var url = XtreamTunerHost.BuildProxyStreamUrl(config, channel);
@@ -955,6 +1175,8 @@ public class XtreamTunerHostTests : IDisposable
             BaseUrl = "http://xtream.example.com",
             DispatcharrBaseUrl = "http://dispatcharr.example.com:9191",
             IsEnabled = true,
+            EnableDispatcharrMode = true,
+            DispatcharrApiUser = "api",
         });
         var channel = new LiveStreamInfo { StreamId = 100, DispatcharrUuid = "abc" };
 
@@ -971,6 +1193,8 @@ public class XtreamTunerHostTests : IDisposable
         config.EnableLiveTv = true;
         config.EnableNativeTuner = true;
         config.Providers[0].DispatcharrBaseUrl = "http://old-dispatcharr:9191";
+        config.Providers[0].EnableDispatcharrMode = true;
+        config.Providers[0].DispatcharrApiUser = "api";
         _mockClient
             .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new List<LiveStreamInfo> { new() { StreamId = 100, Name = "Test Channel", Num = 1, DispatcharrUuid = "abc" } });
@@ -980,6 +1204,27 @@ public class XtreamTunerHostTests : IDisposable
         var result = await _tunerHost.GetChannelStreamMediaSources("xtream_100", CancellationToken.None);
 
         result[0].Path.Should().Be("http://new-dispatcharr:9191/proxy/ts/stream/abc");
+    }
+
+    [Fact]
+    public async Task GetChannelStreamMediaSources_DispatcharrModeSwitchedOff_PlaysTheXtreamUrl()
+    {
+        // BUG-038: a uuid cached while the mode was on must not keep the proxy URL after it is off.
+        var config = Plugin.Instance.Configuration;
+        config.EnableLiveTv = true;
+        config.EnableNativeTuner = true;
+        config.Providers[0].EnableDispatcharrMode = true;
+        config.Providers[0].DispatcharrApiUser = "api";
+        _mockClient
+            .Setup(c => c.GetAllLiveStreamsAsync(It.IsAny<ConnectionInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new List<LiveStreamInfo> { new() { StreamId = 100, Name = "Test Channel", Num = 1, DispatcharrUuid = "086aab97-3c36-41f0-a417-b97f39a69f0f" } });
+        await _tunerHost.GetChannels(false, CancellationToken.None);
+
+        config.Providers[0].EnableDispatcharrMode = false;
+        var result = await _tunerHost.GetChannelStreamMediaSources("xtream_100", CancellationToken.None);
+
+        result[0].Path.Should().NotContain("/proxy/ts/stream/");
+        result[0].Path.Should().Contain("/live/");
     }
 
     [Fact]

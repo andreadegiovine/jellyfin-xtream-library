@@ -371,6 +371,7 @@ var XtreamLibraryConfig = (function () {
             // Title cleaning
             document.getElementById('chkEnableChannelNameCleaning').checked = config.EnableChannelNameCleaning !== false;
             document.getElementById('chkLiveTvNumberByCategory').checked = config.LiveTvNumberByCategory === true;
+            document.getElementById('chkLiveTvCategoryAsTag').checked = config.LiveTvCategoryAsTag === true;
             document.getElementById('txtChannelRemoveTerms').value = config.ChannelRemoveTerms || '';
 
             // Channel overrides
@@ -473,6 +474,7 @@ var XtreamLibraryConfig = (function () {
             // Title cleaning
             config.EnableChannelNameCleaning = document.getElementById('chkEnableChannelNameCleaning').checked;
             config.LiveTvNumberByCategory = document.getElementById('chkLiveTvNumberByCategory').checked;
+            config.LiveTvCategoryAsTag = document.getElementById('chkLiveTvCategoryAsTag').checked;
             config.ChannelRemoveTerms = document.getElementById('txtChannelRemoveTerms').value;
 
             // Channel overrides
@@ -1187,6 +1189,20 @@ var XtreamLibraryConfig = (function () {
             html += '<div class="sync-warning-detail">' + parts.join(' and ') + ' are still on disk but no longer offered by the provider. ';
             html += 'They stay until the cause is fixed or Orphan Safety Threshold is raised in the provider settings. ';
             html += 'A high ratio usually means a provider outage or a changed base URL - check before raising the limit.</div>';
+            html += '</div>';
+        }
+
+        // Items whose category failed to load or came back empty this run, kept instead of
+        // deleted (GitHub #171). The log names the categories.
+        var keptMovies = result.MoviesKeptForUnreadCategories || 0;
+        var keptSeries = result.SeriesKeptForUnreadCategories || 0;
+        if (keptMovies + keptSeries > 0) {
+            var keptParts = [];
+            if (keptMovies > 0) keptParts.push(keptMovies.toLocaleString() + ' movies');
+            if (keptSeries > 0) keptParts.push(keptSeries.toLocaleString() + ' series');
+            html += '<div class="sync-warning-panel">';
+            html += '<div class="sync-warning-title">Kept ' + keptParts.join(' and ') + ' from categories the provider did not list this time</div>';
+            html += '<div class="sync-warning-detail">Those categories failed to load or came back empty. Their items stay until the categories answer again, or are removed once a category has been empty for longer than the full sync interval. The server log names the categories.</div>';
             html += '</div>';
         }
 

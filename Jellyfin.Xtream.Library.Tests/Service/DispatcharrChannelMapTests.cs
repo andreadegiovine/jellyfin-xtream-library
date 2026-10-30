@@ -161,6 +161,23 @@ public class DispatcharrChannelMapTests
     }
 
     [Fact]
+    public void ProfileAndLevelAreReadAsDispatcharrRecordsThem()
+    {
+        // Measured on Dispatcharr 0.32: SBS 6 HD and NPO 1 HD, matching ffprobe exactly.
+        var stats = DispatcharrChannelMap.BuildStats([
+            ChannelWithStats(1, (500, """{"video_codec":"hevc","video_profile":"Main","video_level":123,"audio_channels":2}""")),
+            ChannelWithStats(2, (600, """{"video_codec":"h264","video_profile":"High","video_level":"42"}""")),
+            ChannelWithStats(3, (700, """{"video_codec":"h264","video_profile":null,"video_level":"n/a"}"""))]);
+
+        stats[1].VideoProfile.Should().Be("Main");
+        stats[1].VideoLevel.Should().Be(123);
+        stats[2].VideoProfile.Should().Be("High");
+        stats[2].VideoLevel.Should().Be(42);
+        stats[3].VideoProfile.Should().BeNull();
+        stats[3].VideoLevel.Should().BeNull("an unreadable value is left out, not guessed");
+    }
+
+    [Fact]
     public void AChannelWhoseFirstStreamHasNoStatsGetsNoneFromALaterStream()
     {
         // The later stream is a failover that may never play; its codec says nothing about the first.

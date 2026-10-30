@@ -209,6 +209,13 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool LiveTvCopyAudio { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether a native-tuner channel played from Dispatcharr's own
+    /// channel URL (no login in it) offers direct play, so a client that plays MPEG-TS itself skips
+    /// ffmpeg and HLS. Not on the settings page; for measuring (homelab-ops #550).
+    /// </summary>
+    public bool LiveTvDirectPlayDispatcharr { get; set; }
+
+    /// <summary>
     /// Gets or sets a value indicating whether to include adult channels.
     /// </summary>
     public bool IncludeAdultChannels { get; set; }
@@ -232,6 +239,22 @@ public class PluginConfiguration : BasePluginConfiguration
     /// </para>
     /// </summary>
     public bool LiveTvNumberByCategory { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the native tuner puts each channel's category name
+    /// on the channel as a tag (homelab-ops #550).
+    /// <para>
+    /// With Dispatcharr the category is the channel group, so a parental-control account can be
+    /// limited to one group through Jellyfin's allowed tags.
+    /// </para>
+    /// <para>
+    /// Off by default because Jellyfin replaces a channel's tags with the tuner's tags on every
+    /// guide refresh once the tuner sends any, so tags set by hand or by a script are lost.
+    /// Override tags still win: a channel with tags in <see cref="ChannelOverrides"/> gets exactly
+    /// those and no category tag, which is how a channel is kept out of its group's tag.
+    /// </para>
+    /// </summary>
+    public bool LiveTvCategoryAsTag { get; set; }
 
     /// <summary>
     /// Gets or sets custom terms to remove from channel names. One term per line.

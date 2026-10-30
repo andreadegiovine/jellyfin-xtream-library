@@ -595,10 +595,18 @@ public partial class StrmSyncService
         ContentSnapshot? hintSnapshot = null;
         bool isIncrementalSync = false;
 
-        if (provider.EnableIncrementalSync || provider.GroupMoviesByTmdbId)
+        // Also loaded when only orphan cleanup is on: it is how a category the provider did not
+        // list this run keeps its items (GitHub #171). That use alone changes nothing else here.
+        ContentSnapshot? categorySnapshot = null;
+        if (UsesSnapshot(provider))
         {
             CurrentProgress.Phase = "Loading snapshot";
             var loadedSnapshot = await _snapshotService.LoadLatestSnapshotAsync(providerKey, cancellationToken).ConfigureAwait(false);
+            categorySnapshot = loadedSnapshot;
+            if (!provider.EnableIncrementalSync && !provider.GroupMoviesByTmdbId)
+            {
+                loadedSnapshot = null;
+            }
 
             // Keep raw snapshot as hint for smart-skip optimization (even during full sync). It is
             // also the grouping map, which is why it is loaded even with incremental sync off: a
@@ -699,6 +707,10 @@ public partial class StrmSyncService
         // running then.
         var deletedMovieFiles = new Dictionary<string, int?>(StringComparer.OrdinalIgnoreCase);
 
+        // Categories the provider did not answer for this run, and what was kept because of them
+        // (GitHub #171).
+        var unread = new UnreadCategories { PreviousSnapshot = categorySnapshot };
+
         // Sync Movies and Series - run concurrently when parallelism > 1,
         // sequentially when parallelism <= 1 to respect strict rate limits
         bool runConcurrently = provider.SyncParallelism > 1;
@@ -724,6 +736,7 @@ public partial class StrmSyncService
                             movieIdentities,
                             hintSnapshot,
                             roleLedger,
+                            unread,
                             cancellationToken).ConfigureAwait(false);
                     },
                     cancellationToken));
@@ -746,6 +759,7 @@ public partial class StrmSyncService
                             allCollectedSeries,
                             allSeriesInfoDict,
                             seriesIdentities,
+                            unread,
                             cancellationToken).ConfigureAwait(false);
                     },
                     cancellationToken));
@@ -770,6 +784,7 @@ public partial class StrmSyncService
                     movieIdentities,
                     hintSnapshot,
                     roleLedger,
+                    unread,
                     cancellationToken).ConfigureAwait(false);
             }
 
@@ -787,6 +802,7 @@ public partial class StrmSyncService
                     allCollectedSeries,
                     allSeriesInfoDict,
                     seriesIdentities,
+                    unread,
                     cancellationToken).ConfigureAwait(false);
             }
         }
@@ -1059,10 +1075,10 @@ public partial class StrmSyncService
         // Save snapshot for next incremental sync. Grouping needs it too: the snapshot is what
         // records which folder each stream went to and whether the provider confirmed its id, and
         // the regroup action has nothing to work from without it (GitHub #88).
-        if ((provider.EnableIncrementalSync || provider.GroupMoviesByTmdbId) && !cancellationToken.IsCancellationRequested)
+        if (UsesSnapshot(provider) && !cancellationToken.IsCancellationRequested)
         {
             CurrentProgress.Phase = "Saving snapshot";
-            await SaveSnapshotAsync(provider, providerKey, allCollectedMovies, allCollectedSeries, allSeriesInfoDict, movieIdentities, seriesIdentities, hintSnapshot, result.FailedItems, cancellationToken).ConfigureAwait(false);
+            await SaveSnapshotAsync(provider, providerKey, allCollectedMovies, allCollectedSeries, allSeriesInfoDict, movieIdentities, seriesIdentities, hintSnapshot ?? categorySnapshot, unread, result.FailedItems, cancellationToken).ConfigureAwait(false);
         }
 
         result.WasIncrementalSync = isIncrementalSync;
@@ -1119,6 +1135,8 @@ public partial class StrmSyncService
         globalResult.FilesDeleted += providerResult.FilesDeleted;
         globalResult.MovieOrphansSkipped += providerResult.MovieOrphansSkipped;
         globalResult.OrphansRelocated += providerResult.OrphansRelocated;
+        globalResult.MoviesKeptForUnreadCategories += providerResult.MoviesKeptForUnreadCategories;
+        globalResult.SeriesKeptForUnreadCategories += providerResult.SeriesKeptForUnreadCategories;
         globalResult.MovieOrphansExamined += providerResult.MovieOrphansExamined;
         globalResult.EpisodeOrphansSkipped += providerResult.EpisodeOrphansSkipped;
         globalResult.EpisodeOrphansExamined += providerResult.EpisodeOrphansExamined;
@@ -1241,6 +1259,7 @@ public partial class StrmSyncService
         ConcurrentDictionary<int, ItemIdentity> movieIdentities,
         ContentSnapshot? groupingHint,
         MovieRoleLedger roleLedger,
+        UnreadCategories unread,
         CancellationToken cancellationToken)
     {
         var connectionInfo = new ConnectionInfo(provider.BaseUrl, provider.Username, provider.Password);
@@ -1446,6 +1465,11 @@ public partial class StrmSyncService
         // Build the per-provider VOD exclusion set once; read-only inside the parallel fetch.
         var excludedVodSet = ContentExclusionFilter.BuildSet(provider.ExcludedVodStreamIds);
 
+        // What each category answered, to tell an unread category from one that really has
+        // nothing (GitHub #171).
+        var categoryItemCounts = new ConcurrentDictionary<int, int>();
+        var failedCategoryIds = new ConcurrentDictionary<int, byte>();
+
         // Process categories in batches to reduce memory usage
         for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++)
         {
@@ -1482,6 +1506,7 @@ public partial class StrmSyncService
                     {
                         var streams = await _client.GetVodStreamsByCategoryAsync(connectionInfo, category.CategoryId, ct)
                             .ConfigureAwait(false);
+                        categoryItemCounts[category.CategoryId] = streams.Count;
                         foreach (var stream in streams)
                         {
                             if (ContentExclusionFilter.IsExcluded(excludedVodSet, stream.StreamId))
@@ -1501,6 +1526,7 @@ public partial class StrmSyncService
                         _logger.LogWarning(ex, "Failed to fetch VOD streams for category {CategoryId} ({CategoryName})", category.CategoryId, category.CategoryName);
                         Interlocked.Increment(ref errors);
                         Interlocked.Increment(ref categoryFetchFailures);
+                        failedCategoryIds.TryAdd(category.CategoryId, 0);
                     }
                 }).ConfigureAwait(false);
 
@@ -1552,61 +1578,7 @@ public partial class StrmSyncService
                 // Track existing STRM paths for unchanged movies (orphan protection)
                 foreach (var m in unchangedMovies)
                 {
-                    string movieName = SanitizeFileName(m.Stream.Name, provider.CustomTitleRemoveTerms);
-                    int? year = ExtractYear(m.Stream.Name);
-                    string baseName = year.HasValue ? $"{movieName} ({year})" : movieName;
-
-                    // The owner of the TMDB group this stream was a guest of, from the last sync. Its
-                    // alternative waits on that owner's primary, not on a name built from its own label.
-                    int? recordedGroupOwner = groupingHint != null
-                        && groupingHint.Movies.TryGetValue(m.Stream.StreamId, out var unchangedRecord)
-                        && unchangedRecord.GroupOwnerStreamId is int unchangedOwner
-                        && unchangedOwner != m.Stream.StreamId
-                            ? unchangedOwner
-                            : null;
-
-                    var targetFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var categoryId in m.CategoryIds)
-                    {
-                        if (folderMappings.TryGetValue(categoryId, out var mappedFolders))
-                        {
-                            foreach (var folder in mappedFolders)
-                            {
-                                targetFolders.Add(folder);
-                            }
-                        }
-                    }
-
-                    if (targetFolders.Count == 0)
-                    {
-                        targetFolders.Add(string.Empty);
-                    }
-
-                    foreach (var targetFolder in targetFolders)
-                    {
-                        string movieBasePath = string.IsNullOrEmpty(targetFolder)
-                            ? moviesPath
-                            : Path.Combine(moviesPath, targetFolder);
-
-                        if (existingMovieFolders.TryGetValue(targetFolder, out var folderCache) &&
-                            folderCache.TryGetValue(baseName, out var existingFolderName))
-                        {
-                            ProtectOwnStrmIn(Path.Combine(movieBasePath, existingFolderName), m.Stream.StreamId, syncedFiles, roleLedger, owners, keepUnattributed: true, recordedGroupOwner);
-                        }
-
-                        // A grouped guest sits in the folder its owner named, which is not keyed by
-                        // its own base name, so the lookup above cannot find it and cleanup would
-                        // delete a file the provider still lists. The snapshot remembers where the
-                        // file went (GitHub #88). Only the stream's own files are protected: marking
-                        // the whole shared folder would also keep a departed owner's file alive
-                        // forever (codex review).
-                        if (groupingHint != null
-                            && groupingHint.Movies.TryGetValue(m.Stream.StreamId, out var recordedMovie)
-                            && !string.IsNullOrEmpty(recordedMovie.FolderName))
-                        {
-                            ProtectOwnStrmIn(Path.Combine(movieBasePath, recordedMovie.FolderName), m.Stream.StreamId, syncedFiles, roleLedger, owners, keepUnattributed: false, recordedGroupOwner);
-                        }
-                    }
+                    KeepExistingMovieFiles(m.Stream.Name, m.Stream.StreamId, m.CategoryIds, provider, moviesPath, folderMappings, existingMovieFolders, groupingHint, syncedFiles, roleLedger, owners);
                 }
 
                 var skipped = unchangedMovies.Count;
@@ -2422,9 +2394,42 @@ public partial class StrmSyncService
             streamBag = null!;
         } // End of batch loop
 
+        // After every batch, because a movie of an unread category may still have been listed
+        // under another category, and then it was written normally.
+        // Before the role ledger settles: the files kept here are in syncedFiles by then, so a new
+        // stream that wrote an alternative next to a kept primary does not take it over.
+        int keptForUnread = KeepItemsOfUnreadCategories(
+            "VOD",
+            provider,
+            categories,
+            categoryItemCounts,
+            failedCategoryIds,
+            selection.ShouldSync,
+            unread.PreviousSnapshot?.Movies,
+            m => m.CategoryId,
+            unread.PreviousSnapshot?.UnreadMovieCategoriesSince,
+            id => processedStreamIds.ContainsKey(id),
+            id => ContentExclusionFilter.IsExcluded(excludedVodSet, id),
+            unread.MovieCategoryIds,
+            unread.MovieCategoriesSince,
+            (id, entry) =>
+            {
+                // Own files only: a group's folder also holds guests from categories that did
+                // answer, and one they no longer list must still be cleaned up (codex review).
+                // Every mapped folder, not only the recorded category's: the snapshot keeps one
+                // category per movie, and in Multiple folder mode a movie listed in several has a
+                // copy in each. Own files only, so other streams' copies are not affected.
+                KeepExistingMovieFiles(entry.Name, id, AllMappedCategories(folderMappings, entry.CategoryId), provider, moviesPath, folderMappings, existingMovieFolders, unread.PreviousSnapshot, syncedFiles, roleLedger, owners, ownFilesOnly: true);
+                unread.KeptMovies[id] = entry;
+            },
+            (id, entry) => KeepExistingMovieFiles(entry.Name, id, [entry.CategoryId], provider, moviesPath, folderMappings, existingMovieFolders, unread.PreviousSnapshot, syncedFiles, roleLedger, owners, ownFilesOnly: true));
+        result.MoviesKeptForUnreadCategories += keptForUnread;
+
         // Every category batch is in, so the catalogue is complete now. A category that could not be
         // fetched leaves it incomplete, and then no stream counts as gone: it may be in that category.
-        roleLedger.SetCatalogue(processedStreamIds.Keys, categoryFetchFailures == 0);
+        // A movie kept for an unread category is still listed as far as this run knows, so it counts
+        // as present and keeps its primary (GitHub #171).
+        roleLedger.SetCatalogue(processedStreamIds.Keys.Concat(unread.KeptMovies.Keys), categoryFetchFailures == 0);
         if (categoryFetchFailures > 0)
         {
             _logger.LogWarning(
@@ -2503,6 +2508,7 @@ public partial class StrmSyncService
         ConcurrentBag<Series> allCollectedSeries,
         ConcurrentDictionary<int, SeriesStreamInfo> allSeriesInfoDict,
         ConcurrentDictionary<int, ItemIdentity> seriesIdentities,
+        UnreadCategories unread,
         CancellationToken cancellationToken)
     {
         var connectionInfo = new ConnectionInfo(provider.BaseUrl, provider.Username, provider.Password);
@@ -2694,6 +2700,10 @@ public partial class StrmSyncService
         // Build the per-provider Series exclusion set once; read-only inside the parallel fetch.
         var excludedSeriesSet = ContentExclusionFilter.BuildSet(provider.ExcludedSeriesIds);
 
+        // What each category answered, as for movies (GitHub #171).
+        var categoryItemCounts = new ConcurrentDictionary<int, int>();
+        var failedCategoryIds = new ConcurrentDictionary<int, byte>();
+
         // Process categories in batches to reduce memory usage
         for (int batchIndex = 0; batchIndex < totalBatches; batchIndex++)
         {
@@ -2733,6 +2743,7 @@ public partial class StrmSyncService
                     {
                         var seriesList = await _client.GetSeriesByCategoryAsync(connectionInfo, category.CategoryId, ct)
                             .ConfigureAwait(false);
+                        categoryItemCounts[category.CategoryId] = seriesList.Count;
                         foreach (var series in seriesList)
                         {
                             if (ContentExclusionFilter.IsExcluded(excludedSeriesSet, series.SeriesId))
@@ -2751,6 +2762,7 @@ public partial class StrmSyncService
                     {
                         _logger.LogWarning(ex, "Failed to fetch series for category {CategoryId} ({CategoryName})", category.CategoryId, category.CategoryName);
                         Interlocked.Increment(ref errors);
+                        failedCategoryIds.TryAdd(category.CategoryId, 0);
                     }
                 }).ConfigureAwait(false);
 
@@ -3501,6 +3513,30 @@ public partial class StrmSyncService
             seriesBag = null!;
         } // End of batch loop
 
+        int keptForUnread = KeepItemsOfUnreadCategories(
+            "Series",
+            provider,
+            categories,
+            categoryItemCounts,
+            failedCategoryIds,
+            selection.ShouldSync,
+            unread.PreviousSnapshot?.Series,
+            e => e.CategoryId,
+            unread.PreviousSnapshot?.UnreadSeriesCategoriesSince,
+            id => processedSeriesIds.ContainsKey(id),
+            id => ContentExclusionFilter.IsExcluded(excludedSeriesSet, id),
+            unread.SeriesCategoryIds,
+            unread.SeriesCategoriesSince,
+            (id, entry) =>
+            {
+                // Every mapped folder, for the same reason as movies: one category per series in the
+                // snapshot, a copy per mapped category on disk.
+                KeepExistingSeriesFiles(entry.Name, provider, seriesPath, AllMappedCategories(folderMappings, entry.CategoryId), folderMappings, seriesFolderLookup, syncedFiles);
+                unread.KeptSeries[id] = entry;
+            },
+            (id, entry) => KeepExistingSeriesFiles(entry.Name, provider, seriesPath, [entry.CategoryId], folderMappings, seriesFolderLookup, syncedFiles));
+        result.SeriesKeptForUnreadCategories += keptForUnread;
+
         // Update result with thread-safe counters
         result.SeriesCreated += seriesCreated;
         result.SeriesSkipped += seriesSkipped;
@@ -3691,6 +3727,9 @@ public partial class StrmSyncService
         // Remove prefix language tags like "┃UK┃" or "| EN |" at start of name
         cleanName = PrefixLanguageTagPattern().Replace(cleanName, string.Empty);
 
+        // Remove a dash-style language prefix like "EN - " at start of name (GitHub #185)
+        cleanName = PrefixLanguageDashPattern().Replace(cleanName, string.Empty);
+
         // Remove language/country tags like "| UK |", "┃EN┃", "[DE]", "| FR |", etc.
         cleanName = LanguageTagPattern().Replace(cleanName, string.Empty);
 
@@ -3760,6 +3799,7 @@ public partial class StrmSyncService
 
         // Strip prefix language tags first (same as SanitizeFileName step 1)
         string cleanName = PrefixLanguageTagPattern().Replace(name, string.Empty);
+        cleanName = PrefixLanguageDashPattern().Replace(cleanName, string.Empty);
 
         var labels = new List<string>();
 
@@ -4219,6 +4259,210 @@ public partial class StrmSyncService
     }
 
     /// <summary>
+    /// Marks the STRM files a movie already has on disk as still wanted, for a movie this run
+    /// does not write: unchanged in an incremental sync, or listed in a category the provider did
+    /// not answer for (GitHub #171).
+    /// </summary>
+    private static void KeepExistingMovieFiles(
+        string title,
+        int streamId,
+        IEnumerable<int> categoryIds,
+        ProviderConfig provider,
+        string moviesPath,
+        Dictionary<int, List<string>> folderMappings,
+        Dictionary<string, Dictionary<string, string>> existingMovieFolders,
+        ContentSnapshot? groupingHint,
+        ConcurrentDictionary<string, byte> syncedFiles,
+        MovieRoleLedger roleLedger,
+        StrmOwnerResolver owners,
+        bool ownFilesOnly = false)
+    {
+        string movieName = SanitizeFileName(title, provider.CustomTitleRemoveTerms);
+        int? year = ExtractYear(title);
+        string baseName = year.HasValue ? $"{movieName} ({year})" : movieName;
+
+        // The owner of the TMDB group this stream was a guest of, from the last sync. Its
+        // alternative waits on that owner's primary, not on a name built from its own label.
+        int? recordedGroupOwner = groupingHint != null
+            && groupingHint.Movies.TryGetValue(streamId, out var record)
+            && record.GroupOwnerStreamId is int groupOwner
+            && groupOwner != streamId
+                ? groupOwner
+                : null;
+
+        var targetFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var categoryId in categoryIds)
+        {
+            if (folderMappings.TryGetValue(categoryId, out var mappedFolders))
+            {
+                foreach (var folder in mappedFolders)
+                {
+                    targetFolders.Add(folder);
+                }
+            }
+        }
+
+        if (targetFolders.Count == 0)
+        {
+            targetFolders.Add(string.Empty);
+        }
+
+        foreach (var targetFolder in targetFolders)
+        {
+            string movieBasePath = string.IsNullOrEmpty(targetFolder)
+                ? moviesPath
+                : Path.Combine(moviesPath, targetFolder);
+
+            if (existingMovieFolders.TryGetValue(targetFolder, out var folderCache) &&
+                folderCache.TryGetValue(baseName, out var existingFolderName))
+            {
+                if (ownFilesOnly)
+                {
+                    ProtectOwnStrmFilesIn(Path.Combine(movieBasePath, existingFolderName), streamId, syncedFiles);
+                }
+                else
+                {
+                    ProtectOwnStrmIn(Path.Combine(movieBasePath, existingFolderName), streamId, syncedFiles, roleLedger, owners, keepUnattributed: true, recordedGroupOwner);
+                }
+            }
+
+            // A grouped guest sits in the folder its owner named, which is not keyed by its own
+            // base name, so the lookup above cannot find it and cleanup would delete a file the
+            // provider still lists. The snapshot remembers where the file went (GitHub #88). Only
+            // the stream's own files are protected: marking the whole shared folder would also keep a
+            // departed owner's file alive forever (codex review).
+            if (groupingHint != null
+                && groupingHint.Movies.TryGetValue(streamId, out var recordedMovie)
+                && !string.IsNullOrEmpty(recordedMovie.FolderName))
+            {
+                ProtectOwnStrmIn(Path.Combine(movieBasePath, recordedMovie.FolderName), streamId, syncedFiles, roleLedger, owners, keepUnattributed: false, recordedGroupOwner);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The categories whose folders an unread item may have copies in: every mapped one in
+    /// Multiple folder mode, else just its own.
+    /// </summary>
+    private static IEnumerable<int> AllMappedCategories(Dictionary<int, List<string>> folderMappings, int categoryId)
+        => folderMappings.Count > 0 ? folderMappings.Keys.Append(categoryId) : [categoryId];
+
+    /// <summary>
+    /// Whether this provider's sync loads and saves a snapshot: for incremental sync, for TMDB
+    /// grouping, or for keeping the items of a category the provider did not list (GitHub #171),
+    /// which only matters while orphan cleanup is on.
+    /// </summary>
+    private static bool UsesSnapshot(ProviderConfig provider)
+        => provider.EnableIncrementalSync || provider.GroupMoviesByTmdbId || provider.CleanupOrphans;
+
+    /// <summary>
+    /// Decides which categories are unread this run, and for those still within the limit keeps
+    /// the files and snapshot entries of the items the previous snapshot recorded under them
+    /// (GitHub #171). Shared by movies and series; the callbacks do the type-specific part.
+    /// </summary>
+    /// <typeparam name="TEntry">MovieSnapshot or SeriesSnapshot.</typeparam>
+    /// <returns>How many items were kept.</returns>
+    private int KeepItemsOfUnreadCategories<TEntry>(
+        string kind,
+        ProviderConfig provider,
+        List<Category> fetchedCategories,
+        ConcurrentDictionary<int, int> categoryItemCounts,
+        ConcurrentDictionary<int, byte> failedCategoryIds,
+        Func<int, bool> inScope,
+        Dictionary<int, TEntry>? previousItems,
+        Func<TEntry, int> categoryOf,
+        Dictionary<int, DateTime>? previousSince,
+        Func<int, bool> collected,
+        Func<int, bool> excluded,
+        ConcurrentDictionary<int, byte> unreadIds,
+        ConcurrentDictionary<int, DateTime> sinceToSave,
+        Action<int, TEntry> keep,
+        Action<int, TEntry> keepCopyInCategory)
+    {
+        previousItems ??= new Dictionary<int, TEntry>();
+        var previousCategoryIds = previousItems.Values.Select(categoryOf).ToHashSet();
+
+        // A category still selected that the provider's category list left out this run is not
+        // read either. One the user deselected is out of scope and cleaned up as before; 0 is
+        // where items without a category are recorded, not a category.
+        var listedIds = fetchedCategories.Select(c => c.CategoryId).ToHashSet();
+        var unlisted = previousCategoryIds.Where(id => id != 0 && inScope(id) && !listedIds.Contains(id));
+        var unread = UnreadCategories.Find(categoryItemCounts, failedCategoryIds.Keys.Concat(unlisted), previousCategoryIds);
+        if (unread.Count == 0)
+        {
+            return 0;
+        }
+
+        var now = DateTime.UtcNow;
+        int kept = 0;
+        foreach (var categoryId in unread)
+        {
+            unreadIds.TryAdd(categoryId, 0);
+            var categoryName = fetchedCategories.FirstOrDefault(c => c.CategoryId == categoryId)?.CategoryName ?? string.Empty;
+
+            // The first unread run starts the clock; later ones keep its time, or the limit below
+            // would never be reached.
+            var since = previousSince != null && previousSince.TryGetValue(categoryId, out var recorded) ? recorded : now;
+
+            var underCategory = previousItems
+                .Where(p => categoryOf(p.Value) == categoryId && !excluded(p.Key))
+                .ToList();
+            var items = underCategory.Where(p => !collected(p.Key)).ToList();
+
+            // Listed under another category this run, so written there, but its copy in this
+            // category's folder (Multiple folder mode) was only wanted through this category.
+            // Keep that copy too; the item itself is already in the new snapshot (codex review).
+            var listedElsewhere = underCategory.Where(p => collected(p.Key)).ToList();
+
+            // A failed category with nothing recorded under it has nothing to keep, and the fetch
+            // already logged its own warning. Starting a clock for it would only produce a
+            // misleading "no longer kept" warning a week later.
+            if (items.Count == 0 && listedElsewhere.Count == 0)
+            {
+                continue;
+            }
+
+            if (UnreadCategories.UnreadTooLong(since, now, provider.FullSyncIntervalDays))
+            {
+                // Long enough to believe the provider really emptied it. Neither the files nor the
+                // since-time are kept, so the items are cleaned up like any other orphan.
+                _logger.LogWarning(
+                    "{Kind} category {CategoryId} ({CategoryName}) has not been read since {Since:u}, longer than the full sync interval of {Days} days. Its {Count} items are no longer kept and are cleaned up as orphans.",
+                    kind,
+                    categoryId,
+                    categoryName,
+                    since,
+                    provider.FullSyncIntervalDays,
+                    items.Count);
+                continue;
+            }
+
+            sinceToSave[categoryId] = since;
+            foreach (var (itemId, entry) in items)
+            {
+                keep(itemId, entry);
+            }
+
+            foreach (var (itemId, entry) in listedElsewhere)
+            {
+                keepCopyInCategory(itemId, entry);
+            }
+
+            kept += items.Count;
+            _logger.LogWarning(
+                "{Kind} category {CategoryId} ({CategoryName}) could not be read or came back empty although it had items before. Keeping its {Count} items from the previous sync; unread since {Since:u}, they are cleaned up after {Days} days.",
+                kind,
+                categoryId,
+                categoryName,
+                items.Count,
+                since,
+                provider.FullSyncIntervalDays);
+        }
+
+        return kept;
+    }
+
+    /// <summary>
     /// Marks one stream's own STRM files in a folder as still wanted, so orphan cleanup leaves
     /// them alone while the files of its folder-mates answer for themselves. A file belongs to the
     /// stream and provider its URL names; one whose URL cannot be read that way (Dispatcharr) is
@@ -4285,6 +4529,68 @@ public partial class StrmSyncService
                 ledger.RegisterAlternative(Path.Combine(folder, fileName[..^suffix.Length] + ".strm"), streamId, strmFile, groupOwner, groupOwner.HasValue, processed: false);
             }
         }
+    }
+
+    /// <summary>
+    /// Marks the STRM files in a folder that belong to one stream as still wanted. A file whose
+    /// address names another stream is left to answer for itself; one whose address names no
+    /// stream id at all (a Dispatcharr proxy URL) is kept, since it cannot be told apart.
+    /// </summary>
+    /// <param name="folder">Folder to look in. Missing folders are ignored.</param>
+    /// <param name="streamId">The stream whose files should survive cleanup.</param>
+    /// <param name="syncedFiles">The run's set of files that must survive cleanup.</param>
+    internal static void ProtectOwnStrmFilesIn(string folder, int streamId, ConcurrentDictionary<string, byte> syncedFiles)
+    {
+        if (!Directory.Exists(folder))
+        {
+            return;
+        }
+
+        foreach (var strmFile in Directory.GetFiles(folder, "*.strm"))
+        {
+            // A grouped guest's file is named "... - {streamId}.strm", whatever its URL looks like,
+            // so that name settles whose file it is even for a Dispatcharr URL (CodeRabbit).
+            // The folder's own plain file is never a guest, even when its title ends in " - 2049".
+            var guest = string.Equals(Path.GetFileNameWithoutExtension(strmFile), Path.GetFileName(folder), StringComparison.OrdinalIgnoreCase)
+                ? null
+                : GuestStreamIdInFileName(strmFile);
+            var named = guest ?? StreamIdInStrmUrl(ReadStrmUrl(strmFile));
+            if (named is null || named == streamId)
+            {
+                syncedFiles.TryAdd(strmFile, 0);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The stream id a grouped guest's file name ends in (<c>… - 123.strm</c>), or null.
+    /// </summary>
+    /// <param name="path">The STRM file path.</param>
+    /// <returns>The stream id, or null for any other name.</returns>
+    internal static int? GuestStreamIdInFileName(string path)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        var dash = name.LastIndexOf(" - ", StringComparison.Ordinal);
+        return dash >= 0 && int.TryParse(name[(dash + 3)..], NumberStyles.None, CultureInfo.InvariantCulture, out var id) ? id : null;
+    }
+
+    /// <summary>
+    /// The stream id an Xtream movie or episode URL ends in (<c>…/123.mkv</c>), or null.
+    /// </summary>
+    /// <param name="url">The URL read from a STRM file.</param>
+    /// <returns>The stream id, or null when the URL does not end in one.</returns>
+    internal static int? StreamIdInStrmUrl(string? url)
+    {
+        if (string.IsNullOrEmpty(url))
+        {
+            return null;
+        }
+
+        var path = url.Split('?', '#')[0];
+        var last = path[(path.LastIndexOf('/') + 1)..];
+        var dot = last.IndexOf('.', StringComparison.Ordinal);
+        var digits = dot > 0 ? last[..dot] : last;
+        return int.TryParse(digits, NumberStyles.None, CultureInfo.InvariantCulture, out var id) ? id : null;
     }
 
     /// <summary>
@@ -5221,6 +5527,12 @@ public partial class StrmSyncService
     [GeneratedRegex(@"^[\|\┃]\s*[A-Z]{2,3}\s*[\|\┃]\s*", RegexOptions.IgnoreCase)]
     private static partial Regex PrefixLanguageTagPattern();
 
+    // Matches a dash-style language prefix like "EN - " or "NL - " at start of name (GitHub #185).
+    // Case-sensitive and limited to language codes, so a title such as "AI - Artificial
+    // Intelligence" or "Up - ..." keeps its first word.
+    [GeneratedRegex(@"^(?:EN|NL|DE|FR|ES|IT|PT|TR|AR|PL|RU|UK|US|SE|DK|NO|FI|BE)\s+-\s+")]
+    private static partial Regex PrefixLanguageDashPattern();
+
     // Matches language tags like "| UK |", "┃US┃", "[EN]", "| DE |", "| FR |", etc.
     [GeneratedRegex(@"[\|\┃\[]\s*[A-Z]{2,3}\s*[\|\┃\]]", RegexOptions.IgnoreCase)]
     private static partial Regex LanguageTagPattern();
@@ -5296,6 +5608,7 @@ public partial class StrmSyncService
         ConcurrentDictionary<int, ItemIdentity> movieIdentities,
         ConcurrentDictionary<int, ItemIdentity> seriesIdentities,
         ContentSnapshot? carryForwardFrom,
+        UnreadCategories unread,
         IReadOnlyList<FailedItem> failedItems,
         CancellationToken cancellationToken)
     {
@@ -5322,6 +5635,8 @@ public partial class StrmSyncService
                 {
                     snapshot.Movies[carried.Key] = carried.Value;
                 }
+
+                snapshot.UnreadMovieCategoriesSince = new Dictionary<int, DateTime>(carryForwardFrom.UnreadMovieCategoriesSince);
             }
 
             if (!provider.SyncSeries && carryForwardFrom != null)
@@ -5330,6 +5645,8 @@ public partial class StrmSyncService
                 {
                     snapshot.Series[carried.Key] = carried.Value;
                 }
+
+                snapshot.UnreadSeriesCategoriesSince = new Dictionary<int, DateTime>(carryForwardFrom.UnreadSeriesCategoriesSince);
             }
 
             // Build movie snapshots
@@ -5388,6 +5705,29 @@ public partial class StrmSyncService
                         IdSource = seriesIdentity.Source
                     };
                 }
+            }
+
+            // Items kept because their category was unread were not listed this run, so the loops
+            // above did not see them. Their previous entries go in unchanged: they are what tells
+            // the next run that the category had items (GitHub #171).
+            foreach (var (streamId, kept) in unread.KeptMovies)
+            {
+                snapshot.Movies.TryAdd(streamId, kept);
+            }
+
+            foreach (var (seriesId, kept) in unread.KeptSeries)
+            {
+                snapshot.Series.TryAdd(seriesId, kept);
+            }
+
+            if (provider.SyncMovies)
+            {
+                snapshot.UnreadMovieCategoriesSince = new Dictionary<int, DateTime>(unread.MovieCategoriesSince);
+            }
+
+            if (provider.SyncSeries)
+            {
+                snapshot.UnreadSeriesCategoriesSince = new Dictionary<int, DateTime>(unread.SeriesCategoriesSince);
             }
 
             snapshot.Metadata = new SnapshotMetadata
@@ -5815,6 +6155,18 @@ public class SyncResult
     /// rest can be told apart from one that went around the threshold for no reason.
     /// </summary>
     public int OrphansRelocated { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of movies kept on disk although this run did not list them, because
+    /// their category failed to load or came back empty while it had items before (GitHub #171).
+    /// </summary>
+    public int MoviesKeptForUnreadCategories { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of series kept for the same reason as
+    /// <see cref="MoviesKeptForUnreadCategories"/>.
+    /// </summary>
+    public int SeriesKeptForUnreadCategories { get; set; }
 
     /// <summary>
     /// Gets or sets the number of existing movie STRM files that <see cref="MovieOrphansSkipped"/>

@@ -59,6 +59,7 @@ public class XtreamTunerHost : ITunerHost
     private List<ChannelInfo>? _cachedChannels;
     private DateTime _cacheTime = DateTime.MinValue;
     private bool _cachedNumberByCategory;
+    private bool _cachedCategoryAsTag;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="XtreamTunerHost"/> class.
@@ -98,9 +99,11 @@ public class XtreamTunerHost : ITunerHost
         // Return cached channels if available and not expired
         // The numbering flag is part of the cache identity: flipping it changes every number, and
         // serving the previous list would leave the numbers and the resolver map disagreeing.
+        // The category tag flag is too: a list cached under the other setting carries the wrong tags.
         if (enableCache
             && _cachedChannels != null
             && _cachedNumberByCategory == config.LiveTvNumberByCategory
+            && _cachedCategoryAsTag == config.LiveTvCategoryAsTag
             && DateTime.UtcNow - _cacheTime < CacheDuration)
         {
             _logger.LogDebug("Returning cached channel list ({Count} channels)", _cachedChannels.Count);
@@ -111,6 +114,12 @@ public class XtreamTunerHost : ITunerHost
 
         var channels = await _liveTvService.GetFilteredChannelsAsync(cancellationToken).ConfigureAwait(false);
         var categoryNames = await _liveTvService.GetCategoryNameMapAsync(cancellationToken).ConfigureAwait(false);
+
+        if (config.LiveTvCategoryAsTag && categoryNames.Count == 0)
+        {
+            _logger.LogWarning(
+                "Tag channels with their category is on, but the category list could not be read (fetch failed, or more than one Live TV provider); channels get only their override tags this refresh");
+        }
 
         int stride = ChannelNumbering.ComputeStride(channels);
         var newMap = new Dictionary<string, string>(channels.Count);
@@ -170,7 +179,13 @@ public class XtreamTunerHost : ITunerHost
                 ChannelGroup = channel.CategoryId is int catId && categoryNames.TryGetValue(catId, out var categoryName)
                     ? categoryName
                     : null,
-                Tags = channel.Tags,
+                Tags = ResolveChannelTags(
+                    channel.Tags,
+                    channel.CategoryId is int tagCatId && categoryNames.TryGetValue(tagCatId, out var tagCategoryName)
+                        ? tagCategoryName
+                        : null,
+                    categoryNames.Count > 0,
+                    config.LiveTvCategoryAsTag),
             });
         }
 
@@ -180,6 +195,7 @@ public class XtreamTunerHost : ITunerHost
         _cachedChannels = result;
         _cacheTime = DateTime.UtcNow;
         _cachedNumberByCategory = config.LiveTvNumberByCategory;
+        _cachedCategoryAsTag = config.LiveTvCategoryAsTag;
         _logger.LogInformation(
             "Channel list cached with {Count} channels ({StatsCount} with stream stats, {ProxyCount} with a Dispatcharr URL without credentials)",
             result.Count,
@@ -201,10 +217,10 @@ public class XtreamTunerHost : ITunerHost
 
         var config = Plugin.Instance.Configuration;
         var canonicalChannelId = BuildChannelId(providerIndex, streamId);
-        var (streamUrl, isHls) = ResolveStreamUrl(config, providerIndex, streamId, canonicalChannelId);
+        var (streamUrl, isHls, isDispatcharrUrl) = ResolveStreamUrl(config, providerIndex, streamId, canonicalChannelId);
         _streamStats.TryGetValue(canonicalChannelId, out var stats);
 
-        var mediaSource = CreateMediaSourceInfo(canonicalChannelId, streamUrl, stats, isHls, config, _logger);
+        var mediaSource = CreateMediaSourceInfo(canonicalChannelId, streamUrl, stats, isHls, config, _logger, isDispatcharrUrl);
 
         return new List<MediaSourceInfo> { mediaSource };
     }
@@ -221,10 +237,10 @@ public class XtreamTunerHost : ITunerHost
 
         var config = Plugin.Instance.Configuration;
         var canonicalChannelId = BuildChannelId(providerIndex, parsedStreamId);
-        var (streamUrl, isHls) = ResolveStreamUrl(config, providerIndex, parsedStreamId, canonicalChannelId);
+        var (streamUrl, isHls, isDispatcharrUrl) = ResolveStreamUrl(config, providerIndex, parsedStreamId, canonicalChannelId);
         _streamStats.TryGetValue(canonicalChannelId, out var stats);
 
-        var mediaSource = CreateMediaSourceInfo(canonicalChannelId, streamUrl, stats, isHls, config, _logger);
+        var mediaSource = CreateMediaSourceInfo(canonicalChannelId, streamUrl, stats, isHls, config, _logger, isDispatcharrUrl);
 
         var httpClient = _httpClientFactory.CreateClient();
         ILiveStream liveStream = new XtreamLiveStream(mediaSource, httpClient, _logger);
@@ -313,18 +329,18 @@ public class XtreamTunerHost : ITunerHost
     /// the M3U playlist uses it (GitHub #113). It always serves MPEG-TS, so it is never HLS.
     /// </para>
     /// </summary>
-    private (string Url, bool IsHls) ResolveStreamUrl(PluginConfiguration config, int providerIndex, int streamId, string channelId)
+    private (string Url, bool IsHls, bool IsDispatcharr) ResolveStreamUrl(PluginConfiguration config, int providerIndex, int streamId, string channelId)
     {
         // Only the uuid is cached; the URL is built from the current settings, so a changed or
         // removed Dispatcharr base URL takes effect without waiting for the channel list to reload.
         if (_dispatcharrUuids.TryGetValue(channelId, out var uuid)
             && BuildProxyStreamUrl(config, providerIndex, uuid) is { } proxyUrl)
         {
-            return (proxyUrl, false);
+            return (proxyUrl, false, true);
         }
 
         var isHls = !string.Equals(config.LiveTvOutputFormat, "ts", StringComparison.OrdinalIgnoreCase);
-        return (BuildStreamUrl(config, providerIndex, streamId), isHls);
+        return (BuildStreamUrl(config, providerIndex, streamId), isHls, false);
     }
 
     /// <summary>
@@ -357,6 +373,45 @@ public class XtreamTunerHost : ITunerHost
         return string.Create(CultureInfo.InvariantCulture, $"{baseUrl}/live/{username}/{password}/{streamId}.{extension}");
     }
 
+    /// <summary>
+    /// The tags the tuner hands Jellyfin for one channel (homelab-ops #550).
+    /// <para>
+    /// Jellyfin's guide refresh replaces a channel's tags whenever this is non-null and leaves them
+    /// alone when it is null, so null and an empty array mean different things:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>Override tags win, unchanged, whatever the option says.</item>
+    /// <item>Option off: the override tags or null, exactly as before.</item>
+    /// <item>The list loaded: the category name, or an empty array when the channel has no known
+    /// category, so a channel moved out of a group loses that group's tag.</item>
+    /// <item>The category list did not load (fetch failed, or more than one provider): an empty
+    /// array. Null would keep the tags from the last refresh, and a stale group tag would keep
+    /// showing a channel that has left the group. For an allowed-tags account a missing tag hides
+    /// a channel, it never shows one, so this fails closed: such an account may see nothing until
+    /// the next refresh that loads the list.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="overrideTags">Tags from the channel overrides, or null.</param>
+    /// <param name="categoryName">The channel's category name, or null when unknown.</param>
+    /// <param name="categoryMapLoaded">Whether the category list was read.</param>
+    /// <param name="categoryAsTag">The <see cref="PluginConfiguration.LiveTvCategoryAsTag"/> setting.</param>
+    /// <returns>The tags for <see cref="ChannelInfo.Tags"/>.</returns>
+    internal static string[]? ResolveChannelTags(string[]? overrideTags, string? categoryName, bool categoryMapLoaded, bool categoryAsTag)
+    {
+        if (overrideTags != null || !categoryAsTag)
+        {
+            return overrideTags;
+        }
+
+        if (!categoryMapLoaded)
+        {
+            return Array.Empty<string>();
+        }
+
+        var name = categoryName?.Trim();
+        return string.IsNullOrEmpty(name) ? Array.Empty<string>() : new[] { name };
+    }
+
     internal static string BuildChannelId(int providerIndex, int streamId)
     {
         return providerIndex == 0
@@ -364,7 +419,7 @@ public class XtreamTunerHost : ITunerHost
             : string.Create(CultureInfo.InvariantCulture, $"{ChannelIdPrefix}{providerIndex}_{streamId}");
     }
 
-    internal static MediaSourceInfo CreateMediaSourceInfo(string channelId, string streamUrl, StreamStatsInfo? stats, bool isHls, PluginConfiguration config, ILogger logger)
+    internal static MediaSourceInfo CreateMediaSourceInfo(string channelId, string streamUrl, StreamStatsInfo? stats, bool isHls, PluginConfiguration config, ILogger logger, bool isDispatcharrUrl = false)
     {
         var sourceId = "xtream_live_" + channelId;
 
@@ -394,11 +449,16 @@ public class XtreamTunerHost : ITunerHost
             RequiresOpening = true,
             IsRemote = true,
             IsInfiniteStream = true,
-            // No direct play: a client that direct plays (Swiftfin with VLC) opens Path itself, so
-            // it gets the provider URL with the login in it and bypasses Jellyfin, which then
-            // cannot close the connection. On 2026-10-18 Swiftfin opened 2 to 3 connections per
-            // channel that way and the provider blocked the account with HTTP 407 (homelab-ops #550).
-            SupportsDirectPlay = false,
+            // No direct play with an Xtream URL: a client that direct plays (Swiftfin with VLC)
+            // opens Path itself, so it got the provider URL with the login in it and bypassed
+            // Jellyfin, which then could not close the connection. On 2026-10-18 Swiftfin opened 2
+            // to 3 connections per channel that way and the provider blocked the account with
+            // HTTP 407 (homelab-ops #550). Dispatcharr's own channel URL carries no login, and
+            // Dispatcharr shares one upstream connection between everyone watching a channel, so
+            // there it is offered behind LiveTvDirectPlayDispatcharr, while that is measured.
+            // Decided by which branch built the URL, not by its text: a provider base URL that
+            // happens to contain /proxy/ts/stream/ must not pass for Dispatcharr (CodeRabbit).
+            SupportsDirectPlay = hasStats && config.LiveTvDirectPlayDispatcharr && isDispatcharrUrl,
             // No direct stream: for a live source Jellyfin's direct stream is a remux into one
             // endless fragmented mp4, which the iOS player rejects (AVFoundation -11850, seen on
             // RTL 5 once the audio codec was declared). Without it Jellyfin uses HLS, which still
@@ -447,6 +507,13 @@ public class XtreamTunerHost : ITunerHost
                 RealFrameRate = stats.SourceFps.HasValue ? (float)stats.SourceFps.Value : null,
                 AverageFrameRate = stats.SourceFps.HasValue ? (float)stats.SourceFps.Value : null,
                 BitRate = stats.Bitrate.HasValue ? (int)Math.Round(stats.Bitrate.Value * 1000) : null,
+
+                // Without these Jellyfin wrote its own defaults into the HLS CODECS attribute
+                // (avc1.424029, Constrained Baseline 4.1, for a High 4.2 stream; L120 for HEVC
+                // 4.1), and skipped every profile and level check, so a stream a client said it
+                // cannot play was copied to it anyway (homelab-ops #550).
+                Profile = stats.VideoProfile,
+                Level = stats.VideoLevel,
             };
             mediaStreams.Add(videoStream);
 
@@ -459,7 +526,10 @@ public class XtreamTunerHost : ITunerHost
                 Type = MediaStreamType.Audio,
                 Index = -1,
                 Codec = audioCodec,
-                Channels = audioCodec is null ? null : stats.AudioChannels,
+
+                // Declared even when the audio is re-encoded: without it Jellyfin took the
+                // client's maximum, and a stereo channel came out as 5.1 (homelab-ops #550).
+                Channels = stats.AudioChannels,
                 SampleRate = audioCodec is null ? null : stats.AudioSampleRate,
                 BitRate = audioCodec is null || stats.AudioBitrate is null ? null : stats.AudioBitrate * 1000,
             });
