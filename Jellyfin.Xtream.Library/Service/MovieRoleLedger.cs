@@ -159,7 +159,8 @@ internal sealed class MovieRoleLedger
 
     /// <summary>
     /// Settles what only the complete catalogue can: streams that found a primary of a stream that
-    /// is gone take it over in place, and the lowest stream id of a folder written this run gets
+    /// is gone take it over (in place, or under its own name for a TMDB group guest whose owner had
+    /// another label), and the lowest stream id of a folder written this run gets
     /// the plain name. Runs once, after the last batch and before orphan cleanup.
     /// </summary>
     /// <param name="syncedFiles">The run's set of files that must survive cleanup; updated.</param>
@@ -327,23 +328,43 @@ internal sealed class MovieRoleLedger
                 : (File.Exists(slot.PrimaryPath) && _ownerOfFile(slot.PrimaryPath) == gone && !syncedFiles.ContainsKey(slot.PrimaryPath)
                     ? slot.PrimaryPath
                     : null);
-            if (stale is null || !TryMove(taker.Path, stale))
+            if (stale is null)
             {
                 continue;
             }
 
-            syncedFiles.TryRemove(taker.Path, out _);
-            syncedFiles.TryAdd(stale, 0);
-            claimedPaths.TryRemove(taker.Path, out _);
-            claimedPaths.TryAdd(stale, 0);
-            slot.Alternatives.Remove(taker.StreamId);
-            if (!taker.GroupGuest)
+            // A guest of a TMDB group whose owner carried another label goes to its own primary name,
+            // the one it would write as the owner, and the departed owner's file is removed. Moving it
+            // into the owner's labelled file would only rename it again on the next sync, and each
+            // rename is a new item in Jellyfin (maintainer review).
+            string target = taker.GroupGuest ? slot.PrimaryPath : stale;
+            bool inPlace = string.Equals(target, stale, StringComparison.OrdinalIgnoreCase);
+            if (!inPlace && (syncedFiles.ContainsKey(target) || File.Exists(target)))
             {
-                slot.Holder = taker.StreamId;
-                slot.HolderEstablished = true;
+                continue;
             }
 
-            changes.Add(new RoleChange("takeover", taker.StreamId, stale, taker.Path));
+            if (!TryMove(taker.Path, target))
+            {
+                continue;
+            }
+
+            if (!inPlace)
+            {
+                TryDelete(stale);
+            }
+
+            syncedFiles.TryRemove(taker.Path, out _);
+            syncedFiles.TryAdd(target, 0);
+            claimedPaths.TryRemove(taker.Path, out _);
+            claimedPaths.TryAdd(target, 0);
+            slot.Alternatives.Remove(taker.StreamId);
+            slot.Holder = taker.StreamId;
+            slot.HolderEstablished = true;
+
+            // In place, the existing item is rewritten, so it counts as an update. Under its own name
+            // it is a new file, the same as a promotion.
+            changes.Add(new RoleChange(inPlace ? "takeover" : "promotion", taker.StreamId, target, taker.Path));
         }
     }
 
@@ -445,6 +466,22 @@ internal sealed class MovieRoleLedger
         return slot;
     }
 
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+            // Left for orphan cleanup.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Left for orphan cleanup.
+        }
+    }
+
     private static bool TryMove(string from, string to)
     {
         try
@@ -465,7 +502,7 @@ internal sealed class MovieRoleLedger
     /// <summary>
     /// One role change made by the ledger.
     /// </summary>
-    /// <param name="Kind">"takeover", "swap" or "promotion".</param>
+    /// <param name="Kind">"takeover" (rewritten in place), "swap" or "promotion" (moved to a new name).</param>
     /// <param name="StreamId">The stream that holds the primary file now.</param>
     /// <param name="PrimaryPath">The primary file it holds now.</param>
     /// <param name="PreviousPath">The alternative file it was moved from.</param>

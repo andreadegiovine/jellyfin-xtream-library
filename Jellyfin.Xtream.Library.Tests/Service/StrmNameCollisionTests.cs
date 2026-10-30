@@ -488,6 +488,37 @@ public class StrmNameCollisionTests : IDisposable
         }
     }
 
+    // A guest that joins the group in the same sync its owner leaves takes over at once. It goes
+    // straight to its own primary name, not into the departed owner's labelled file, so the next
+    // sync does not rename it a second time (each rename is a new item in Jellyfin).
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ANewGuestWhoseOwnerLeavesTheSameSync_TakesItsOwnNameOnce(bool cleanup)
+    {
+        VodInfoWithTmdbId(100, "42");
+        VodInfoWithTmdbId(101, "42");
+        var folder = Path.Combine(_libraryPath, "Movies", "Alpha (2024) [tmdbid-42]");
+        await RunMovieSyncAsync(
+            [new StreamInfo { StreamId = 100, Name = "Alpha (2024) - [FHD]", ContainerExtension = "mp4" }],
+            useShippedDefaults: false,
+            groupByTmdbId: true).ConfigureAwait(true);
+        Directory.GetFiles(folder, "*.strm").Select(Path.GetFileName).Should().Equal("Alpha (2024) [tmdbid-42] - FHD.strm");
+
+        foreach (bool shipped in new[] { false, true, false })
+        {
+            await RunMovieSyncAsync(
+                [new StreamInfo { StreamId = 101, Name = "Beta (2024)", ContainerExtension = "mp4" }],
+                useShippedDefaults: shipped,
+                groupByTmdbId: true,
+                cleanupOrphans: cleanup).ConfigureAwait(true);
+
+            var files = Directory.GetFiles(folder, "*.strm");
+            files.Select(Path.GetFileName).Should().Equal("Alpha (2024) [tmdbid-42].strm");
+            (await StreamIdOfAsync(files[0]).ConfigureAwait(true)).Should().Be(101);
+        }
+    }
+
     // The maintainer's second case. A provider that renumbers every id leaves each primary naming a
     // stream that no longer exists. Each new stream rewrites it in place, as before alternatives, so
     // no movie gets a second file and cleanup has nothing to block on.
